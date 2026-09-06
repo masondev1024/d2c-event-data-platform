@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: d2c-platform-config
+data:
+  KAFKA_BOOTSTRAP_SERVERS: kafka-bootstrap.kafka.svc.cluster.local:9092
+  OUTBOX_TOPIC: d2c.application.approved.v1
+  D2C_EVENT_TOPIC: d2c.application.approved.v1
+  D2C_EVENT_DLQ_TOPIC: d2c.application.consumer.dlq.v1
+  D2C_EVENT_CONSUMER_GROUP: d2c-application-event-consumer-v1
+  TRUSTED_HOSTS: d2c.example.com

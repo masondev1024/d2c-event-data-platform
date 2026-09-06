@@ -8,7 +8,8 @@ Vector → Kinesis Data Firehose → S3 bronze Parquet로 전달하기 위한 �
 
 생성 리소스:
 
-- 공개 접근 차단·AES256 암호화·버전관리·짧은 lifecycle을 적용한 S3 bucket
+- 공개 접근 차단·고객 관리형 KMS(SSE-KMS) 암호화·버전관리·짧은 lifecycle을 적용한 S3 bucket
+- 키 자동 교체가 활성화된 customer-managed KMS key와 Firehose 전용 암호화 권한
 - JSON → Snappy Parquet 변환이 가능한 DirectPut Firehose
 - Firehose가 참조할 Glue Catalog database/table과 Athena partition projection
 - Firehose 전용 least-privilege IAM role/policy

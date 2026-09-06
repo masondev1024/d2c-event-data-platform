@@ -8,6 +8,11 @@ output "bucket_name" {
   value       = aws_s3_bucket.data_lake.bucket
 }
 
+output "data_lake_kms_key_arn" {
+  description = "Customer-managed KMS key used for S3 data lake encryption."
+  value       = aws_kms_key.data_lake.arn
+}
+
 output "firehose_name" {
   description = "DirectPut Firehose delivery stream consumed by Vector."
   value       = aws_kinesis_firehose_delivery_stream.sensor_events.name

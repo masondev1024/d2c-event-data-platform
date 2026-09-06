@@ -40,3 +40,88 @@ groups:
         annotations:
           summary: "Sensor sink write failed"
           description: "The DuckDB sink has failed to commit a canonical event in the last 5 minutes."
+
+      - alert: SensorSinkQuarantineRecords
+        expr: increase(sensor_sink_records_total{result="quarantined"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Canonical events were quarantined by the sink"
+          description: "A clean-topic record violated the downstream contract and was routed to the sink DLQ."
+
+      - alert: SensorWorkerStale
+        expr: |
+          (time() - sensor_processor_heartbeat_unixtime > 60)
+          or
+          (time() - sensor_sink_heartbeat_unixtime > 60)
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A streaming worker has not completed a record recently"
+          description: "Check Kafka connectivity, consumer assignment, and downstream write health."
+
+  - name: d2c-approval-release-confidence
+    rules:
+      - alert: D2COutboxParityMismatch
+        expr: d2c_outbox_parity_gap > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "D2C approval and outbox parity mismatch"
+          description: "An approved application is missing its outbox event or an orphan event exists."
+
+      - alert: D2COutboxParityCheckFailed
+        expr: d2c_outbox_parity_check_success < 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "D2C outbox parity check is unavailable"
+          description: "The release gate is fail-closed because PostgreSQL parity truth could not be read."
+
+      - alert: D2CApply5xxRatioHigh
+        expr: |
+          sum(rate(d2c_http_requests_total{route="/api/apply",status=~"5.."}[5m]))
+          /
+          clamp_min(sum(rate(d2c_http_requests_total{route="/api/apply"}[5m])), 0.001)
+          > 0.01
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "D2C approval API 5xx ratio is above 1%"
+          description: "Inspect PostgreSQL readiness, migration state, and API logs."
+
+      - alert: D2CApplyP95LatencyHigh
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(d2c_http_request_duration_seconds_bucket{route="/api/apply"}[5m]))
+          ) > 0.5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "D2C approval API p95 latency is above 500 ms"
+          description: "Check PostgreSQL latency, connection saturation, and API resource limits."
+
+      - alert: D2COutboxBacklogHigh
+        expr: d2c_outbox_backlog > 100
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "D2C transactional outbox backlog is high"
+          description: "The publisher is not draining approval events fast enough."
+
+      - alert: D2COutboxPublisherStale
+        expr: time() - d2c_outbox_publisher_heartbeat_unixtime > 60
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "D2C outbox publisher heartbeat is stale"
+          description: "Check PostgreSQL connectivity, Kafka broker health, and publisher logs."

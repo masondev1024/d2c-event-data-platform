@@ -1,0 +1,93 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: d2c-approval-canary-gate
+spec:
+  args:
+    - name: service-name
+    - name: publisher-service-name
+    - name: prometheus-address
+  metrics:
+    - name: canary-traffic
+      interval: 20s
+      count: 3
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: "{{args.prometheus-address}}"
+          query: |
+            sum(increase(d2c_apply_requests_total{service="{{args.service-name}}",result="success"}[5m])) or vector(0)
+      successCondition: result[0] > 0
+
+    - name: outbox-parity
+      interval: 20s
+      count: 3
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: "{{args.prometheus-address}}"
+          query: |
+            max(d2c_outbox_parity_gap{service="{{args.service-name}}"}) or vector(1)
+      successCondition: result[0] == 0
+
+    - name: parity-check-health
+      interval: 20s
+      count: 3
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: "{{args.prometheus-address}}"
+          query: |
+            min(d2c_outbox_parity_check_success{service="{{args.service-name}}"}) or vector(0)
+      successCondition: result[0] == 1
+
+    - name: apply-5xx-ratio
+      interval: 20s
+      count: 3
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: "{{args.prometheus-address}}"
+          query: |
+            (
+              sum(increase(d2c_http_requests_total{service="{{args.service-name}}",route="/api/apply",status=~"5.."}[5m]))
+              /
+              clamp_min(sum(increase(d2c_http_requests_total{service="{{args.service-name}}",route="/api/apply"}[5m])), 1)
+            ) or vector(1)
+      successCondition: result[0] < 0.01
+
+    - name: apply-p95-latency
+      interval: 20s
+      count: 3
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: "{{args.prometheus-address}}"
+          query: |
+            histogram_quantile(
+              0.95,
+              sum by (le) (rate(d2c_http_request_duration_seconds_bucket{service="{{args.service-name}}",route="/api/apply"}[5m]))
+            ) or vector(1)
+      successCondition: result[0] < 0.5
+
+    - name: database-readiness
+      interval: 20s
+      count: 3
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: "{{args.prometheus-address}}"
+          query: |
+            min(d2c_db_readiness{service="{{args.service-name}}"}) or vector(0)
+      successCondition: result[0] == 1
+
+    - name: outbox-backlog
+      interval: 20s
+      count: 3
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: "{{args.prometheus-address}}"
+          query: |
+            max(d2c_outbox_backlog{service="{{args.publisher-service-name}}"}) or vector(999999)
+      successCondition: result[0] < 100

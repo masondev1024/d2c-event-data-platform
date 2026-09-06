@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/masondev1024/d2c-event-data-platform/blob/main/schemas/d2c.application.approved.v1.schema.json",
+  "title": "D2C application approved event v1",
+  "description": "Immutable event emitted after an application and its transactional outbox row commit together.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "event_type",
+    "event_version",
+    "occurred_at",
+    "data"
+  ],
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "event_type": {
+      "const": "d2c.application.approved.v1"
+    },
+    "event_version": {
+      "const": 1
+    },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "application_id",
+        "user_id",
+        "campaign_id"
+      ],
+      "properties": {
+        "application_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "user_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "campaign_id": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    }
+  }
+}

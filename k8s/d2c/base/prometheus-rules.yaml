@@ -1,0 +1,80 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: d2c-release-sli
+  labels:
+    app: d2c-api
+spec:
+  groups:
+    - name: d2c-release-sli
+      rules:
+        - alert: D2COutboxParityMismatch
+          expr: max by (service) (d2c_outbox_parity_gap{service=~"d2c-api-(stable|canary)"}) > 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: D2C approval and outbox parity mismatch
+            description: An approved application is missing its outbox event or an orphan outbox event exists.
+
+        - alert: D2COutboxParityCheckFailed
+          expr: min by (service) (d2c_outbox_parity_check_success{service=~"d2c-api-(stable|canary)"}) < 1
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: D2C outbox parity check is unavailable
+            description: The release gate is fail-closed because database parity truth could not be read.
+
+        - alert: D2CApply5xxRatioHigh
+          expr: |
+            sum by (service) (rate(d2c_http_requests_total{service=~"d2c-api-(stable|canary)",route="/api/apply",status=~"5.."}[5m]))
+            /
+            clamp_min(sum by (service) (rate(d2c_http_requests_total{service=~"d2c-api-(stable|canary)",route="/api/apply"}[5m])), 0.001)
+            > 0.01
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: D2C approval API 5xx ratio is above 1%
+            description: Inspect database readiness, migration state, and the latest Rollout AnalysisRun.
+
+        - alert: D2CApplyP95LatencyHigh
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum by (service, le) (rate(d2c_http_request_duration_seconds_bucket{service=~"d2c-api-(stable|canary)",route="/api/apply"}[5m]))
+            ) > 0.5
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: D2C approval API p95 latency is above 500 ms
+            description: Check PostgreSQL latency, connection saturation, and canary resource limits.
+
+        - alert: D2COutboxBacklogHigh
+          expr: d2c_outbox_backlog{service="d2c-outbox-publisher"} > 100
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: D2C transactional outbox backlog is high
+            description: The publisher is not draining approval events fast enough; do not promote the canary.
+
+        - alert: D2COutboxPublisherStale
+          expr: time() - d2c_outbox_publisher_heartbeat_unixtime{service="d2c-outbox-publisher"} > 60
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: D2C outbox publisher heartbeat is stale
+            description: Check PostgreSQL connectivity, Kafka broker health, and publisher logs.
+
+        - alert: D2CEventConsumerLagHigh
+          expr: max by (topic, partition) (d2c_event_consumer_lag{service="d2c-event-consumer"}) > 100
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: D2C event consumer lag is high
+            description: The idempotent consumer is not keeping up with the approved-event topic.

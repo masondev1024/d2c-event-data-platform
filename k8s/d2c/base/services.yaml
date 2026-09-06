@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: d2c-api-stable
+  labels:
+    app: d2c-api
+    monitoring: d2c-api
+    rollout-track: stable
+spec:
+  selector:
+    app: d2c-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: d2c-api-canary
+  labels:
+    app: d2c-api
+    monitoring: d2c-api
+    rollout-track: canary
+spec:
+  selector:
+    app: d2c-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

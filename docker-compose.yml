@@ -41,6 +41,112 @@ services:
     networks:
       - kafka-net
 
+  postgres:
+    profiles: ["d2c"]
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: d2c
+      POSTGRES_USER: d2c
+      POSTGRES_PASSWORD: "${D2C_POSTGRES_PASSWORD:-d2c-local-only}"
+    volumes:
+      - d2c-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U d2c -d d2c"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - kafka-net
+
+  d2c-migrate:
+    profiles: ["d2c"]
+    build:
+      context: .
+      dockerfile: app/Dockerfile
+    restart: "no"
+    command: ["python", "schema.py"]
+    environment:
+      DATABASE_URL: "postgresql://d2c:${D2C_POSTGRES_PASSWORD:-d2c-local-only}@postgres:5432/d2c"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - kafka-net
+
+  d2c-api:
+    profiles: ["d2c"]
+    build:
+      context: .
+      dockerfile: app/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      DATABASE_URL: "postgresql://d2c:${D2C_POSTGRES_PASSWORD:-d2c-local-only}@postgres:5432/d2c"
+      D2C_ENV: "${D2C_ENV:-development}"
+      ALLOW_FAILURE_DRILL: "${ALLOW_FAILURE_DRILL:-false}"
+      D2C_OUTBOX_FAILURE_INJECTION: "${D2C_OUTBOX_FAILURE_INJECTION:-}"
+      TRUSTED_HOSTS: localhost,127.0.0.1,d2c-api
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    depends_on:
+      d2c-migrate:
+        condition: service_completed_successfully
+    networks:
+      - kafka-net
+
+  d2c-outbox-publisher:
+    profiles: ["d2c"]
+    build:
+      context: .
+      dockerfile: app/Dockerfile
+    restart: unless-stopped
+    command: ["python", "outbox_publisher.py"]
+    environment:
+      DATABASE_URL: "postgresql://d2c:${D2C_POSTGRES_PASSWORD:-d2c-local-only}@postgres:5432/d2c"
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      OUTBOX_TOPIC: d2c.application.approved.v1
+      METRICS_PORT: 9102
+    ports:
+      - "127.0.0.1:9102:9102"
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      d2c-migrate:
+        condition: service_completed_successfully
+    networks:
+      - kafka-net
+
+  d2c-event-consumer:
+    profiles: ["d2c"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "services.d2c_event_consumer"]
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      D2C_EVENT_TOPIC: d2c.application.approved.v1
+      D2C_EVENT_DLQ_TOPIC: d2c.application.consumer.dlq.v1
+      D2C_EVENT_CONSUMER_GROUP: d2c-application-event-consumer-v1
+      D2C_DUCKDB_PATH: /data/d2c_events.duckdb
+      METRICS_PORT: 9103
+      METRICS_BIND_HOST: 0.0.0.0
+    volumes:
+      - ./data:/data
+    ports:
+      - "127.0.0.1:9103:9103"
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    networks:
+      - kafka-net
+
   fluent-bit:
     image: fluent/fluent-bit:3.2.2
     restart: unless-stopped
@@ -93,6 +199,7 @@ services:
       DLQ_TOPIC: factory.sensor.dlq.v1
       CONSUMER_GROUP: sensor-normalizer-v1
       METRICS_PORT: 9100
+      METRICS_BIND_HOST: 0.0.0.0
     depends_on:
       kafka-init:
         condition: service_completed_successfully
@@ -108,9 +215,11 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       CLEAN_TOPIC: factory.sensor.clean.v1
+      SINK_DLQ_TOPIC: factory.sensor.sink.dlq.v1
       SINK_CONSUMER_GROUP: sensor-duckdb-sink-v1
       DUCKDB_PATH: /data/sensor.duckdb
       METRICS_PORT: 9101
+      METRICS_BIND_HOST: 0.0.0.0
     volumes:
       - ./data:/data
     ports:
@@ -185,3 +294,4 @@ networks:
 
 volumes:
   kafka-data:
+  d2c-postgres-data:

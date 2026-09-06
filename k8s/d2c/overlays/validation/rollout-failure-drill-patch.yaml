@@ -1,0 +1,19 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: d2c-api
+spec:
+  template:
+    metadata:
+      annotations:
+        d2c.example.com/failure-drill: outbox-transaction-rollback
+    spec:
+      containers:
+        - name: api
+          env:
+            - name: D2C_ENV
+              value: validation
+            - name: ALLOW_FAILURE_DRILL
+              value: "true"
+            - name: D2C_OUTBOX_FAILURE_INJECTION
+              value: before_outbox_insert

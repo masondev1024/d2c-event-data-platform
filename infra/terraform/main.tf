@@ -49,12 +49,59 @@ resource "aws_s3_bucket_versioning" "data_lake" {
   }
 }
 
+data "aws_iam_policy_document" "data_lake_kms" {
+  statement {
+    sid    = "EnableAccountRootPermissions"
+    effect = "Allow"
+
+    actions   = ["kms:*"]
+    resources = ["*"]
+
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"]
+    }
+  }
+
+  statement {
+    sid    = "AllowFirehoseEncryption"
+    effect = "Allow"
+
+    actions = [
+      "kms:Decrypt",
+      "kms:DescribeKey",
+      "kms:Encrypt",
+      "kms:GenerateDataKey",
+    ]
+    resources = ["*"]
+
+    principals {
+      type        = "AWS"
+      identifiers = [aws_iam_role.firehose.arn]
+    }
+  }
+}
+
+resource "aws_kms_key" "data_lake" {
+  description             = "Customer-managed key for the factory sensor bronze data lake."
+  deletion_window_in_days = 7
+  enable_key_rotation     = true
+  policy                  = data.aws_iam_policy_document.data_lake_kms.json
+  tags                    = local.common_tags
+}
+
+resource "aws_kms_alias" "data_lake" {
+  name          = "alias/${var.project_name}-${var.environment}-${local.resource_suffix}-data-lake"
+  target_key_id = aws_kms_key.data_lake.key_id
+}
+
 resource "aws_s3_bucket_server_side_encryption_configuration" "data_lake" {
   bucket = aws_s3_bucket.data_lake.id
 
   rule {
     apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
+      kms_master_key_id = aws_kms_key.data_lake.arn
+      sse_algorithm     = "aws:kms"
     }
     bucket_key_enabled = true
   }
@@ -248,6 +295,19 @@ data "aws_iam_policy_document" "firehose_access" {
     ]
 
     resources = ["${aws_s3_bucket.data_lake.arn}/*"]
+  }
+
+  statement {
+    sid = "EncryptLakeObjects"
+
+    actions = [
+      "kms:Decrypt",
+      "kms:DescribeKey",
+      "kms:Encrypt",
+      "kms:GenerateDataKey",
+    ]
+
+    resources = [aws_kms_key.data_lake.arn]
   }
 
   statement {

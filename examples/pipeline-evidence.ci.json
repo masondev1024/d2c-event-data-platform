@@ -1,0 +1,20 @@
+{
+  "pipeline": "factory-sensor",
+  "captured_at": "2026-09-06T00:00:00Z",
+  "schema_version": "factory-sensor.v1",
+  "routing": {
+    "input_records": 3,
+    "clean_records": 2,
+    "dlq_records": 1
+  },
+  "sink": {
+    "received_records": 2,
+    "unique_rows": 2,
+    "duplicate_rows": 0,
+    "failed_records": 0
+  },
+  "quality": {
+    "passed": true,
+    "failures": []
+  }
+}

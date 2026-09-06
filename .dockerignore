@@ -6,3 +6,13 @@ runtime
 data
 __pycache__
 *.pyc
+tests
+scripts
+schemas
+examples
+docs
+infra
+.terraform
+*.tfstate
+*.tfstate.*
+*.tfvars
