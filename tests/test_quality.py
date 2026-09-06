@@ -99,9 +99,7 @@ class LakeQualityTest(unittest.TestCase):
                     )
                     """
                 )
-                connection.execute(
-                    "COPY aws_events TO ? (FORMAT PARQUET)", [parquet_path]
-                )
+                connection.table("aws_events").write_parquet(parquet_path)
             finally:
                 connection.close()
 

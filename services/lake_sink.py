@@ -289,11 +289,23 @@ def write_canonical_events(
                         "INSERT INTO current_batch SELECT * EXCLUDE (batch_id, stored_at) FROM lake_events WHERE batch_id = ?",
                         [batch_id],
                     )
-                    connection.execute(
-                        "COPY (SELECT * FROM current_batch) TO ? "
-                        "(FORMAT PARQUET, PARTITION_BY (event_date))",
-                        [str(staging_path)],
-                    )
+                    event_dates = [
+                        row[0]
+                        for row in connection.execute(
+                            "SELECT DISTINCT event_date FROM current_batch ORDER BY event_date"
+                        ).fetchall()
+                    ]
+                    for event_date in event_dates:
+                        partition_path = staging_path / f"event_date={event_date.isoformat()}"
+                        partition_path.mkdir(parents=True, exist_ok=False)
+                        partition_relation = connection.sql(
+                            "SELECT * FROM current_batch WHERE event_date = ?",
+                            params=[event_date],
+                        )
+                        partition_relation.write_parquet(
+                            str(partition_path / "data.parquet"),
+                            compression="snappy",
+                        )
                 if not _export_matches_batch(connection, staging_path, expected_event_ids):
                     raise RuntimeError(f"Parquet export validation failed for batch {batch_id}")
                 if final_path.exists():
