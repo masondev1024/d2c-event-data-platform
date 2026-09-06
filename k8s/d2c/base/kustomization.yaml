@@ -20,6 +20,6 @@ resources:
 
 images:
   - name: ghcr.io/masondev1024/d2c-event-data-platform-api
-    newTag: v0.2.0
+    newTag: v0.2.1
   - name: ghcr.io/masondev1024/d2c-event-data-platform
-    newTag: v0.2.0
+    newTag: v0.2.1
