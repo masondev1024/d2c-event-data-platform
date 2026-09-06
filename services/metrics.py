@@ -145,14 +145,17 @@ def start_metrics_server(registry: MetricsRegistry, port: int) -> ThreadingHTTPS
         def log_message(self, _format: str, *_args: object) -> None:
             return
 
-    server = ThreadingHTTPServer(("0.0.0.0", port), MetricsHandler)
+    # Bind locally by default; container deployments opt in explicitly so a
+    # metrics endpoint is reachable only on the intended network interface.
+    bind_host = os.getenv("METRICS_BIND_HOST", "127.0.0.1")
+    server = ThreadingHTTPServer((bind_host, port), MetricsHandler)
     thread = threading.Thread(
         target=server.serve_forever,
         name=f"metrics-server-{port}",
         daemon=True,
     )
     thread.start()
-    LOGGER.info("metrics_server_started address=0.0.0.0:%s", port)
+    LOGGER.info("metrics_server_started address=%s:%s", bind_host, port)
     return server
 
 

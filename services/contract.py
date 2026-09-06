@@ -22,6 +22,8 @@ TEXT_EVENT_PATTERN = re.compile(
     r"HUMI:(?P<humidity>[-+]?\d+(?:\.\d+)?)\s+\|\s*"
     r"STAT:(?P<status>[A-Za-z_]+)"
 )
+CANONICAL_SCHEMA_VERSION = "factory-sensor.v1"
+DLQ_SCHEMA_VERSION = "factory-sensor-dlq.v1"
 
 
 class DataQualityError(ValueError):
@@ -176,7 +178,7 @@ def normalize_sensor_event(raw: Any, ingested_at: datetime | None = None) -> Nor
     ingestion_time = (ingested_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
 
     return NormalizedSensorEvent(
-        schema_version="factory-sensor.v1",
+        schema_version=CANONICAL_SCHEMA_VERSION,
         event_id=event_id,
         event_time=event_time,
         ingested_at=ingestion_time.isoformat().replace("+00:00", "Z"),
@@ -185,3 +187,73 @@ def normalize_sensor_event(raw: Any, ingested_at: datetime | None = None) -> Nor
         humidity=humidity,
         status=status,
     )
+
+
+def validate_canonical_sensor_event(raw: Any) -> None:
+    """Validate an already-normalized event before a downstream write.
+
+    The processor validates source records, but every downstream boundary must
+    still fail closed because a replay, manual publish, or producer regression
+    can bypass that process. The event id is recomputed to protect idempotency
+    from a payload whose identity was altered after normalization.
+    """
+
+    if not isinstance(raw, dict):
+        raise DataQualityError("canonical event must be a JSON object")
+
+    required = {
+        "schema_version",
+        "event_id",
+        "event_time",
+        "ingested_at",
+        "sensor_id",
+        "temperature",
+        "humidity",
+        "status",
+        "source",
+    }
+    missing = sorted(field for field in required if raw.get(field) in (None, ""))
+    if missing:
+        raise DataQualityError(f"canonical event is missing fields: {missing}")
+    unknown = sorted(set(raw) - required)
+    if unknown:
+        raise DataQualityError(f"canonical event has unsupported fields: {unknown}")
+    if raw["schema_version"] != CANONICAL_SCHEMA_VERSION:
+        raise DataQualityError(
+            f"unsupported canonical schema_version: {raw['schema_version']}"
+        )
+
+    source = raw["source"]
+    if not isinstance(source, dict):
+        raise DataQualityError("canonical event source must be an object")
+    if set(source) != {"topic", "partition", "offset"}:
+        raise DataQualityError("canonical event source must contain only topic, partition and offset")
+    if not isinstance(source["topic"], str) or not source["topic"].strip():
+        raise DataQualityError("canonical event source.topic is required")
+    if (
+        isinstance(source["partition"], bool)
+        or not isinstance(source["partition"], int)
+        or source["partition"] < 0
+    ):
+        raise DataQualityError("canonical event source.partition must be a non-negative integer")
+    if (
+        isinstance(source["offset"], bool)
+        or not isinstance(source["offset"], int)
+        or source["offset"] < 0
+    ):
+        raise DataQualityError("canonical event source.offset must be a non-negative integer")
+
+    event = normalize_sensor_event(
+        {
+            "timestamp": raw["event_time"],
+            "sensor_id": raw["sensor_id"],
+            "temperature": raw["temperature"],
+            "humidity": raw["humidity"],
+            "status": raw["status"],
+        }
+    )
+    if not isinstance(raw["event_id"], str) or raw["event_id"] != event.event_id:
+        raise DataQualityError("event_id does not match the canonical payload")
+    if raw["ingested_at"] in (None, ""):
+        raise DataQualityError("ingested_at is required")
+    _parse_event_time(raw["ingested_at"])

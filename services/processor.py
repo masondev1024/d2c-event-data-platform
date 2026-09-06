@@ -14,7 +14,7 @@ from kafka import KafkaConsumer, KafkaProducer, TopicPartition
 from kafka.structs import OffsetAndMetadata
 from kafka.errors import KafkaError
 
-from .contract import DataQualityError, normalize_sensor_event
+from .contract import DLQ_SCHEMA_VERSION, DataQualityError, normalize_sensor_event
 from .metrics import MetricsRegistry, metrics_port_from_env, start_metrics_server
 
 
@@ -46,7 +46,7 @@ def _decode(raw: bytes | None) -> Any:
 
 def _build_dlq(raw: Any, error: Exception, topic: str, partition: int, offset: int) -> dict[str, Any]:
     return {
-        "schema_version": "factory-sensor-dlq.v1",
+        "schema_version": DLQ_SCHEMA_VERSION,
         "failed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "error_type": type(error).__name__,
         "error_message": str(error),
@@ -173,6 +173,11 @@ def run() -> None:
         assert producer is not None
         while not STOP_REQUESTED:
             records = consumer.poll(timeout_ms=1_000, max_records=50)
+            metrics.set_gauge(
+                "sensor_processor_heartbeat_unixtime",
+                time.time(),
+                help_text="Unix timestamp of the last completed consumer poll.",
+            )
             if time.monotonic() >= next_lag_check:
                 _update_consumer_lag(consumer, metrics)
                 next_lag_check = time.monotonic() + lag_interval_seconds

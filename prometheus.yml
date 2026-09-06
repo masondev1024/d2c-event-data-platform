@@ -13,3 +13,16 @@ scrape_configs:
   - job_name: "sensor-sink"
     static_configs:
       - targets: ["stream-sink:9101"]
+
+  - job_name: "d2c-api"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["d2c-api:8080"]
+
+  - job_name: "d2c-outbox-publisher"
+    static_configs:
+      - targets: ["d2c-outbox-publisher:9102"]
+
+  - job_name: "d2c-event-consumer"
+    static_configs:
+      - targets: ["d2c-event-consumer:9103"]

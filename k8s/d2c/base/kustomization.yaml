@@ -1,0 +1,25 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: d2c
+
+resources:
+  - configmap.yaml
+  - rollout.yaml
+  - services.yaml
+  - ingress.yaml
+  - analysis-template.yaml
+  - service-monitors.yaml
+  - prometheus-rules.yaml
+  - migration-job.yaml
+  - outbox-deployment.yaml
+  - outbox-service.yaml
+  - consumer-deployment.yaml
+  - consumer-service.yaml
+  - pvc.yaml
+
+images:
+  - name: ghcr.io/masondev1024/d2c-event-data-platform-api
+    newTag: v0.2.0
+  - name: ghcr.io/masondev1024/d2c-event-data-platform
+    newTag: v0.2.0

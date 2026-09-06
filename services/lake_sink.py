@@ -289,9 +289,10 @@ def write_canonical_events(
                         "INSERT INTO current_batch SELECT * EXCLUDE (batch_id, stored_at) FROM lake_events WHERE batch_id = ?",
                         [batch_id],
                     )
-                    quoted_path = str(staging_path).replace("'", "''")
                     connection.execute(
-                        f"COPY (SELECT * FROM current_batch) TO '{quoted_path}' (FORMAT PARQUET, PARTITION_BY (event_date))"
+                        "COPY (SELECT * FROM current_batch) TO ? "
+                        "(FORMAT PARQUET, PARTITION_BY (event_date))",
+                        [str(staging_path)],
                     )
                 if not _export_matches_batch(connection, staging_path, expected_event_ids):
                     raise RuntimeError(f"Parquet export validation failed for batch {batch_id}")

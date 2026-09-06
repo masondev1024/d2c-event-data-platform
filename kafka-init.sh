@@ -6,6 +6,9 @@ topics=(
   factory.sensor.raw.text.v1
   factory.sensor.clean.v1
   factory.sensor.dlq.v1
+  factory.sensor.sink.dlq.v1
+  d2c.application.approved.v1
+  d2c.application.consumer.dlq.v1
 )
 
 for topic in "${topics[@]}"; do

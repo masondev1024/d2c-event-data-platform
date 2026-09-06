@@ -1,0 +1,110 @@
+name: security
+
+on:
+  push:
+    branches: ["main", "poc/**", "feat/**"]
+  pull_request:
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dependency-and-code-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install runtime and audit tools
+        run: |
+          python -m pip install --requirement requirements.txt
+          python -m pip install --requirement app/requirements.txt
+          python -m pip install pip-audit==2.9.0 bandit==1.8.6
+
+      - name: Audit Python dependencies
+        run: |
+          pip-audit --requirement requirements.txt --strict
+          pip-audit --requirement app/requirements.txt --strict
+
+      - name: Scan Python source
+        run: bandit --recursive app services scripts --severity-level medium --confidence-level medium
+
+  container-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build non-root worker image
+        run: docker build --tag factory-sensor:${{ github.sha }} .
+
+      - name: Build non-root D2C API image
+        run: docker build --file app/Dockerfile --tag d2c-api:${{ github.sha }} .
+
+      - name: Set up Trivy
+        uses: aquasecurity/setup-trivy@e07451d2e059ed86c2870430ea286b3a9e0bf241
+        with:
+          version: v0.72.0
+
+      - name: Scan repository configuration and dependencies
+        run: >-
+          trivy fs .
+          --scanners vuln,secret,misconfig
+          --severity HIGH,CRITICAL
+          --ignore-unfixed
+          --exit-code 1
+          --skip-dirs .git
+          --skip-dirs infra/terraform/.terraform
+
+      - name: Scan worker image
+        run: >-
+          trivy image factory-sensor:${{ github.sha }}
+          --scanners vuln,secret,misconfig
+          --severity HIGH,CRITICAL
+          --ignore-unfixed
+          --exit-code 1
+
+      - name: Scan D2C API image
+        run: >-
+          trivy image d2c-api:${{ github.sha }}
+          --scanners vuln,secret,misconfig
+          --severity HIGH,CRITICAL
+          --ignore-unfixed
+          --exit-code 1
+
+      - name: Generate SPDX image SBOM
+        uses: anchore/sbom-action@v0.24.0
+        with:
+          image: factory-sensor:${{ github.sha }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          artifact-name: sbom.spdx.json
+
+      - name: Generate SPDX D2C API SBOM
+        uses: anchore/sbom-action@v0.24.0
+        with:
+          image: d2c-api:${{ github.sha }}
+          format: spdx-json
+          output-file: d2c-api.sbom.spdx.json
+          artifact-name: d2c-api.sbom.spdx.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.sha }}
+          path: |
+            sbom.spdx.json
+            d2c-api.sbom.spdx.json
+          if-no-files-found: error

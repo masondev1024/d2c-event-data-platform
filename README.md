@@ -1,6 +1,9 @@
-# Kafka Streaming Data Platform PoC
+# D2C Event Data Platform
 
-`local-datapipeline` 브랜치의 센서 로그 수집 실습을 기반으로, Kafka를 운영 가능한 데이터 파이프라인의 중심으로 확장한 로컬 PoC입니다.
+센서 로그 수집 실습에서 출발해, D2C 응모 승인 도메인의 데이터 정합성과 배포 안전성을
+검증하는 Kafka 기반 Data Platform PoC입니다. 핵심 증거는 Kafka를 붙였다는 사실이 아니라
+`승인 → 같은 DB 트랜잭션의 outbox → Kafka → 멱등 consumer` 경계와 이를 실제 release gate로
+사용하는 운영 신호입니다.
 
 이 README가 프로젝트의 실행·설계·운영 문서의 canonical source입니다. 상세 설계 메모와
 일회성 검증 원본은 `docs/`에 로컬로 보관하지만 Git에는 포함하지 않습니다.
@@ -16,7 +19,14 @@
 - AWS Firehose → S3 bronze Parquet → Glue/Athena 전송 경로는 `aws` Compose profile로 분리
 - Processor/Sink의 Prometheus metrics와 짧은 보존 정책으로 운영 상태·비용을 함께 확인
 - local event-time Parquet lake와 AWS arrival-time bronze를 분리해 레이크화 경계를 검증
+- 응모 승인과 transactional outbox를 같은 PostgreSQL 트랜잭션으로 기록
+- 승인/outbox parity SLI, 5xx, p95 latency, outbox backlog를 Prometheus와 Argo canary gate에 연결
+- validation-only failure drill에서 불일치·5xx·지연 시 stable 복귀 경로를 재현
 - Terraform, CI, 데이터 품질 SQL, 장애·비용 runbook을 코드와 함께 관리
+
+실행·장애 대응 절차는 [RUNBOOK.md](RUNBOOK.md), 프로젝트 개요와 설계 의사결정은 이
+README를 canonical source로 사용합니다. 상세 메모와 일회성 검증 원본은 `docs/`에 로컬로
+보관하며 Git에는 포함하지 않습니다.
 
 ## 아키텍처
 
@@ -44,6 +54,36 @@ log_gen.py
                                                                   ▼
                                                          Glue / Athena
 ```
+
+### 고정한 D2C release-confidence 흐름
+
+```text
+POST /api/apply
+    │
+    ▼
+PostgreSQL transaction
+    ├── d2c_applications(status=APPROVED)
+    └── d2c_outbox_events(payload=d2c.application.approved.v1)
+             │
+             ▼
+      at-least-once outbox publisher ──> Kafka
+                                           │
+                                           ▼
+                              event_id 멱등 consumer
+                                           │
+                                           ▼
+                                  DuckDB / lake boundary
+
+Prometheus: parity gap + parity check + 5xx ratio + p95 + backlog + traffic
+    │
+    ▼
+Argo Rollouts AnalysisRun ── pass: canary promotion / fail: stable 유지·abort
+```
+
+응모 승인 row와 outbox row는 하나의 commit으로 함께 보이거나 함께 rollback됩니다.
+publisher는 Kafka ack 이후 `published_at`을 기록하므로 ack와 DB update 사이 crash는 중복
+publish를 만들 수 있습니다. consumer의 `event_id` primary key와 `ON CONFLICT DO NOTHING`이
+이를 흡수하는 at-least-once + idempotent sink 모델이며, exactly-once라고 과장하지 않습니다.
 
 Kafka 내부 컨테이너는 `kafka:9092`, 호스트에서 접근할 때는 `localhost:29092`를 사용합니다. 로컬 브로커는 KRaft 단일 노드이며 replication factor는 1입니다. 이는 개발용 설정이고 고가용성 구성이 아닙니다.
 
@@ -73,6 +113,95 @@ open http://localhost:9090
 Prometheus에는 lag, publish failure, DLQ 비율, sink write failure에 대한 기본 alert rule도
 포함되어 있습니다. 이 로컬 profile은 Alertmanager를 붙이지 않았으므로 alert state는
 Prometheus UI에서 확인하고, 운영 배포에서는 알림 채널과 on-call 정책을 연결합니다.
+
+## D2C approval vertical slice
+
+### 실행
+
+```bash
+docker compose --profile d2c up -d --build \
+  kafka kafka-init postgres d2c-migrate d2c-api \
+  d2c-outbox-publisher d2c-event-consumer
+
+curl -fsS http://127.0.0.1:8080/readyz
+curl -sS -X POST http://127.0.0.1:8080/api/apply \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: apply-local-0001' \
+  -d '{"user_id":1001,"campaign_id":1}'
+
+# 같은 idempotency key/aggregate는 duplicate 응답이며 두 번째 event를 만들지 않습니다.
+curl -sS -X POST http://127.0.0.1:8080/api/apply \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: apply-local-0001' \
+  -d '{"user_id":1001,"campaign_id":1}'
+```
+
+검증 포인트는 API metric, PostgreSQL outbox, Kafka topic, consumer 저장소를 한 번에 비교하는
+것입니다.
+
+```bash
+docker compose exec -T postgres psql -U d2c -d d2c -c \
+  'SELECT COUNT(*) AS applications,
+          (SELECT COUNT(*) FROM d2c_outbox_events) AS outbox_events,
+          (SELECT COUNT(*) FROM d2c_outbox_events WHERE published_at IS NOT NULL) AS published,
+          (SELECT COUNT(*) FROM d2c_outbox_events WHERE published_at IS NULL) AS backlog;'
+
+curl -fsS http://127.0.0.1:8080/metrics | rg \
+  'd2c_(apply_requests_total|outbox_events_total|outbox_parity_gap|outbox_parity_check_success|db_readiness)'
+
+docker compose exec -T d2c-event-consumer python -c \
+  "import duckdb; c=duckdb.connect('/data/d2c_events.duckdb', read_only=True); print(c.execute('select count(*), count(distinct event_id) from d2c_application_events').fetchone())"
+
+docker compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server kafka:9092 \
+  --describe --group d2c-application-event-consumer-v1
+```
+
+### Release gate와 Kubernetes
+
+`k8s/d2c/base`에는 다음을 포함합니다.
+
+- Argo Rollout: 10% → AnalysisRun → 50% → AnalysisRun 단계
+- stable/canary Service와 NGINX Ingress traffic routing
+- 승인 API의 5xx ratio, p95, DB readiness, outbox parity/조회 성공, canary traffic gate
+- transactional outbox publisher, idempotent consumer, PreSync schema migration Job
+- Prometheus Operator `ServiceMonitor`/`PrometheusRule`와 non-root/read-only container security context
+
+```bash
+kubectl kustomize k8s/d2c/base
+kubectl kustomize k8s/d2c/overlays/validation
+```
+
+`validation` overlay는 `D2C_ENV=validation`, `ALLOW_FAILURE_DRILL=true`,
+`D2C_OUTBOX_FAILURE_INJECTION=before_outbox_insert`를 넣은 실패 재현 전용입니다. 실제
+cluster 적용에는 Argo Rollouts, NGINX Ingress, Prometheus Operator, PostgreSQL/Kafka,
+`d2c-api-secret`, `d2c-api-tls`가 필요하며, 현재 repository에서 실제 cluster rollout을
+실행했다고 주장하지 않습니다. 클러스터가 없는 환경에서는 Kustomize render와 local
+Docker 수직 슬라이스를 검증 증거로 사용합니다.
+
+API는 포트폴리오용 synthetic/internal boundary라 인증·인가를 구현하지 않았습니다. 실제
+D2C 외부 트래픽에 노출하기 전에는 IdP/OIDC, rate limit, CSRF 또는 service-to-service
+identity, TLS, secret manager, audit log를 edge와 workload identity에 추가해야 합니다.
+
+장애 주입·복구 명령과 실제 측정표는 [RUNBOOK.md](RUNBOOK.md)에 정리했습니다.
+
+### 실제 local validation (2026-09-06)
+
+로컬 Docker 수직 슬라이스에서 승인 8건을 흘려 확인한 결과입니다. publisher 이미지에서
+누락된 `kafka-python` 의존성을 먼저 발견·수정한 뒤 재실행했으며, 재시작 전후 outbox row의
+재처리도 확인했습니다.
+
+| 경계 | 실측값 | 판정 |
+| --- | ---: | --- |
+| PostgreSQL applications / outbox | 9 / 9 | parity invariant 유지 |
+| published / unpublished outbox | 9 / 0 | publisher drain 완료 |
+| consumer stored / unique event_id | 9 / 9 | 중복 없음 |
+| Kafka consumer lag | 모든 partition 0 | 정상 수렴 |
+| parity gap / query success | 0 / 1 | release gate 통과 |
+| 승인 API 응답 sample | 11.6–19.1 ms | 정상 |
+| outbox failure drill | HTTP 503, row 증가 0 | 원자성 보호 |
+| PostgreSQL outage | readiness 503, gap/check 1/0 → 복구 | fail-closed |
+| Kafka outage | 승인 201, backlog 1 → 복구 후 0 | durable retry |
 
 Processor는 output publish가 성공한 뒤 처리한 Kafka record 하나의 offset만 명시적으로
 commit합니다. 따라서 crash 후 중복은 허용하는 at-least-once 모델이며, sink의 `event_id`
@@ -198,8 +327,10 @@ Kafka UI는 <http://localhost:8081>에서 확인할 수 있습니다.
 python3 -m unittest discover -s tests -v
 ```
 
-GitHub Actions는 push/PR마다 Python compile·unit test와 Terraform `fmt -check`·`validate`를
-실행합니다. CI에서는 AWS `apply`나 `destroy`를 실행하지 않아 credential과 비용을 분리합니다.
+GitHub Actions는 push/PR마다 root/app 의존성 설치, Python compile·unit test, D2C JSON
+Schema 검증, Kustomize render, Terraform `fmt -check`·`validate`를 실행합니다. 별도
+security workflow는 dependency audit, Bandit, CodeQL, Trivy, 이미지 SBOM을 수행합니다.
+CI에서는 AWS `apply`나 `destroy`를 실행하지 않아 credential과 비용을 분리합니다.
 
 DLQ 경로를 강제로 확인하려면 별도 터미널에서 다음처럼 invalid event 비율을 높여 실행합니다.
 
@@ -320,6 +451,7 @@ S3 bucket의 `force_destroy` 기본값은 `false`입니다. 데이터가 남은 
 
 - Firehose: 시간당 클러스터 비용 없이 수집 데이터량 기준 과금되며, Direct PUT은 5 KB 단위로 반올림됩니다. JSON→Parquet 변환도 별도 데이터 처리량 과금 대상입니다.
 - S3: 저장량·request·data transfer 기준 과금이며 `bronze/`, `errors/` 객체를 7일 후 삭제합니다.
+- KMS: customer-managed key와 암호화 API 요청에 비용이 발생할 수 있습니다. 일회성 포트폴리오 실습에서는 검증 후 `terraform destroy`까지 수행해 키와 잔존 비용을 정리합니다.
 - Athena: 스캔 데이터 기준 과금이므로 partition filter를 사용합니다. 공식 가격 기준 쿼리당 10 MB 최소 스캔이 적용됩니다.
 - Glue Catalog/CloudWatch: 작은 metadata와 짧은 로그 보존으로 실습 규모에서는 보통 주요 비용원이 아닙니다. 로그량·custom metric 사용량은 계정별로 확인합니다.
 - MSK: 이 PoC에는 포함하지 않았습니다. 상시 broker/serverless 비용이 발생할 수 있어, Kafka 자체를 AWS에 띄우는 단계는 별도 실습으로 분리합니다.
@@ -376,11 +508,17 @@ target은 processor/sink 모두 `up`이었고, DLQ rate 약 10.35% alert는 `for
 Terraform destroy를 실행했습니다. 따라서 이 검증으로 남은 상시 AWS 리소스나 지속 비용은
 없습니다.
 
-## 남은 고도화 단계
+## 현재 완료 범위와 다음 단계
 
-1. Glue Schema Registry 또는 JSON Schema compatibility check를 CI에 추가
-2. 현재 S3 Parquet landing을 Spark Structured Streaming + Iceberg snapshot/compaction으로 교체
-3. Airflow DAG로 freshness, null/range/duplicate 검사와 backfill을 자동화
-4. Kafka TLS/SASL, ACL, secret manager와 cloud workload identity 적용
-5. 단일 브로커를 다중 broker/RF3 또는 비용을 통제한 MSK 실습 환경으로 확장
-6. Testcontainers 기반 통합 테스트와 Kafka/Firehose 장애 주입 테스트 추가
+현재 구현·검증된 범위는 승인 API의 transactional outbox, 공유 D2C event contract/JSON
+Schema, at-least-once publisher, `event_id` 멱등 consumer, DB-truth parity SLI, 5xx/p95/
+backlog metrics, Argo canary manifest, failure drill, local event-time Parquet quality gate,
+AWS Firehose→S3 bronze Parquet POC, CI/security workflow입니다.
+
+운영 수준으로 더 확장할 때의 순서는 다음과 같습니다.
+
+1. EKS에서 실제 Argo Rollouts + NGINX + Prometheus Operator를 연결하고 AnalysisRun abort와 stable traffic을 실측
+2. AWS workload identity, Secrets Manager, Kafka TLS/SASL/ACL과 외부 인증·인가 추가
+3. DuckDB/local Parquet consumer sink를 Spark Structured Streaming + Iceberg snapshot/compaction으로 교체
+4. Airflow/dbt 또는 데이터 품질 오케스트레이터로 freshness, null/range/duplicate 검사와 backfill 자동화
+5. MSK 또는 다중 broker/RF3 환경에서 rebalance, partition scaling, retention/비용을 별도 실습
