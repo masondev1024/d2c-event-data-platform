@@ -8,6 +8,15 @@
 이 README가 프로젝트의 실행·설계·운영 문서의 canonical source입니다. 상세 설계 메모와
 일회성 검증 원본은 `docs/`에 로컬로 보관하지만 Git에는 포함하지 않습니다.
 
+## 구현 내용과 검증 기록
+
+승인 기록이 이벤트 전달과 소비자 저장까지 이어지는 경계는 다음 순서로 확인할 수 있습니다.
+
+- 구현: [승인 API](app/app.py)는 승인과 outbox를 같은 DB 트랜잭션으로 기록합니다. [publisher](app/outbox_publisher.py)는 Kafka 확인 응답 뒤 발행 상태를 갱신하고, [consumer](services/d2c_event_consumer.py)는 `event_id`로 중복 저장을 막습니다. 전달 의미는 at-least-once이며, 재처리는 소비자 멱등성으로 처리합니다.
+- 건수 대조: [2026-09-06 로컬 검증 기록](RUNBOOK.md#2026-09-06-로컬-검증-기록)의 최종 승인·outbox·consumer 저장 건수는 **9 / 9 / 9**입니다. 미발행 outbox는 0건, 저장된 고유 `event_id`는 9건, Kafka lag는 모든 partition에서 0으로 기록됐습니다.
+- 실패와 복구: 같은 [RUNBOOK](RUNBOOK.md#2026-09-06-로컬-검증-기록)에 outbox 기록 실패 시 DB row 증가 0, PostgreSQL 장애 시 readiness 실패, Kafka 복구 후 backlog 해소를 남겼습니다.
+- 실행 범위: [Compose 구성](docker-compose.yml)의 로컬 KRaft 단일 브로커·복제 계수 1에서 얻은 기록입니다. 별도 AWS 전송 경로의 결과와 구분하며, 다중 브로커 고가용성이나 실제 Kubernetes canary 배포를 검증한 수치로 사용하지 않습니다.
+
 ## 목표
 
 - 파일 로그 수집과 Kafka raw topic 발행
