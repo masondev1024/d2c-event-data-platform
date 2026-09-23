@@ -176,7 +176,7 @@ docker compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh \
 ### Spark + Iceberg analytics boundary
 
 `lakehouse` profile은 외부 AWS catalog나 object storage를 만들지 않는 로컬 검증용입니다.
-Spark 3.5.9와 Iceberg 1.11.0 runtime dependency를 이미지 build 시 고정해 실행 중 Maven
+Spark 4.1.3(Scala 2.13)와 Iceberg 1.11.0 runtime dependency를 이미지 build 시 고정해 실행 중 Maven
 다운로드에 의존하지 않습니다. approval fact는 `days(occurred_at)`으로 partition하고, 계약
 위반 원문은 Kafka `topic/partition/offset`을 key로 quarantine합니다.
 
@@ -373,7 +373,15 @@ python3 -m unittest discover -s tests -v
 GitHub Actions는 push/PR마다 root/app 의존성 설치, Python compile·unit test, D2C JSON
 Schema·catalog 검증, Iceberg runtime image build 및 local catalog smoke test, Kustomize render,
 Terraform `fmt -check`·`validate`를 실행합니다. 별도 security workflow는 dependency audit,
-Bandit, Trivy, worker/API/catalog/lakehouse 이미지 SBOM을 수행합니다.
+Bandit, Trivy, worker/API/catalog/lakehouse 이미지 SBOM을 수행합니다. Lakehouse 이미지는 사용하지
+않는 Spark Connect·Hive Thrift·Derby·ZooKeeper 구성요소와 이전 direct runtime JAR를 제거하고,
+Kafka/Netty/Jackson/HTTP direct runtime을 고정된 patched dependency로 보강합니다. 남은 upstream
+nested JAR finding은 `security/lakehouse.trivyignore.yaml`에서 **정확한 JAR 경로와 45일 이내
+만료일**로만 제한하며, `scripts/validate_lakehouse_trivy_exceptions.py`가 무기한·와일드카드 예외를
+먼저 거부합니다. 경로가 달라지거나 만료되거나 새로 고정 가능한 HIGH/CRITICAL finding이 생기면
+release gate는 실패합니다. Upstream이 아직 수정하지 않은 HIGH/CRITICAL finding은 차단 대상과
+구분해 `d2c-lakehouse-trivy.json` artifact로 남기므로, release 통과를 취약점 부재 주장으로 사용하지
+않습니다.
 CI에서는 AWS `apply`나 `destroy`를 실행하지 않아 credential과 비용을 분리합니다.
 
 DLQ 경로를 강제로 확인하려면 별도 터미널에서 다음처럼 invalid event 비율을 높여 실행합니다.

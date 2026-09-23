@@ -1,4 +1,4 @@
-.PHONY: test verify schema-check evidence-check quality-check d2c-contract-check lake-export catalog-check lakehouse-check lakehouse-image
+.PHONY: test verify schema-check evidence-check quality-check d2c-contract-check lake-export catalog-check lakehouse-check lakehouse-security-check lakehouse-image
 
 PYTHON ?= python3
 
@@ -32,8 +32,12 @@ catalog-check:
 lakehouse-check:
 	$(PYTHON) -m unittest discover -s tests -p 'test_d2c_iceberg_stream.py' -v
 
+lakehouse-security-check:
+	$(PYTHON) scripts/validate_lakehouse_trivy_exceptions.py \
+		--policy security/lakehouse.trivyignore.yaml
+
 lakehouse-image:
 	docker build --file lakehouse/Dockerfile --tag d2c-iceberg-stream:local .
 
-verify: test schema-check evidence-check d2c-contract-check catalog-check
+verify: test schema-check evidence-check d2c-contract-check catalog-check lakehouse-security-check
 	$(PYTHON) -m compileall -q app services scripts lakehouse d2c_contract.py log_gen.py
