@@ -1,0 +1,363 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/masondev1024/d2c-event-data-platform/blob/main/catalog/schemas/data-product.v1.schema.json",
+  "title": "Data product catalog entry v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "catalog_version",
+    "id",
+    "name",
+    "description",
+    "domain",
+    "maturity",
+    "owner",
+    "classification",
+    "service_levels",
+    "quality_rules",
+    "assets"
+  ],
+  "properties": {
+    "catalog_version": {
+      "const": "data-product.v1"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{2,62}$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 120
+    },
+    "description": {
+      "type": "string",
+      "minLength": 20,
+      "maxLength": 1000
+    },
+    "domain": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{2,62}$"
+    },
+    "maturity": {
+      "enum": [
+        "prototype",
+        "production-candidate",
+        "operational"
+      ]
+    },
+    "owner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "team",
+        "runbook"
+      ],
+      "properties": {
+        "team": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{2,62}$"
+        },
+        "runbook": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._/-]+$"
+        }
+      }
+    },
+    "classification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "level",
+        "fields"
+      ],
+      "properties": {
+        "level": {
+          "enum": [
+            "public",
+            "internal",
+            "restricted"
+          ]
+        },
+        "fields": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "asset_id",
+              "path",
+              "classification",
+              "handling"
+            ],
+            "properties": {
+              "asset_id": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9-]{2,62}$"
+              },
+              "path": {
+                "type": "string",
+                "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,126}$"
+              },
+              "classification": {
+                "enum": [
+                  "pseudonymous-identifier",
+                  "business-identifier",
+                  "operational-metadata"
+                ]
+              },
+              "handling": {
+                "type": "string",
+                "minLength": 10,
+                "maxLength": 500
+              }
+            }
+          }
+        }
+      }
+    },
+    "service_levels": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "objective",
+          "measurement",
+          "state"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]{2,62}$"
+          },
+          "objective": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "measurement": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "state": {
+            "enum": [
+              "implemented",
+              "planned"
+            ]
+          }
+        }
+      }
+    },
+    "quality_rules": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "asset_id",
+          "name",
+          "rule",
+          "state"
+        ],
+        "properties": {
+          "asset_id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]{2,62}$"
+          },
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]{2,62}$"
+          },
+          "rule": {
+            "type": "string",
+            "minLength": 10,
+            "maxLength": 500
+          },
+          "state": {
+            "enum": [
+              "implemented",
+              "planned"
+            ]
+          }
+        }
+      }
+    },
+    "assets": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "name",
+          "description",
+          "kind",
+          "state",
+          "primary_key",
+          "upstreams"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]{2,62}$"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 120
+          },
+          "description": {
+            "type": "string",
+            "minLength": 20,
+            "maxLength": 1000
+          },
+          "kind": {
+            "enum": [
+              "event",
+              "table",
+              "view"
+            ]
+          },
+          "state": {
+            "enum": [
+              "implemented",
+              "planned"
+            ]
+          },
+          "primary_key": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,126}$"
+            }
+          },
+          "upstreams": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{2,62}$"
+            }
+          },
+          "contract_path": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._/-]+$"
+          },
+          "event_type": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 160
+          },
+          "event_version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "storage": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "engine": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 120
+              },
+              "location": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 500
+              },
+              "table": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160
+              },
+              "catalog": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160
+              }
+            }
+          },
+          "implementation_references": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._/-]+$"
+            }
+          },
+          "future_work": {
+            "type": "string",
+            "minLength": 20,
+            "maxLength": 1000
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "kind": {
+                  "const": "event"
+                }
+              },
+              "required": [
+                "kind"
+              ]
+            },
+            "then": {
+              "required": [
+                "contract_path",
+                "event_type",
+                "event_version"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "state": {
+                  "const": "implemented"
+                }
+              },
+              "required": [
+                "state"
+              ]
+            },
+            "then": {
+              "required": [
+                "implementation_references"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "state": {
+                  "const": "planned"
+                }
+              },
+              "required": [
+                "state"
+              ]
+            },
+            "then": {
+              "required": [
+                "future_work"
+              ]
+            }
+          }
+        ]
+      }
+    }
+  }
+}

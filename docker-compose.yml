@@ -274,6 +274,82 @@ services:
     networks:
       - kafka-net
 
+  catalog-portal:
+    profiles: ["catalog"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: catalog-portal
+    restart: unless-stopped
+    command: ["python", "-m", "services.catalog_portal"]
+    environment:
+      CATALOG_BIND_HOST: 0.0.0.0
+      CATALOG_PORT: 8082
+      CATALOG_DIR: /app/catalog/data-products
+      CATALOG_REPOSITORY_ROOT: /app
+    ports:
+      - "127.0.0.1:8082:8082"
+    networks:
+      - kafka-net
+
+  d2c-iceberg-stream:
+    profiles: ["lakehouse"]
+    build:
+      context: .
+      dockerfile: lakehouse/Dockerfile
+    restart: "no"
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - local[2]
+      - --conf
+      - spark.driver.memory=1g
+      - --conf
+      - spark.executor.memory=1g
+      - /opt/d2c-lakehouse/lakehouse/d2c_iceberg_stream.py
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      D2C_EVENT_TOPIC: d2c.application.approved.v1
+      D2C_LAKEHOUSE_CATALOG: d2c_lakehouse
+      D2C_LAKEHOUSE_NAMESPACE: d2c
+      D2C_LAKEHOUSE_WAREHOUSE: file:///warehouse
+      D2C_LAKEHOUSE_CHECKPOINT: /checkpoints/d2c-application-approvals-v1
+      D2C_LAKEHOUSE_STARTING_OFFSETS: earliest
+      D2C_LAKEHOUSE_MAX_OFFSETS_PER_TRIGGER: "1000"
+      D2C_LAKEHOUSE_TRIGGER: available_now
+    volumes:
+      - d2c-iceberg-warehouse:/warehouse
+      - d2c-spark-checkpoints:/checkpoints
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    networks:
+      - kafka-net
+
+  d2c-iceberg-verify:
+    profiles: ["lakehouse"]
+    build:
+      context: .
+      dockerfile: lakehouse/Dockerfile
+    restart: "no"
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - local[2]
+      - --conf
+      - spark.driver.memory=1g
+      - --conf
+      - spark.executor.memory=1g
+      - /opt/d2c-lakehouse/lakehouse/validate_d2c_iceberg.py
+    environment:
+      D2C_LAKEHOUSE_CATALOG: d2c_lakehouse
+      D2C_LAKEHOUSE_NAMESPACE: d2c
+      D2C_LAKEHOUSE_WAREHOUSE: file:///warehouse
+    volumes:
+      - d2c-iceberg-warehouse:/warehouse
+    networks:
+      - kafka-net
+
   kafka-ui:
     image: provectuslabs/kafka-ui:v0.7.2
     restart: unless-stopped
@@ -295,3 +371,5 @@ networks:
 volumes:
   kafka-data:
   d2c-postgres-data:
+  d2c-iceberg-warehouse:
+  d2c-spark-checkpoints:

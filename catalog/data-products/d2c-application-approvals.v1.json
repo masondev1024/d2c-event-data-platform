@@ -1,0 +1,170 @@
+{
+  "catalog_version": "data-product.v1",
+  "id": "d2c-application-approvals",
+  "name": "D2C application approvals",
+  "description": "A contract-governed D2C approval event product that preserves transactional outbox parity, at-least-once delivery, and idempotent operational consumption.",
+  "domain": "d2c-platform",
+  "maturity": "production-candidate",
+  "owner": {
+    "team": "platform-lab",
+    "runbook": "RUNBOOK.md"
+  },
+  "classification": {
+    "level": "restricted",
+    "fields": [
+      {
+        "asset_id": "d2c-application-approved-event-v1",
+        "path": "data.user_id",
+        "classification": "pseudonymous-identifier",
+        "handling": "Treat as restricted at query boundaries; do not add raw customer attributes to this event contract."
+      },
+      {
+        "asset_id": "d2c-application-approved-event-v1",
+        "path": "data.application_id",
+        "classification": "business-identifier",
+        "handling": "Use only for approval-domain joins and retain access controls with the downstream serving layer."
+      }
+    ]
+  },
+  "service_levels": [
+    {
+      "name": "outbox-parity",
+      "objective": "d2c_outbox_parity_gap = 0",
+      "measurement": "Prometheus gauge compared from approval and outbox database truth at scrape time.",
+      "state": "implemented"
+    },
+    {
+      "name": "publisher-backlog",
+      "objective": "d2c_outbox_backlog < 100 while the publisher is healthy",
+      "measurement": "Prometheus gauge of unpublished transactional outbox rows.",
+      "state": "implemented"
+    },
+    {
+      "name": "consumer-recovery",
+      "objective": "d2c_event_consumer_lag converges to 0 after recovery",
+      "measurement": "Kafka partition lag exported by the idempotent consumer.",
+      "state": "implemented"
+    }
+  ],
+  "quality_rules": [
+    {
+      "asset_id": "d2c-application-approved-event-v1",
+      "name": "contract-shape",
+      "rule": "Every emitted approval event must conform to the versioned JSON Schema before it becomes a supported interface.",
+      "state": "implemented"
+    },
+    {
+      "asset_id": "d2c-application-events-operational",
+      "name": "event-id-uniqueness",
+      "rule": "The operational sink uses event_id as its primary key and treats a replayed event as a duplicate rather than a second fact.",
+      "state": "implemented"
+    },
+    {
+      "asset_id": "d2c-application-events-iceberg",
+      "name": "lake-freshness-and-reconciliation",
+      "rule": "Each Spark batch must classify every Kafka source record as a fact or quarantine row, and replaying the same source ranges must not add fact, quarantine, or audit records.",
+      "state": "implemented"
+    },
+    {
+      "asset_id": "d2c-application-events-iceberg-quarantine",
+      "name": "contract-violation-quarantine",
+      "rule": "A malformed or contract-violating Kafka record must be retained once by topic, partition, and offset instead of stopping the approval analytics stream.",
+      "state": "implemented"
+    }
+  ],
+  "assets": [
+    {
+      "id": "d2c-application-approved-event-v1",
+      "name": "Application approved event v1",
+      "description": "Immutable approval event written into the same PostgreSQL transaction as the application row and published from the transactional outbox.",
+      "kind": "event",
+      "state": "implemented",
+      "primary_key": [
+        "event_id"
+      ],
+      "upstreams": [],
+      "contract_path": "schemas/d2c.application.approved.v1.schema.json",
+      "event_type": "d2c.application.approved.v1",
+      "event_version": 1,
+      "implementation_references": [
+        "app/app.py",
+        "app/outbox_publisher.py",
+        "d2c_contract.py",
+        "schemas/d2c.application.approved.v1.schema.json"
+      ]
+    },
+    {
+      "id": "d2c-application-events-operational",
+      "name": "D2C application events operational sink",
+      "description": "Idempotent DuckDB operational sink for approved events, used to demonstrate replay-safe consumer persistence before an analytics lakehouse sink is introduced.",
+      "kind": "table",
+      "state": "implemented",
+      "primary_key": [
+        "event_id"
+      ],
+      "upstreams": [
+        "d2c-application-approved-event-v1"
+      ],
+      "storage": {
+        "engine": "DuckDB",
+        "location": "data/d2c_events.duckdb",
+        "table": "d2c_application_events"
+      },
+      "implementation_references": [
+        "services/d2c_event_consumer.py",
+        "docker-compose.yml"
+      ]
+    },
+    {
+      "id": "d2c-application-events-iceberg",
+      "name": "D2C application events analytics table",
+      "description": "Checkpointed Spark Structured Streaming fact table for incremental D2C approval analytics with immutable event-id reconciliation at the Apache Iceberg boundary.",
+      "kind": "table",
+      "state": "implemented",
+      "primary_key": [
+        "event_id"
+      ],
+      "upstreams": [
+        "d2c-application-approved-event-v1"
+      ],
+      "storage": {
+        "engine": "Apache Iceberg",
+        "location": "file:///warehouse",
+        "catalog": "d2c_lakehouse",
+        "table": "d2c.application_approvals"
+      },
+      "implementation_references": [
+        "lakehouse/d2c_iceberg_stream.py",
+        "lakehouse/validate_d2c_iceberg.py",
+        "lakehouse/Dockerfile",
+        "docker-compose.yml"
+      ]
+    },
+    {
+      "id": "d2c-application-events-iceberg-quarantine",
+      "name": "D2C application events quarantine table",
+      "description": "Restricted Iceberg quarantine table for malformed and contract-violating approval records, preserving Kafka source coordinates for deterministic remediation.",
+      "kind": "table",
+      "state": "implemented",
+      "primary_key": [
+        "kafka_topic",
+        "kafka_partition",
+        "kafka_offset"
+      ],
+      "upstreams": [
+        "d2c-application-approved-event-v1"
+      ],
+      "storage": {
+        "engine": "Apache Iceberg",
+        "location": "file:///warehouse",
+        "catalog": "d2c_lakehouse",
+        "table": "d2c.application_approval_dlq"
+      },
+      "implementation_references": [
+        "lakehouse/d2c_iceberg_stream.py",
+        "lakehouse/validate_d2c_iceberg.py",
+        "docker-compose.yml"
+      ]
+    }
+  ]
+}

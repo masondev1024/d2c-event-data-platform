@@ -6,7 +6,7 @@ from pathlib import Path
 
 from jsonschema import Draft202012Validator, FormatChecker
 
-from d2c_contract import build_application_approved_event
+from d2c_contract import build_application_approved_event, validate_application_approved_event
 
 
 class D2CEventContractTest(unittest.TestCase):
@@ -40,6 +40,18 @@ class D2CEventContractTest(unittest.TestCase):
         event["data"]["campaign_id"] = 0
 
         self.assertTrue(list(self.validator.iter_errors(event)))
+
+    def test_executable_contract_rejects_a_non_rfc3339_timestamp(self) -> None:
+        event = build_application_approved_event(
+            application_id=42,
+            user_id=7,
+            campaign_id=1,
+        )
+        event["occurred_at"] = "2026-09-23X00:00:00+00:00"
+
+        self.assertTrue(list(self.validator.iter_errors(event)))
+        with self.assertRaisesRegex(ValueError, "RFC 3339"):
+            validate_application_approved_event(event)
 
 
 if __name__ == "__main__":
