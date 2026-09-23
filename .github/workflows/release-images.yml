@@ -48,3 +48,24 @@ jobs:
           tags: ghcr.io/${{ github.repository_owner }}/d2c-event-data-platform-api:${{ github.ref_name }}
           provenance: true
           sbom: true
+
+      - name: Build and publish catalog portal image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          target: catalog-portal
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/d2c-event-data-platform-catalog:${{ github.ref_name }}
+          provenance: true
+          sbom: true
+
+      - name: Build and publish D2C lakehouse image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: lakehouse/Dockerfile
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/d2c-event-data-platform-lakehouse:${{ github.ref_name }}
+          provenance: true
+          sbom: true

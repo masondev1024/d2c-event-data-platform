@@ -9,14 +9,13 @@ import signal
 import time
 from datetime import datetime, timezone
 from typing import Any
-from uuid import UUID
 
 import duckdb
 from kafka import KafkaConsumer, KafkaProducer, TopicPartition
 from kafka.errors import KafkaError
 from kafka.structs import OffsetAndMetadata
 
-from d2c_contract import D2C_EVENT_TYPE, D2C_EVENT_VERSION
+from d2c_contract import D2C_EVENT_TYPE, validate_application_approved_event
 from .metrics import MetricsRegistry, metrics_port_from_env, start_metrics_server
 
 
@@ -45,26 +44,7 @@ def _decode(raw: bytes | None) -> Any:
 
 
 def _validate_event(event: Any) -> None:
-    if not isinstance(event, dict):
-        raise ValueError("D2C event must be a JSON object")
-    required = {"event_id", "event_type", "event_version", "occurred_at", "data"}
-    if set(event) != required:
-        raise ValueError("D2C event has missing or unsupported fields")
-    if event["event_type"] != D2C_EVENT_TYPE:
-        raise ValueError("unsupported D2C event type")
-    if event["event_version"] != D2C_EVENT_VERSION:
-        raise ValueError("unsupported D2C event version")
-    try:
-        UUID(str(event["event_id"]))
-        datetime.fromisoformat(str(event["occurred_at"]).replace("Z", "+00:00"))
-    except (TypeError, ValueError) as error:
-        raise ValueError("D2C event id or occurred_at is invalid") from error
-    data = event["data"]
-    if not isinstance(data, dict) or set(data) != {"application_id", "user_id", "campaign_id"}:
-        raise ValueError("D2C event data is invalid")
-    for field in ("application_id", "user_id", "campaign_id"):
-        if isinstance(data[field], bool) or not isinstance(data[field], int) or data[field] <= 0:
-            raise ValueError(f"D2C event data.{field} must be a positive integer")
+    validate_application_approved_event(event)
 
 
 def _commit_message(consumer: KafkaConsumer, message: Any) -> None:

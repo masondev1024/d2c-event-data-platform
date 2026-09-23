@@ -2,7 +2,7 @@ name: security
 
 on:
   push:
-    branches: ["main", "poc/**", "feat/**"]
+    branches: ["main", "dev", "poc/**", "feat/**"]
   pull_request:
   schedule:
     - cron: "17 3 * * 1"
@@ -39,7 +39,7 @@ jobs:
           pip-audit --requirement app/requirements.txt --strict
 
       - name: Scan Python source
-        run: bandit --recursive app services scripts --severity-level medium --confidence-level medium
+        run: bandit --recursive app services scripts lakehouse --severity-level medium --confidence-level medium
 
   container-scan:
     runs-on: ubuntu-latest
@@ -52,6 +52,12 @@ jobs:
 
       - name: Build non-root D2C API image
         run: docker build --file app/Dockerfile --tag d2c-api:${{ github.sha }} .
+
+      - name: Build non-root catalog portal image
+        run: docker build --target catalog-portal --tag d2c-catalog-portal:${{ github.sha }} .
+
+      - name: Build non-root D2C lakehouse image
+        run: docker build --file lakehouse/Dockerfile --tag d2c-iceberg-stream:${{ github.sha }} .
 
       - name: Set up Trivy
         uses: aquasecurity/setup-trivy@e07451d2e059ed86c2870430ea286b3a9e0bf241
@@ -84,6 +90,22 @@ jobs:
           --ignore-unfixed
           --exit-code 1
 
+      - name: Scan catalog portal image
+        run: >-
+          trivy image d2c-catalog-portal:${{ github.sha }}
+          --scanners vuln,secret,misconfig
+          --severity HIGH,CRITICAL
+          --ignore-unfixed
+          --exit-code 1
+
+      - name: Scan D2C lakehouse image
+        run: >-
+          trivy image d2c-iceberg-stream:${{ github.sha }}
+          --scanners vuln,secret,misconfig
+          --severity HIGH,CRITICAL
+          --ignore-unfixed
+          --exit-code 1
+
       - name: Generate SPDX image SBOM
         uses: anchore/sbom-action@v0.24.0
         with:
@@ -100,6 +122,22 @@ jobs:
           output-file: d2c-api.sbom.spdx.json
           artifact-name: d2c-api.sbom.spdx.json
 
+      - name: Generate SPDX catalog portal SBOM
+        uses: anchore/sbom-action@v0.24.0
+        with:
+          image: d2c-catalog-portal:${{ github.sha }}
+          format: spdx-json
+          output-file: d2c-catalog-portal.sbom.spdx.json
+          artifact-name: d2c-catalog-portal.sbom.spdx.json
+
+      - name: Generate SPDX D2C lakehouse SBOM
+        uses: anchore/sbom-action@v0.24.0
+        with:
+          image: d2c-iceberg-stream:${{ github.sha }}
+          format: spdx-json
+          output-file: d2c-iceberg-stream.sbom.spdx.json
+          artifact-name: d2c-iceberg-stream.sbom.spdx.json
+
       - name: Upload SBOM artifact
         uses: actions/upload-artifact@v4
         with:
@@ -107,4 +145,6 @@ jobs:
           path: |
             sbom.spdx.json
             d2c-api.sbom.spdx.json
+            d2c-catalog-portal.sbom.spdx.json
+            d2c-iceberg-stream.sbom.spdx.json
           if-no-files-found: error

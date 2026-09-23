@@ -8,7 +8,8 @@ __pycache__
 *.pyc
 tests
 scripts
-schemas
+schemas/*
+!schemas/d2c.application.approved.v1.schema.json
 examples
 docs
 infra
