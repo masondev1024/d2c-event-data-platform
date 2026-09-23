@@ -32,7 +32,7 @@ USER root
 # ZooKeeper role. Remove those unused distribution components and the older
 # direct Netty/LZ4 libraries before adding patched runtime dependencies.
 RUN apt-get update \
-    && apt-get install --yes --only-upgrade linux-libc-dev \
+    && apt-get install --yes --no-install-recommends --only-upgrade linux-libc-dev \
     && rm -rf /var/lib/apt/lists/* /opt/spark/examples /opt/spark/jars/connect-repl \
     && rm -f \
         /opt/spark/jars/derby*.jar \
