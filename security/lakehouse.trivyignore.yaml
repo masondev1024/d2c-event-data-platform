@@ -1,0 +1,90 @@
+# The validator rejects unscoped, non-expiring, or long-lived entries before
+# Trivy uses this file. Entries intentionally target only nested upstream jars.
+vulnerabilities:
+  - id: CVE-2025-52999
+    paths:
+      - opt/spark/jars/hadoop-client-runtime-3.4.2.jar
+    expired_at: 2026-10-23
+    statement: >-
+      Jackson is nested in Hadoop's shaded client runtime, which is retained for the
+      local Iceberg Hadoop catalog. Review when Spark or Hadoop refreshes the bundle;
+      do not extend this entry without a new scan and a documented replacement plan.
+  - id: CVE-2026-10050
+    paths:
+      - opt/spark/jars/spark-core_2.13-4.1.3.jar
+    expired_at: 2026-10-23
+    statement: >-
+      Jetty is nested in Spark core. This one-shot profile disables the Spark UI and
+      Compose publishes no host port for the job; the upstream Spark bundle must be
+      refreshed or replaced before this time-boxed exception can be renewed.
+  - id: CVE-2026-2332
+    paths:
+      - opt/spark/jars/hadoop-client-runtime-3.4.2.jar
+      - opt/spark/jars/spark-core_2.13-4.1.3.jar
+    expired_at: 2026-10-23
+    statement: >-
+      Jetty HTTP is present only inside the Spark and Hadoop upstream bundles. The
+      Spark UI is disabled and Compose publishes no host web port for this job; upgrade
+      the owning bundle instead of adding a broad package-level suppression when ready.
+  - id: CVE-2026-54399
+    paths:
+      - opt/spark/jars/org.apache.iceberg_iceberg-spark-runtime-4.1_2.13-1.11.0.jar
+    expired_at: 2026-10-23
+    statement: >-
+      HTTP Core is embedded in Iceberg's runtime bundle. The local profile uses a
+      Hadoop catalog rather than a remote REST catalog, and the exception is limited
+      to this exact upstream artifact pending a compatible Iceberg runtime refresh.
+  - id: CVE-2026-54428
+    paths:
+      - opt/spark/jars/org.apache.iceberg_iceberg-spark-runtime-4.1_2.13-1.11.0.jar
+    expired_at: 2026-10-23
+    statement: >-
+      HTTP/2 Core is embedded in Iceberg's runtime bundle. The local profile uses a
+      Hadoop catalog rather than a remote REST catalog, and the exception is limited
+      to this exact upstream artifact pending a compatible Iceberg runtime refresh.
+  - id: CVE-2026-54512
+    paths:
+      - opt/spark/jars/hadoop-client-runtime-3.4.2.jar
+      - opt/spark/jars/org.apache.iceberg_iceberg-spark-runtime-4.1_2.13-1.11.0.jar
+      - opt/spark/jars/parquet-jackson-1.16.0.jar
+    expired_at: 2026-10-23
+    statement: >-
+      Databind copies are nested in upstream Hadoop, Iceberg, and Parquet jars. The
+      image overlays a patched direct Jackson runtime, but nested bundles must be
+      replaced by compatible upstream releases rather than unpacked in place.
+  - id: CVE-2026-54513
+    paths:
+      - opt/spark/jars/hadoop-client-runtime-3.4.2.jar
+      - opt/spark/jars/org.apache.iceberg_iceberg-spark-runtime-4.1_2.13-1.11.0.jar
+      - opt/spark/jars/parquet-jackson-1.16.0.jar
+    expired_at: 2026-10-23
+    statement: >-
+      Databind copies are nested in upstream Hadoop, Iceberg, and Parquet jars. The
+      image overlays a patched direct Jackson runtime, but nested bundles must be
+      replaced by compatible upstream releases rather than unpacked in place.
+  - id: CVE-2026-56740
+    paths:
+      - opt/spark/jars/hadoop-client-runtime-3.4.2.jar
+    expired_at: 2026-10-23
+    statement: >-
+      JLine remote telnet is nested in Hadoop's client runtime and this job does not
+      configure a JLine remote endpoint. Retain the Hadoop bundle only for catalog
+      compatibility and reassess it at the next dependency refresh.
+  - id: CVE-2026-56741
+    paths:
+      - opt/spark/jars/hadoop-client-runtime-3.4.2.jar
+    expired_at: 2026-10-23
+    statement: >-
+      JLine remote telnet is nested in Hadoop's client runtime and this job does not
+      configure a JLine remote endpoint. Retain the Hadoop bundle only for catalog
+      compatibility and reassess it at the next dependency refresh.
+  - id: GHSA-r7wm-3cxj-wff9
+    paths:
+      - opt/spark/jars/hadoop-client-runtime-3.4.2.jar
+      - opt/spark/jars/org.apache.iceberg_iceberg-spark-runtime-4.1_2.13-1.11.0.jar
+      - opt/spark/jars/parquet-jackson-1.16.0.jar
+    expired_at: 2026-10-23
+    statement: >-
+      Jackson core copies are nested in upstream Hadoop, Iceberg, and Parquet jars.
+      The image overlays a patched direct Jackson runtime; replace the owning bundles
+      through compatible upstream releases before this exact-path exception expires.

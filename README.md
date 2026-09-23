@@ -2,8 +2,9 @@
 
 센서 로그 수집 실습에서 출발해, D2C 응모 승인 도메인의 데이터 정합성과 배포 안전성을
 검증하는 Kafka 기반 Data Platform PoC입니다. 핵심 증거는 Kafka를 붙였다는 사실이 아니라
-`승인 → 같은 DB 트랜잭션의 outbox → Kafka → 멱등 consumer` 경계와 이를 실제 release gate로
-사용하는 운영 신호입니다.
+`승인 → 같은 DB 트랜잭션의 outbox → Kafka → 운영·분석 sink` 경계와 이를 실제 release gate로
+사용하는 운영 신호입니다. 분석 경계는 Spark Structured Streaming과 Apache Iceberg로 구현하되,
+전달 의미를 exactly-once라고 과장하지 않고 at-least-once source + sink idempotency로 명시합니다.
 
 이 README가 프로젝트의 실행·설계·운영 문서의 canonical source입니다. 상세 설계 메모와
 일회성 검증 원본은 `docs/`에 로컬로 보관하지만 Git에는 포함하지 않습니다.
@@ -12,9 +13,10 @@
 
 승인 기록이 이벤트 전달과 소비자 저장까지 이어지는 경계는 다음 순서로 확인할 수 있습니다.
 
-- 구현: [승인 API](app/app.py)는 승인과 outbox를 같은 DB 트랜잭션으로 기록합니다. [publisher](app/outbox_publisher.py)는 Kafka 확인 응답 뒤 발행 상태를 갱신하고, [consumer](services/d2c_event_consumer.py)는 `event_id`로 중복 저장을 막습니다. 전달 의미는 at-least-once이며, 재처리는 소비자 멱등성으로 처리합니다.
+- 구현: [승인 API](app/app.py)는 승인과 outbox를 같은 DB 트랜잭션으로 기록합니다. [publisher](app/outbox_publisher.py)는 Kafka 확인 응답 뒤 발행 상태를 갱신하고, [consumer](services/d2c_event_consumer.py)는 `event_id`로 중복 저장을 막습니다. [Spark lakehouse writer](lakehouse/d2c_iceberg_stream.py)는 같은 계약을 검증해 Iceberg fact·quarantine·source-range audit table로 분기합니다.
 - 건수 대조: [2026-09-06 로컬 검증 기록](RUNBOOK.md#2026-09-06-로컬-검증-기록)의 최종 승인·outbox·consumer 저장 건수는 **9 / 9 / 9**입니다. 미발행 outbox는 0건, 저장된 고유 `event_id`는 9건, Kafka lag는 모든 partition에서 0으로 기록됐습니다.
 - 실패와 복구: 같은 [RUNBOOK](RUNBOOK.md#2026-09-06-로컬-검증-기록)에 outbox 기록 실패 시 DB row 증가 0, PostgreSQL 장애 시 readiness 실패, Kafka 복구 후 backlog 해소를 남겼습니다.
+- 분석 경계: 2026-09-23 로컬 E2E에서 유효 approval 1건은 Iceberg fact로, UUID 계약 위반 1건은 quarantine으로 적재했습니다. 새 checkpoint로 전체 Kafka 범위를 다시 읽은 뒤에도 fact·quarantine·audit row 수는 각각 **1 / 1 / 3**으로 유지됐고, 이미 처리한 source range는 Iceberg metadata snapshot도 추가하지 않았습니다.
 - 실행 범위: [Compose 구성](docker-compose.yml)의 로컬 KRaft 단일 브로커·복제 계수 1에서 얻은 기록입니다. 별도 AWS 전송 경로의 결과와 구분하며, 다중 브로커 고가용성이나 실제 Kubernetes canary 배포를 검증한 수치로 사용하지 않습니다.
 
 ## 목표
@@ -31,6 +33,9 @@
 - 응모 승인과 transactional outbox를 같은 PostgreSQL 트랜잭션으로 기록
 - 승인/outbox parity SLI, 5xx, p95 latency, outbox backlog를 Prometheus와 Argo canary gate에 연결
 - validation-only failure drill에서 불일치·5xx·지연 시 stable 복귀 경로를 재현
+- Spark Structured Streaming checkpoint와 Iceberg snapshot으로 D2C approval fact·quarantine·source-range audit을 분리
+- Kafka source offset, contract violation, immutable `event_id`를 보존해 at-least-once replay를 재현 가능하게 처리
+- machine-readable data product catalog과 fail-closed portal로 owner, runbook, classification, SLO, lineage를 검증
 - Terraform, CI, 데이터 품질 SQL, 장애·비용 runbook을 코드와 함께 관리
 
 실행·장애 대응 절차는 [RUNBOOK.md](RUNBOOK.md), 프로젝트 개요와 설계 의사결정은 이
@@ -77,11 +82,13 @@ PostgreSQL transaction
              ▼
       at-least-once outbox publisher ──> Kafka
                                            │
-                                           ▼
-                              event_id 멱등 consumer
-                                           │
-                                           ▼
-                                  DuckDB / lake boundary
+                         ┌─────────────────┴──────────────────┐
+                         ▼                                    ▼
+            event_id 멱등 operational consumer     Spark Structured Streaming
+                         │                           ├── contract validation
+                         ▼                           ├── Iceberg fact (event_id)
+                   DuckDB operational sink           ├── Iceberg quarantine (topic/partition/offset)
+                                                     └── source-range audit + checkpoint
 
 Prometheus: parity gap + parity check + 5xx ratio + p95 + backlog + traffic
     │
@@ -165,6 +172,33 @@ docker compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh \
   --bootstrap-server kafka:9092 \
   --describe --group d2c-application-event-consumer-v1
 ```
+
+### Spark + Iceberg analytics boundary
+
+`lakehouse` profile은 외부 AWS catalog나 object storage를 만들지 않는 로컬 검증용입니다.
+Spark 4.1.3(Scala 2.13)와 Iceberg 1.11.0 runtime dependency를 이미지 build 시 고정해 실행 중 Maven
+다운로드에 의존하지 않습니다. approval fact는 `days(occurred_at)`으로 partition하고, 계약
+위반 원문은 Kafka `topic/partition/offset`을 key로 quarantine합니다.
+
+```bash
+# d2c profile을 먼저 실행해 Kafka와 approval producer를 준비한다.
+docker compose --profile lakehouse run --rm --no-deps d2c-iceberg-stream
+docker compose --profile lakehouse run --rm --no-deps d2c-iceberg-verify
+
+# 빠른 정적 확인과 이미지 build
+make lakehouse-check
+make lakehouse-image
+```
+
+writer는 source range마다 `source_records = valid_records + quarantined_records`를 강제하고,
+immutable `event_id`가 다른 payload로 재도착하면 checkpoint를 진행시키지 않습니다. 같은 Kafka
+range를 재처리하면 fact·quarantine·audit의 새로운 row와 metadata snapshot을 만들지 않습니다.
+따라서 이 경계의 의미는 "Kafka exactly-once"가 아니라 **Kafka at-least-once delivery를
+checkpoint·idempotency·quarantine·audit으로 복구 가능하게 만든 것**입니다.
+
+`catalog/data-products/d2c-application-approvals.v1.json`은 이 data product의 owner, runbook,
+restricted classification, SLO, lineage와 implementation evidence를 검증하고,
+`catalog-portal`은 invalid catalog을 fail-closed(HTTP 503)로 노출합니다.
 
 ### Release gate와 Kubernetes
 
@@ -275,8 +309,8 @@ batch_id=<batch-id>/event_date=YYYY-MM-DD/*.parquet
 
 이 local sink는 Kafka offset commit과 Parquet commit이 하나의 트랜잭션이 아닌
 at-least-once 경계를 보여주는 교육용 구현입니다. 따라서 exactly-once라고 부르지 않으며,
-작은 파일이 많아지는 운영 환경에서는 Spark Structured Streaming + Iceberg snapshot,
-manifest, compaction으로 교체합니다.
+센서 파이프라인의 장기 분석 경계로는 Spark Structured Streaming + Iceberg snapshot,
+manifest, compaction을 적용해야 합니다. D2C approval 경로에는 이 전환을 먼저 구현해 두었습니다.
 
 ```mermaid
 flowchart LR
@@ -337,8 +371,17 @@ python3 -m unittest discover -s tests -v
 ```
 
 GitHub Actions는 push/PR마다 root/app 의존성 설치, Python compile·unit test, D2C JSON
-Schema 검증, Kustomize render, Terraform `fmt -check`·`validate`를 실행합니다. 별도
-security workflow는 dependency audit, Bandit, CodeQL, Trivy, 이미지 SBOM을 수행합니다.
+Schema·catalog 검증, Iceberg runtime image build 및 local catalog smoke test, Kustomize render,
+Terraform `fmt -check`·`validate`를 실행합니다. 별도 security workflow는 dependency audit,
+Bandit, Trivy, worker/API/catalog/lakehouse 이미지 SBOM을 수행합니다. Lakehouse 이미지는 사용하지
+않는 Spark Connect·Hive Thrift·Derby·ZooKeeper 구성요소와 이전 direct runtime JAR를 제거하고,
+Kafka/Netty/Jackson/HTTP direct runtime을 고정된 patched dependency로 보강합니다. 남은 upstream
+nested JAR finding은 `security/lakehouse.trivyignore.yaml`에서 **정확한 JAR 경로와 45일 이내
+만료일**로만 제한하며, `scripts/validate_lakehouse_trivy_exceptions.py`가 무기한·와일드카드 예외를
+먼저 거부합니다. 경로가 달라지거나 만료되거나 새로 고정 가능한 HIGH/CRITICAL finding이 생기면
+release gate는 실패합니다. Upstream이 아직 수정하지 않은 HIGH/CRITICAL finding은 차단 대상과
+구분해 `d2c-lakehouse-trivy.json` artifact로 남기므로, release 통과를 취약점 부재 주장으로 사용하지
+않습니다.
 CI에서는 AWS `apply`나 `destroy`를 실행하지 않아 credential과 비용을 분리합니다.
 
 DLQ 경로를 강제로 확인하려면 별도 터미널에서 다음처럼 invalid event 비율을 높여 실행합니다.
@@ -520,14 +563,15 @@ Terraform destroy를 실행했습니다. 따라서 이 검증으로 남은 상�
 ## 현재 완료 범위와 다음 단계
 
 현재 구현·검증된 범위는 승인 API의 transactional outbox, 공유 D2C event contract/JSON
-Schema, at-least-once publisher, `event_id` 멱등 consumer, DB-truth parity SLI, 5xx/p95/
-backlog metrics, Argo canary manifest, failure drill, local event-time Parquet quality gate,
-AWS Firehose→S3 bronze Parquet POC, CI/security workflow입니다.
+Schema, at-least-once publisher, `event_id` 멱등 consumer, Spark Structured Streaming + Iceberg
+fact/quarantine/source-range audit, DB-truth parity SLI, 5xx/p95/backlog metrics, Argo canary
+manifest, failure drill, local event-time Parquet quality gate, AWS Firehose→S3 bronze Parquet
+POC, catalog portal, CI/security workflow입니다.
 
 운영 수준으로 더 확장할 때의 순서는 다음과 같습니다.
 
 1. EKS에서 실제 Argo Rollouts + NGINX + Prometheus Operator를 연결하고 AnalysisRun abort와 stable traffic을 실측
 2. AWS workload identity, Secrets Manager, Kafka TLS/SASL/ACL과 외부 인증·인가 추가
-3. DuckDB/local Parquet consumer sink를 Spark Structured Streaming + Iceberg snapshot/compaction으로 교체
+3. local Iceberg Hadoop catalog을 S3 + Glue/REST catalog으로 이관하고 Iceberg compaction·snapshot expiry를 운영 주기에 연결
 4. Airflow/dbt 또는 데이터 품질 오케스트레이터로 freshness, null/range/duplicate 검사와 backfill 자동화
 5. MSK 또는 다중 broker/RF3 환경에서 rebalance, partition scaling, retention/비용을 별도 실습

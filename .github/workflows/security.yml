@@ -2,7 +2,7 @@ name: security
 
 on:
   push:
-    branches: ["main", "poc/**", "feat/**"]
+    branches: ["main", "dev", "poc/**", "feat/**"]
   pull_request:
   schedule:
     - cron: "17 3 * * 1"
@@ -29,17 +29,18 @@ jobs:
 
       - name: Install runtime and audit tools
         run: |
-          python -m pip install --requirement requirements.txt
+          python -m pip install --requirement requirements-dev.txt
           python -m pip install --requirement app/requirements.txt
           python -m pip install pip-audit==2.9.0 bandit==1.8.6
 
       - name: Audit Python dependencies
         run: |
           pip-audit --requirement requirements.txt --strict
+          pip-audit --requirement requirements-dev.txt --strict
           pip-audit --requirement app/requirements.txt --strict
 
       - name: Scan Python source
-        run: bandit --recursive app services scripts --severity-level medium --confidence-level medium
+        run: bandit --recursive app services scripts lakehouse --severity-level medium --confidence-level medium
 
   container-scan:
     runs-on: ubuntu-latest
@@ -47,11 +48,29 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Set up Python for exception policy
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Validate bounded lakehouse exception policy
+        run: |
+          python -m pip install --requirement requirements-dev.txt
+          python scripts/validate_lakehouse_trivy_exceptions.py \
+            --policy security/lakehouse.trivyignore.yaml
+
       - name: Build non-root worker image
         run: docker build --tag factory-sensor:${{ github.sha }} .
 
       - name: Build non-root D2C API image
         run: docker build --file app/Dockerfile --tag d2c-api:${{ github.sha }} .
+
+      - name: Build non-root catalog portal image
+        run: docker build --target catalog-portal --tag d2c-catalog-portal:${{ github.sha }} .
+
+      - name: Build non-root D2C lakehouse image
+        run: docker build --file lakehouse/Dockerfile --tag d2c-iceberg-stream:${{ github.sha }} .
 
       - name: Set up Trivy
         uses: aquasecurity/setup-trivy@e07451d2e059ed86c2870430ea286b3a9e0bf241
@@ -84,6 +103,34 @@ jobs:
           --ignore-unfixed
           --exit-code 1
 
+      - name: Scan catalog portal image
+        run: >-
+          trivy image d2c-catalog-portal:${{ github.sha }}
+          --scanners vuln,secret,misconfig
+          --severity HIGH,CRITICAL
+          --ignore-unfixed
+          --exit-code 1
+
+      - name: Scan D2C lakehouse image with bounded exceptions
+        run: >-
+          trivy image d2c-iceberg-stream:${{ github.sha }}
+          --scanners vuln,secret,misconfig
+          --severity HIGH,CRITICAL
+          --ignore-unfixed
+          --ignorefile security/lakehouse.trivyignore.yaml
+          --show-suppressed
+          --exit-code 1
+
+      - name: Capture all D2C lakehouse vulnerability statuses
+        run: >-
+          trivy image d2c-iceberg-stream:${{ github.sha }}
+          --scanners vuln
+          --severity HIGH,CRITICAL
+          --ignorefile security/lakehouse.trivyignore.yaml
+          --show-suppressed
+          --format json
+          --output d2c-lakehouse-trivy.json
+
       - name: Generate SPDX image SBOM
         uses: anchore/sbom-action@v0.24.0
         with:
@@ -100,11 +147,30 @@ jobs:
           output-file: d2c-api.sbom.spdx.json
           artifact-name: d2c-api.sbom.spdx.json
 
-      - name: Upload SBOM artifact
+      - name: Generate SPDX catalog portal SBOM
+        uses: anchore/sbom-action@v0.24.0
+        with:
+          image: d2c-catalog-portal:${{ github.sha }}
+          format: spdx-json
+          output-file: d2c-catalog-portal.sbom.spdx.json
+          artifact-name: d2c-catalog-portal.sbom.spdx.json
+
+      - name: Generate SPDX D2C lakehouse SBOM
+        uses: anchore/sbom-action@v0.24.0
+        with:
+          image: d2c-iceberg-stream:${{ github.sha }}
+          format: spdx-json
+          output-file: d2c-iceberg-stream.sbom.spdx.json
+          artifact-name: d2c-iceberg-stream.sbom.spdx.json
+
+      - name: Upload SBOM and lakehouse vulnerability evidence
         uses: actions/upload-artifact@v4
         with:
           name: sbom-${{ github.sha }}
           path: |
             sbom.spdx.json
             d2c-api.sbom.spdx.json
+            d2c-catalog-portal.sbom.spdx.json
+            d2c-iceberg-stream.sbom.spdx.json
+            d2c-lakehouse-trivy.json
           if-no-files-found: error
