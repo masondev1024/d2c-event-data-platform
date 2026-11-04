@@ -1,39 +1,43 @@
-/* Build the original upstream Spark 4.2 runtime from its source projects. */
-gradle.projectsEvaluated {
-  gradle.rootProject.allprojects { component ->
-    component.repositories {
-      maven {
-        url = uri('/rebuilt-repository')
-        content { includeModule('org.apache.parquet', 'parquet-jackson') }
-      }
-    }
-    component.configurations.configureEach {
-      resolutionStrategy.dependencySubstitution {
-        substitute module('org.apache.parquet:parquet-jackson') using module('org.apache.parquet:parquet-jackson:1.17.1-d2c-jackson2.21.7')
-      }
-    }
-    component.tasks.withType(org.gradle.api.tasks.scala.ScalaCompile).configureEach {
-      scalaCompileOptions.forkOptions.memoryMaximumSize = '768m'
+/* Build the original upstream Spark 4.2 runtime from its source projects.
+ * Iceberg enables configuration on demand. Register the proof task as its
+ * project finishes evaluation, before Gradle selects the requested task path.
+ * The global projectsEvaluated callback runs after that selection in this mode.
+ */
+gradle.afterProject { component ->
+  component.repositories {
+    maven {
+      url = component.uri('/rebuilt-repository')
+      content { includeModule('org.apache.parquet', 'parquet-jackson') }
     }
   }
-  def runtime = gradle.rootProject.project(':iceberg-spark:iceberg-spark-runtime-4.2_2.13')
-  runtime.tasks.named('shadowJar') {
-    archiveVersion.set('1.12.0-d2c-security1')
+  component.configurations.configureEach {
+    resolutionStrategy.dependencySubstitution {
+      substitute module('org.apache.parquet:parquet-jackson') using module('org.apache.parquet:parquet-jackson:1.17.1-d2c-jackson2.21.7')
+    }
   }
-  runtime.tasks.register('d2cRecordRuntimeInputs') {
-    dependsOn runtime.tasks.named('shadowJar')
-    doLast {
-      def records = runtime.configurations.runtimeClasspath.resolvedConfiguration.resolvedArtifacts.collect { artifact ->
-        def id = artifact.moduleVersion.id
-        [coordinate: "${id.group}:${id.name}:${id.version}", filename: artifact.file.name,
-         path: artifact.file.absolutePath,
-         sha256: java.security.MessageDigest.getInstance('SHA-256').digest(artifact.file.bytes).encodeHex().toString(),
-         source_project: artifact.id.componentIdentifier instanceof org.gradle.api.artifacts.component.ProjectComponentIdentifier]
-      }.sort { a, b -> a.coordinate <=> b.coordinate }
-      def destination = new File('/artifacts')
-      destination.mkdirs()
-      new File(destination, 'security-runtime-artifacts.json').text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(records)) + '\n'
-      new File(destination, 'runtime-dependencies.txt').text = records.collect { it.coordinate }.join('\n') + '\n'
+  component.tasks.withType(org.gradle.api.tasks.scala.ScalaCompile).configureEach {
+    scalaCompileOptions.forkOptions.memoryMaximumSize = '768m'
+  }
+  if (component.path == ':iceberg-spark:iceberg-spark-runtime-4.2_2.13') {
+    def runtime = component
+    runtime.tasks.named('shadowJar') {
+      archiveVersion.set('1.12.0-d2c-security1')
+    }
+    runtime.tasks.register('d2cRecordRuntimeInputs') {
+      dependsOn runtime.tasks.named('shadowJar')
+      doLast {
+        def records = runtime.configurations.runtimeClasspath.resolvedConfiguration.resolvedArtifacts.collect { artifact ->
+          def id = artifact.moduleVersion.id
+          [coordinate: "${id.group}:${id.name}:${id.version}", filename: artifact.file.name,
+           path: artifact.file.absolutePath,
+           sha256: java.security.MessageDigest.getInstance('SHA-256').digest(artifact.file.bytes).encodeHex().toString(),
+           source_project: artifact.id.componentIdentifier instanceof org.gradle.api.artifacts.component.ProjectComponentIdentifier]
+        }.sort { a, b -> a.coordinate <=> b.coordinate }
+        def destination = new File('/artifacts')
+        destination.mkdirs()
+        new File(destination, 'security-runtime-artifacts.json').text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(records)) + '\n'
+        new File(destination, 'runtime-dependencies.txt').text = records.collect { it.coordinate }.join('\n') + '\n'
+      }
     }
   }
 }
