@@ -20,6 +20,8 @@ run_maven() {
         -Dhadoop.version=3.5.0 \
         -Djackson2.version=2.21.7 -Djackson2.databind.version=2.21.7 \
         -Djline.version=3.30.17 \
+        -Dguava.version=33.7.2-jre -Dhadoop-thirdparty-guava.version=1.6.0 \
+        -Dsnappy-java.version=1.1.10.9 \
         -Dmaven-shade-plugin.version=3.6.1 \
         -Dproject.build.outputTimestamp=2026-11-04T00:00:00Z \
         -DskipTests -Dmaven.javadoc.skip=true -Dcheckstyle.skip=true "$@"
@@ -41,6 +43,13 @@ for module in hadoop-client-api hadoop-client-runtime; do
     cp pom.xml "$output_dir/$module-$variant-source-pom.xml"
     cp "/root/.m2/repository/org/apache/hadoop/$module/$variant/$module-$variant.pom" \
         "$output_dir/$module-$variant-installed-pom.xml"
+done
+# These unmodified standard JARs are compatibility baselines only. They are not
+# selected into either output assembly. The complete osgi modules above must
+# retain their own classes and public/protected ABI against these originals.
+for module in curator-client curator-framework curator-recipes; do
+    run_maven org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get \
+        -Dartifact="org.apache.curator:$module:5.2.0" -Dtransitive=false
 done
 python3 "$helper_dir/verify_bundle.py" "$source_root" "$output_dir"
 # provenance records static checks only. The final image must separately execute

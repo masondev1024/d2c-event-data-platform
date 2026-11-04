@@ -7,7 +7,10 @@ from pathlib import Path
 import re
 import xml.etree.ElementTree as ET
 
-from runtime_profile import EXCLUDED_ARTIFACTS, MODULES, SOURCE_INPUTS, UPSTREAM_VERSION, VARIANT_VERSION
+from runtime_profile import (CURATOR_CLASSIFIER, CURATOR_MODULES, CURATOR_VERSION,
+                             EXCLUDED_ARTIFACTS, GUAVA_VERSION, HADOOP_SHADED_GUAVA_VERSION,
+                             MODULES, REPLACED_CURATOR_ARTIFACTS, SNAPPY_VERSION, SOURCE_INPUTS,
+                             UPSTREAM_VERSION, VARIANT_VERSION)
 
 NS = {"m": "http://maven.apache.org/POM/4.0.0"}
 TRANSFORMER_CLASS = "d2c.shade.hadoop.JlineProviderResourceTransformer"
@@ -74,10 +77,10 @@ def patch_source(source: str, module: str) -> str:
     additions = "".join(
         f"        <exclusion>\n          <groupId>{group}</groupId>\n"
         f"          <artifactId>{name}</artifactId>\n        </exclusion>\n"
-        for group, name in EXCLUDED_ARTIFACTS
+        for group, name in (*EXCLUDED_ARTIFACTS, *REPLACED_CURATOR_ARTIFACTS)
     )
     dependency = dependency.replace(
-        "</exclusions>", "<!-- D2C local profile: omit remote jobclient and interactive WebSocket transport artifacts. -->\n"
+        "</exclusions>", "<!-- D2C local profile: omit remote transports; select complete unshaded Curator modules explicitly below. -->\n"
         + additions + "      </exclusions>", 1,
     )
     dependency = dependency.replace(
@@ -96,7 +99,23 @@ def patch_source(source: str, module: str) -> str:
       <exclusions>
 """ + additions + """      </exclusions>
     </dependency>"""
-    patched = source[:matches[0].start()] + dependency + local_common + source[matches[0].end():]
+    # Classifier is part of Maven's identity. Explicitly retain each full osgi
+    # module, excluding the standard shaded siblings on EVERY transitive path.
+    # dependencyManagement alone cannot replace an unclassified dependency.
+    curator_exclusions = "".join(
+        f"        <exclusion><groupId>{group}</groupId><artifactId>{name}</artifactId></exclusion>\n"
+        for group, name in REPLACED_CURATOR_ARTIFACTS)
+    curator_dependencies = "".join(f"""
+    <dependency>
+      <groupId>org.apache.curator</groupId>
+      <artifactId>{module}</artifactId>
+      <version>{CURATOR_VERSION}</version>
+      <classifier>{CURATOR_CLASSIFIER}</classifier>
+      <exclusions>
+{curator_exclusions}      </exclusions>
+    </dependency>""" for module in CURATOR_MODULES)
+    patched = (source[:matches[0].start()] + dependency + local_common
+               + curator_dependencies + source[matches[0].end():])
     version_pattern = rf"(<artifactId>{re.escape(module)}</artifactId>\s*<version>){re.escape(UPSTREAM_VERSION)}(</version>)"
     patched, count = re.subn(version_pattern, rf"\g<1>{VARIANT_VERSION}\g<2>", patched)
     if count != 1:
@@ -118,12 +137,27 @@ def patch_source(source: str, module: str) -> str:
         patched = patched.replace("<transformers>", "<transformers>\n"
             + f'                    <transformer implementation="{TRANSFORMER_CLASS}"/>', 1)
     # Jackson's official 2.21.7 release uses annotations 2.21, not 2.21.7.
-    management = """  <dependencyManagement>
+    management = f"""  <dependencyManagement>
     <dependencies>
       <dependency>
         <groupId>com.fasterxml.jackson.core</groupId>
         <artifactId>jackson-annotations</artifactId>
         <version>2.21</version>
+      </dependency>
+      <dependency>
+        <groupId>com.google.guava</groupId>
+        <artifactId>guava</artifactId>
+        <version>{GUAVA_VERSION}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.hadoop.thirdparty</groupId>
+        <artifactId>hadoop-shaded-guava</artifactId>
+        <version>{HADOOP_SHADED_GUAVA_VERSION}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.xerial.snappy</groupId>
+        <artifactId>snappy-java</artifactId>
+        <version>{SNAPPY_VERSION}</version>
       </dependency>
     </dependencies>
   </dependencyManagement>

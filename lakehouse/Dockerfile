@@ -87,7 +87,7 @@ USER root
 ENV HOME=/tmp \
     IVY_HOME=/tmp/ivy \
     SPARK_LOCAL_IP=127.0.0.1 \
-    D2C_EXTRA_PACKAGES="org.apache.spark:spark-sql-kafka-0-10_2.13:4.2.1,org.apache.kafka:kafka-clients:3.9.2,at.yawk.lz4:lz4-java:1.11.4,io.netty:netty-all:4.2.17.Final,com.fasterxml.jackson.core:jackson-core:2.21.7,com.fasterxml.jackson.core:jackson-databind:2.21.7,com.fasterxml.jackson.dataformat:jackson-dataformat-yaml:2.21.7,com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.21.7,com.fasterxml.jackson.module:jackson-module-scala_2.13:2.21.7,org.apache.httpcomponents.core5:httpcore5:5.4.3,org.apache.httpcomponents.core5:httpcore5-h2:5.4.3"
+    D2C_EXTRA_PACKAGES="org.apache.spark:spark-sql-kafka-0-10_2.13:4.2.1,org.apache.kafka:kafka-clients:3.9.2,com.google.guava:guava:33.7.2-jre,com.google.guava:failureaccess:1.0.3,org.xerial.snappy:snappy-java:1.1.10.9,at.yawk.lz4:lz4-java:1.11.4,io.netty:netty-all:4.2.17.Final,com.fasterxml.jackson.core:jackson-core:2.21.7,com.fasterxml.jackson.core:jackson-databind:2.21.7,com.fasterxml.jackson.dataformat:jackson-dataformat-yaml:2.21.7,com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.21.7,com.fasterxml.jackson.module:jackson-module-scala_2.13:2.21.7,org.apache.httpcomponents.core5:httpcore5:5.4.3,org.apache.httpcomponents.core5:httpcore5-h2:5.4.3"
 
 RUN python3 /recipe-source/scripts/lakehouse_artifacts.py component \
     --component dependencies --directory /opt/spark/extra-jars --source-root /recipe-source \
@@ -110,7 +110,8 @@ import shutil
 root = Path('/opt/spark/extra-jars')
 excluded = ('org.apache.hadoop_hadoop-client-api-*.jar',
             'org.apache.hadoop_hadoop-client-runtime-*.jar',
-            'org.apache.spark_spark-core_*.jar')
+            'org.apache.spark_spark-core_*.jar',
+            'org.apache.spark_spark-network-common_*.jar')
 for source in sorted((Path(os.environ['IVY_HOME']) / 'jars').rglob('*.jar')):
     if not any(fnmatch.fnmatch(source.name, pattern) for pattern in excluded):
         shutil.copyfile(source, root / source.name)
@@ -122,7 +123,7 @@ record = {
     'method': 'Official Spark 4.2.1 Ivy resolver and local[1] Pi completed with exit zero',
     'requested_packages': os.environ['D2C_EXTRA_PACKAGES'].split(','),
     'artifact_sha256': {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in jars},
-    'excluded_replaced_artifacts': ['hadoop-client-api', 'hadoop-client-runtime', 'spark-core_2.13'],
+    'excluded_replaced_artifacts': ['hadoop-client-api', 'hadoop-client-runtime', 'spark-core_2.13', 'spark-network-common_2.13'],
     'limits': 'Build-stage resolution/startup only; final runtime regression and scans are separate',
 }
 (root / 'dependency-source-provenance.json').write_text(json.dumps(record, indent=2, sort_keys=True) + '\n')
@@ -176,6 +177,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* /opt/spark/examples /opt/spark/jars/connect-repl \
     && rm -f \
         /opt/spark/jars/derby*.jar \
+        /opt/spark/jars/guava-*.jar \
+        /opt/spark/jars/failureaccess-*.jar \
         /opt/spark/jars/jackson-annotations-*.jar \
         /opt/spark/jars/jackson-core-*.jar \
         /opt/spark/jars/jackson-databind-*.jar \
@@ -189,6 +192,8 @@ RUN apt-get update \
         /opt/spark/jars/hadoop-client-api-*.jar \
         /opt/spark/jars/hadoop-client-runtime-*.jar \
         /opt/spark/jars/parquet-jackson-*.jar \
+        /opt/spark/jars/snappy-java-*.jar \
+        /opt/spark/jars/spark-network-common_2.13-*.jar \
         /opt/spark/jars/spark-hive-thriftserver_*.jar \
         /opt/spark/jars/zookeeper-*.jar
 
@@ -203,6 +208,7 @@ RUN --mount=type=bind,from=selected-artifacts,target=/tmp/d2c-artifacts,ro \
     && cp /tmp/d2c-artifacts/parquet/parquet-jackson-1.17.0-d2c-jackson2.21.7.jar /opt/spark/jars/ \
     && cp /tmp/d2c-artifacts/iceberg/iceberg-spark-runtime-4.2_2.13-1.12.0-d2c-security1.jar /opt/spark/jars/ \
     && cp /tmp/d2c-artifacts/spark/spark-core_2.13-4.2.1-d2c-jetty12.1.14.jar /opt/spark/jars/spark-core_2.13-4.2.1.jar \
+    && cp /tmp/d2c-artifacts/spark/spark-network-common_2.13-4.2.1-d2c-guava33.7.2-jre.jar /opt/spark/jars/spark-network-common_2.13-4.2.1.jar \
     && mkdir --parents /usr/share/d2c-security/artifacts \
     && cp /tmp/d2c-artifacts/hadoop/provenance.json /usr/share/d2c-security/hadoop-source-provenance.json \
     && cp /tmp/d2c-artifacts/parquet/parquet-source-provenance.json /usr/share/d2c-security/ \

@@ -22,5 +22,6 @@ cd /upstream
 d2c_iceberg_jar=/upstream/spark/v4.2/spark-runtime/build/libs/iceberg-spark-runtime-4.2_2.13-1.12.0-d2c-security1.jar
 python3 "$d2c_iceberg_helpers/verify-source-runtime.py" \
   --upstream /upstream --inputs /artifacts/security-runtime-artifacts.json \
+  --guava-inputs /artifacts/security-guava-artifacts.json \
   --rebuilt "$d2c_iceberg_jar" --artifacts /artifacts
 cp "$d2c_iceberg_jar" /artifacts/

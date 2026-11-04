@@ -258,10 +258,12 @@ def run_phase(args: argparse.Namespace) -> dict:
         "D2C_LAKEHOUSE_STREAM_ID": "d2c-kafka-checkpoint-regression",
         "D2C_LAKEHOUSE_WAREHOUSE": (state / "warehouse").as_uri(),
         "D2C_LAKEHOUSE_CHECKPOINT": str(state / "checkpoint")})
-    spark = create_spark_session(settings)
+    spark = create_spark_session(settings, local_master="local[1]")
     query = None
     try:
         require(spark.sparkContext.master == "local[1]", "Regression requires the bounded local[1] master")
+        spark_conf_master = spark.sparkContext.getConf().get("spark.master")
+        require(spark_conf_master == "local[1]", "Regression requires spark.master to remain local[1]")
         spark.sparkContext.setLogLevel("WARN")
         create_tables(spark, settings)
         marker_path = state / "proofs/crash-marker.json"
@@ -326,7 +328,7 @@ def run_phase(args: argparse.Namespace) -> dict:
             "status": "PASS", "owner": owner, "image_id": image_id, "identity": identity,
             "manifest_sha256": manifest_digest(manifest),
             "spark_version": spark.version, "java_version": spark._jvm.java.lang.System.getProperty("java.version"),
-            "machine": os.uname().machine, "master": spark.sparkContext.master,
+            "machine": os.uname().machine, "master": spark.sparkContext.master, "spark_conf_master": spark_conf_master,
             "publishing": publishing, "observed_batches": observed, "checkpoint": commit_window,
             "state": checked, "snapshots": snapshot_ids,
             "scope": "Real Kafka/LZ4 and four separate Spark processes; test-only failure after production sink write and before checkpoint commit"}

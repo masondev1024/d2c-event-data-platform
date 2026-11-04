@@ -57,7 +57,10 @@ class ArtifactFixture(unittest.TestCase):
                       "native_source_compile_platform": "linux/arm64"}
             (directory / "build-status.json").write_text(json.dumps(status))
         dependency_dir = self.artifacts / "dependencies"
-        dependency_provenance = {"spark_version": "4.2.1", "artifact_sha256": {
+        dependency_provenance = {"spark_version": "4.2.1",
+            "requested_packages": ["com.google.guava:guava:33.7.2-jre",
+                                   "com.google.guava:failureaccess:1.0.3",
+                                   "org.xerial.snappy:snappy-java:1.1.10.9"], "artifact_sha256": {
             path.name: subject.sha256(path) for path in dependency_dir.glob("*.jar")}}
         (dependency_dir / subject.PROVENANCE["dependencies"]).write_text(json.dumps(dependency_provenance))
         for role in subject.ROLES:
@@ -123,6 +126,38 @@ class ArtifactSealTest(ArtifactFixture):
         path.write_bytes(jar_fixture())
         with self.assertRaisesRegex(subject.ArtifactError, "leaked"):
             subject.seal(self.artifacts, self.source)
+
+    def test_original_network_common_cannot_override_the_source_rebuilt_module(self) -> None:
+        path = self.artifacts / "dependencies/org.apache.spark_spark-network-common_2.13-4.2.1.jar"
+        path.write_bytes(jar_fixture())
+        with self.assertRaisesRegex(subject.ArtifactError, "leaked"):
+            subject.seal(self.artifacts, self.source)
+
+    def test_old_direct_guava_or_snappy_cannot_accompany_the_patched_dependency(self) -> None:
+        for filename in ("com.google.guava_guava-33.7.1-jre.jar",
+                         "com.google.guava_failureaccess-1.0.2.jar",
+                         "org.xerial.snappy_snappy-java-1.1.10.8.jar"):
+            with self.subTest(filename=filename):
+                path = self.artifacts / "dependencies" / filename
+                path.write_bytes(jar_fixture())
+                try:
+                    with self.assertRaisesRegex(subject.ArtifactError, "unexpected direct runtime dependency"):
+                        subject.seal(self.artifacts, self.source)
+                finally:
+                    path.unlink()
+
+    def test_resolver_receipt_requires_the_actual_fixed_dependency_requests(self) -> None:
+        path = self.artifacts / "dependencies" / subject.PROVENANCE["dependencies"]
+        original = json.loads(path.read_text())
+        for requests in (None, [], ["com.google.guava:guava:33.7.1-jre"],
+                         original["requested_packages"] + [False]):
+            with self.subTest(requests=requests):
+                changed = deepcopy(original)
+                changed["requested_packages"] = requests
+                path.write_text(json.dumps(changed))
+                with self.assertRaisesRegex(subject.ArtifactError, "patched direct"):
+                    subject.seal(self.artifacts, self.source)
+        path.write_text(json.dumps(original))
 
     def test_invalid_jar_does_not_pass_on_filename_alone(self) -> None:
         path = self.artifacts / "hadoop/hadoop-client-api-3.5.0-d2c-local1.jar"

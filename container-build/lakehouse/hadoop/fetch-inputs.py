@@ -5,7 +5,9 @@ import hashlib
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-from runtime_profile import SOURCE_INPUTS, SOURCE_ROOT_URL
+from runtime_profile import (CURATOR_SOURCE_INPUTS, CURATOR_SOURCE_ROOT_URL,
+                             SOURCE_INPUTS, SOURCE_ROOT_URL,
+                             THIRDPARTY_SOURCE_INPUTS, THIRDPARTY_SOURCE_ROOT_URL)
 from jline_resources import LOADER_SHA256, LOADER_SOURCE, SOURCE_ROOT as JLINE_SOURCE_ROOT
 
 
@@ -13,15 +15,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source_root", type=Path)
     args = parser.parse_args()
-    for relative, expected in SOURCE_INPUTS.items():
-        request = Request(SOURCE_ROOT_URL + relative, headers={"User-Agent": "D2C-source-assembly"})
+    inputs = [(SOURCE_ROOT_URL, relative, expected, args.source_root)
+              for relative, expected in SOURCE_INPUTS.items()]
+    inputs += [(CURATOR_SOURCE_ROOT_URL, relative, expected, args.source_root / "curator-review")
+               for relative, expected in CURATOR_SOURCE_INPUTS.items()]
+    inputs += [(THIRDPARTY_SOURCE_ROOT_URL, relative, expected, args.source_root / "thirdparty-review")
+               for relative, expected in THIRDPARTY_SOURCE_INPUTS.items()]
+    for root_url, relative, expected, target_root in inputs:
+        request = Request(root_url + relative, headers={"User-Agent": "D2C-source-assembly"})
         with urlopen(request, timeout=120) as response:
             content = response.read(1_000_001)
         if len(content) > 1_000_000:
             raise ValueError(f"unexpectedly large source input: {relative}")
         if hashlib.sha256(content).hexdigest() != expected:
             raise ValueError(f"upstream source hash mismatch: {relative}")
-        target = args.source_root / relative
+        target = target_root / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.name == "pom.xml":
             target = target.with_name("upstream.pom.xml")

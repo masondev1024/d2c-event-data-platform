@@ -4,6 +4,7 @@ from pathlib import Path
 
 
 REPLACEMENTS = {
+    'guava = "33.7.1-jre"': 'guava = "33.7.2-jre"',
     'jackson-annotations = "2.22"': 'jackson-annotations = "2.21"',
     'jackson-bom = "2.22.2"': 'jackson-bom = "2.21.7"',
     'jackson221 = { strictly = "2.21.4"}': 'jackson221 = { strictly = "2.21.7"}',
@@ -25,7 +26,7 @@ def patch_source(root):
         "git.build.version=1.12.0-d2c-security1\n"
         "git.closest.tag.name=apache-iceberg-1.12.0\n"
         "git.commit.id=212aa894e919ff9fdf89160da4aadcbe6858ac01\n"
-        "build.security.patch=spark4.2.1-jackson2.21.7-parquet-jackson2.21.7\n"
+        "build.security.patch=spark4.2.1-guava33.7.2-jackson2.21.7-parquet-jackson2.21.7\n"
     )
 
 

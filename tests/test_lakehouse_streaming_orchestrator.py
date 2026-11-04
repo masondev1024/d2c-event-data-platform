@@ -160,6 +160,7 @@ class OrchestratorTest(unittest.TestCase):
             self.assertEqual(command[command.index("--user") + 1], "185:0")
             self.assertEqual(command[command.index("--memory") + 1], "2000m")
             self.assertEqual(command[command.index("--cpus") + 1], "2")
+            self.assertEqual(command[command.index("--master") + 1], "local[1]")
             self.assertIn("type=volume,src=" + instance.names["volume"] + ",dst=/state", command)
             self.assertNotIn("type=bind", " ".join(command))
             self.assertNotIn("--publish", command)

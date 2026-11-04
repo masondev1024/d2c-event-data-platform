@@ -1,4 +1,4 @@
-"""Compile official Spark core source and run its original Maven shade recipe."""
+"""Compile official Spark core/network source with their original shade recipes."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 from verify_runtime import verify_runtime, verify_spark_identity
+from verify_network_runtime import ARTIFACT_ID as NETWORK_ARTIFACT_ID, verify_network_identity, verify_network_runtime, verify_resolved_guava
 
 
 HELPER_DIR = Path(__file__).resolve().parent
@@ -111,6 +112,13 @@ def verify_source(source: Path, manifest: dict) -> dict:
         raise ValueError("Original core Jetty shade recipe is missing")
     if not (source / "core/src/main/scala/org/apache/spark/SparkContext.scala").is_file():
         raise ValueError("Spark core Scala implementation source is missing")
+    network = ET.parse(source / "common/network-common/pom.xml").getroot()
+    if (network.findtext("m:parent/m:version", namespaces=NAMESPACE), network.findtext("m:artifactId", namespaces=NAMESPACE)) != (manifest["spark_version"], NETWORK_ARTIFACT_ID):
+        raise ValueError("Network-common does not belong to the selected Spark release")
+    if "<pattern>com.google.common</pattern>" not in (source / "pom.xml").read_text():
+        raise ValueError("Original inherited Guava shade recipe is missing")
+    if not (source / "common/network-common/src/main/java/org/apache/spark/network/util/TransportConf.java").is_file():
+        raise ValueError("Spark network-common Java implementation source is missing")
     documents = {}
     for name in ("LICENSE", "NOTICE"):
         path = source / name
@@ -120,12 +128,14 @@ def verify_source(source: Path, manifest: dict) -> dict:
     return {"pom_sha256": manifest["source"]["pom_sha256"], "license_sha256": documents, "upstream_properties": manifest["upstream_properties"]}
 
 
-def verify_dependency_tree(tree: dict, manifest: dict) -> dict:
+def verify_dependency_tree(tree: dict, manifest: dict, artifact_id: str = "spark-core_2.13") -> dict:
     """Check selected dependencies, not omitted/evicted dependency guesses."""
     spark_version, jetty_version = manifest["spark_version"], manifest["jetty_version"]
-    if (tree.get("groupId"), tree.get("artifactId"), tree.get("version")) != ("org.apache.spark", "spark-core_2.13", spark_version):
-        raise ValueError("Dependency tree is not the selected Spark core")
-    stack, jetty, spark, scala = [tree], {}, {}, set()
+    if artifact_id not in ("spark-core_2.13", NETWORK_ARTIFACT_ID):
+        raise ValueError("Unsupported Spark source module")
+    if (tree.get("groupId"), tree.get("artifactId"), tree.get("version")) != ("org.apache.spark", artifact_id, spark_version):
+        raise ValueError("Dependency tree is not the selected Spark module")
+    stack, jetty, spark, scala, guava = [tree], {}, {}, set(), {}
     while stack:
         node = stack.pop()
         group, artifact, version = (node.get(key, "") for key in ("groupId", "artifactId", "version"))
@@ -139,19 +149,29 @@ def verify_dependency_tree(tree: dict, manifest: dict) -> dict:
             spark[artifact] = version
         if group == "org.scala-lang" and artifact == "scala-library":
             scala.add(version)
+        if group == "com.google.guava" and artifact in ("guava", "failureaccess"):
+            expected = manifest["guava_version"] if artifact == "guava" else manifest["failureaccess_version"]
+            if version != expected:
+                raise ValueError(f"Selected Guava dependency is stale: {artifact}:{version}")
+            guava[artifact] = version
         stack.extend(node.get("children", []))
-    if not jetty:
+    if artifact_id == "spark-core_2.13" and not jetty:
         raise ValueError("No Jetty dependencies in the build tree")
-    if scala != {manifest["upstream_properties"]["scala.version"]}:
+    required_guava = {"guava", "failureaccess"} if artifact_id == NETWORK_ARTIFACT_ID else {"guava"}
+    if not required_guava.issubset(guava):
+        raise ValueError("No complete selected patched Guava/failureaccess dependencies in the build tree")
+    if scala != {manifest["upstream_properties"]["scala.version"]} and not (artifact_id == NETWORK_ARTIFACT_ID and not scala):
         raise ValueError(f"Unexpected Scala library selection: {sorted(scala)}")
-    return {"jetty": jetty, "spark": spark, "scala_library": sorted(scala)}
+    return {"jetty": jetty, "spark": spark, "scala_library": sorted(scala), "guava": guava}
 
 
-def maven_command(maven: Path, source: Path, repository: Path, manifest: dict) -> list[str]:
+def maven_command(maven: Path, source: Path, repository: Path, manifest: dict, module: str = "core") -> list[str]:
     # Deliberately no -pl/-am reactor fallback: dependencies are the published
-    # artifacts of this exact Spark release. The original core POM is untouched.
+    # artifacts of this exact Spark release. Each original POM is untouched.
+    if module not in ("core", "common/network-common"):
+        raise ValueError("Unsupported Spark source module path")
     return [
-        str(maven), "--batch-mode", "--no-transfer-progress", "--strict-checksums", "--file", str(source / "core/pom.xml"),
+        str(maven), "--batch-mode", "--no-transfer-progress", "--strict-checksums", "--file", str(source / module / "pom.xml"),
         f"-Dmaven.repo.local={repository}",
         *[f"-D{name}={value}" for name, value in sorted(manifest["overrides"].items())],
         "-DskipTests=true", "-Dmaven.test.skip=true", "-Dcheckstyle.skip=true",
@@ -237,7 +257,8 @@ def run_protobuf_probe(jdk: Path, target: Path, work: Path, environment: dict) -
 
 
 def build(work: Path, output: Path, baseline: Path, repository: Path,
-          shared_maven_home: Path | None = None, shared_maven_archive: Path | None = None) -> None:
+          shared_maven_home: Path | None = None, shared_maven_archive: Path | None = None,
+          baseline_network: Path | None = None) -> None:
     manifest = json.loads(MANIFEST.read_text())
     # Fail before any large fetch when the Docker stage still has Spark 4.1.x.
     with zipfile.ZipFile(baseline) as jar:
@@ -246,6 +267,10 @@ def build(work: Path, output: Path, baseline: Path, repository: Path,
     environment.pop("MAVEN_ARGS", None)
     environment["MAVEN_OPTS"] = "-Xmx1536m"
     jdk, jdk_evidence = verify_build_jdk(manifest, environment)
+    if baseline_network is None:
+        baseline_network = baseline.with_name(f"{NETWORK_ARTIFACT_ID}-{manifest['spark_version']}.jar")
+    with zipfile.ZipFile(baseline_network) as jar:
+        verify_network_identity(jar, manifest["spark_version"])
     work.mkdir(parents=True, exist_ok=True)
     output.mkdir(parents=True, exist_ok=True)
     downloads = work / "downloads"
@@ -268,6 +293,22 @@ def build(work: Path, output: Path, baseline: Path, repository: Path,
         raise ValueError("Unexpected Maven executable version")
     if not re.search(r"Java version:\s*" + re.escape(manifest["build_jdk"]["java_version"]) + r"(?:,|\s)", version.stdout):
         raise ValueError("Maven did not select the pinned Spark Java 17 compiler")
+    network_command = maven_command(maven, source, repository, manifest, "common/network-common")
+    network_build_command = network_command + ["clean", "package"]
+    subprocess.run(network_build_command, cwd=source, env=environment, check=True)
+    network_tree_path = output / "spark-network-common-build-dependencies.json"
+    subprocess.run(network_command + ["dependency:tree", "-DoutputType=json", f"-DoutputFile={network_tree_path}"], cwd=source, env=environment, check=True)
+    network_dependencies = verify_dependency_tree(json.loads(network_tree_path.read_text()), manifest, NETWORK_ARTIFACT_ID)
+    network_target = source / f"common/network-common/target/{NETWORK_ARTIFACT_ID}-{manifest['spark_version']}.jar"
+    network_verification = verify_network_runtime(network_target, baseline_network, manifest["guava_version"], manifest["spark_version"])
+    resolved_guava = {
+        artifact: repository / "com/google/guava" / artifact / version / f"{artifact}-{version}.jar"
+        for artifact, version in (("guava", manifest["guava_version"]), ("failureaccess", manifest["failureaccess_version"]))
+    }
+    network_verification["resolved_guava_payload"] = verify_resolved_guava(
+        network_target, resolved_guava["guava"], resolved_guava["failureaccess"],
+        manifest["guava_version"], manifest["failureaccess_version"],
+    )
     command = maven_command(maven, source, repository, manifest)
     build_command = command + ["clean", "package"]
     subprocess.run(build_command, cwd=source, env=environment, check=True)
@@ -278,29 +319,37 @@ def build(work: Path, output: Path, baseline: Path, repository: Path,
     verification = verify_runtime(target, baseline, manifest["jetty_version"], manifest["spark_version"])
     verification["protobuf_builder_probe"] = run_protobuf_probe(jdk, target, work, environment)
     artifact = output / f"spark-core_2.13-{manifest['spark_version']}-d2c-jetty{manifest['jetty_version']}.jar"
+    network_artifact = output / f"{NETWORK_ARTIFACT_ID}-{manifest['spark_version']}-d2c-guava{manifest['guava_version']}.jar"
     shutil.copyfile(target, artifact)
+    shutil.copyfile(network_target, network_artifact)
     for document in ("LICENSE", "NOTICE"):
         shutil.copyfile(source / document, output / f"{document}.spark-{manifest['spark_version']}")
     (output / "spark-core-verification.json").write_text(json.dumps(verification, indent=2, sort_keys=True) + "\n")
+    (output / "spark-network-common-verification.json").write_text(json.dumps(network_verification, indent=2, sort_keys=True) + "\n")
     provenance = {
         "schema_version": 1, "built_at_utc": datetime.now(timezone.utc).isoformat(),
         "source": manifest["source"], "maven": manifest["maven"],
         "maven_installation": tool_installation,
         "source_evidence": source_evidence, "source_edits": [],
-        "build_strategy": "standalone original core POM, published same-release Spark dependencies",
+        "build_strategy": "standalone original core and network-common POMs, published same-release Spark dependencies",
         "build_command": build_command, "dependency_overrides": manifest["overrides"],
+        "network_build_command": network_build_command,
         "maven_version_output": version.stdout.strip(),
         "java_version_output": jdk_evidence["java_version_output"],
         "build_java": jdk_evidence,
         "selected_dependencies": dependencies,
+        "network_selected_dependencies": network_dependencies,
         "artifact": {"filename": artifact.name, "sha256": digest_file(artifact)},
+        "network_artifact": {"filename": network_artifact.name, "sha256": digest_file(network_artifact)},
         "verification": verification,
+        "network_verification": network_verification,
         "local_variant": True,
         "scope": manifest["compatibility_scope"],
         "limits": "Source compilation and structural checks only. This does not establish startup/behavioral compatibility or a clean container scan.",
     }
     (output / "spark-source-provenance.json").write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n")
     print(f"Verified source-built artifact: {artifact.name} sha256={provenance['artifact']['sha256']}")
+    print(f"Verified source-built artifact: {network_artifact.name} sha256={provenance['network_artifact']['sha256']}")
 
 
 def main() -> None:
@@ -308,6 +357,7 @@ def main() -> None:
     parser.add_argument("--work-dir", type=Path, default=Path("/work/spark"))
     parser.add_argument("--output-dir", type=Path, default=Path("/out/spark"))
     parser.add_argument("--baseline-jar", type=Path, default=Path("/opt/spark/jars/spark-core_2.13-4.2.1.jar"))
+    parser.add_argument("--baseline-network-jar", type=Path, default=Path("/opt/spark/jars/spark-network-common_2.13-4.2.1.jar"))
     parser.add_argument("--maven-repo", type=Path, default=Path("/root/.m2/repository"))
     parser.add_argument("--maven-home", type=Path)
     parser.add_argument("--maven-archive", type=Path)
@@ -316,7 +366,8 @@ def main() -> None:
         parser.error("maven-home and maven-archive must be supplied together")
     build(args.work_dir.resolve(), args.output_dir.resolve(), args.baseline_jar.resolve(), args.maven_repo.resolve(),
           args.maven_home.resolve() if args.maven_home else None,
-          args.maven_archive.resolve() if args.maven_archive else None)
+          args.maven_archive.resolve() if args.maven_archive else None,
+          args.baseline_network_jar.resolve())
 
 
 if __name__ == "__main__":

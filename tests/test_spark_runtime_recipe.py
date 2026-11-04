@@ -32,6 +32,7 @@ def load_module(name: str):
 
 
 verify = load_module("verify_runtime")
+network_verify = load_module("verify_network_runtime")
 build = load_module("build_core")
 MANIFEST = json.loads((RECIPE / "inputs.json").read_text())
 
@@ -82,8 +83,52 @@ def dependency_tree():
             {"groupId": "org.apache.spark", "artifactId": "spark-common-utils_2.13", "version": "4.2.1"},
             {"groupId": "org.eclipse.jetty", "artifactId": "jetty-http", "version": "12.1.14"},
             {"groupId": "org.scala-lang", "artifactId": "scala-library", "version": "2.13.18"},
+            {"groupId": "com.google.guava", "artifactId": "guava", "version": "33.7.2-jre"},
+            {"groupId": "com.google.guava", "artifactId": "failureaccess", "version": "1.0.3"},
         ],
     }
+
+
+def network_jar_fixture(path: Path, *, guava_version="33.7.2-jre", spark_version="4.2.1", descriptor="()I"):
+    with zipfile.ZipFile(path, "w") as jar:
+        jar.writestr(network_verify.SPARK_PROPERTIES, f"groupId=org.apache.spark\nartifactId=spark-network-common_2.13\nversion={spark_version}\n")
+        jar.writestr(network_verify.GUAVA_PROPERTIES, f"groupId=com.google.guava\nartifactId=guava\nversion={guava_version}\n")
+        failureaccess = "META-INF/maven/com.google.guava/failureaccess/pom.properties"
+        jar.writestr(failureaccess, "groupId=com.google.guava\nartifactId=failureaccess\nversion=1.0.3\n")
+        for name in (network_verify.SPARK_PROPERTIES, network_verify.GUAVA_PROPERTIES, failureaccess):
+            jar.writestr(name.replace("pom.properties", "pom.xml"), "<project>Fixture upstream POM</project>")
+        for name in network_verify.REQUIRED_CLASSES:
+            jar.writestr(name, class_file(name[:-6], descriptor))
+        jar.writestr("META-INF/LICENSE", "Fixture Apache license")
+        jar.writestr("META-INF/NOTICE", "Fixture notice")
+
+
+def network_dependency_tree():
+    return {
+        "groupId": "org.apache.spark", "artifactId": "spark-network-common_2.13", "version": "4.2.1",
+        "children": [
+            {"groupId": "org.apache.spark", "artifactId": "spark-common-utils-java_2.13", "version": "4.2.1"},
+            {"groupId": "com.google.guava", "artifactId": "guava", "version": "33.7.2-jre"},
+            {"groupId": "com.google.guava", "artifactId": "failureaccess", "version": "1.0.3"},
+        ],
+    }
+
+
+def guava_dependency_fixture(path: Path, artifact: str, version: str):
+    """Original-package fixtures; represent resolved inputs, not a real build."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w") as jar:
+        prefix = f"META-INF/maven/com.google.guava/{artifact}/"
+        jar.writestr(prefix + "pom.properties", f"groupId=com.google.guava\nartifactId={artifact}\nversion={version}\n")
+        jar.writestr(prefix + "pom.xml", "<project>Fixture upstream POM</project>")
+        for name in sorted(network_verify.REQUIRED_CLASSES):
+            if not name.startswith("org/sparkproject/guava/"):
+                continue
+            internal = "/util/concurrent/internal/" in name
+            if internal != (artifact == "failureaccess"):
+                continue
+            original = name.replace("org/sparkproject/guava/", "com/google/common/")
+            jar.writestr(original, class_file(original[:-6]))
 
 
 def protobuf_proof(target: Path):
@@ -187,17 +232,22 @@ class SparkRuntimeRecipeTests(unittest.TestCase):
     def test_dependency_tree_rejects_mixed_scala_version(self):
         self.assert_rejected_dependency_version(2, "2.13.17")
 
-    def test_recipe_retains_original_core_build_and_only_jetty_override(self):
-        self.assertEqual(MANIFEST["overrides"], {"jetty.version": "12.1.14"})
+    def test_recipe_retains_original_module_builds_and_reviewed_dependency_overrides(self):
+        self.assertEqual(MANIFEST["overrides"], {"jetty.version": "12.1.14", "guava.version": "33.7.2-jre"})
         self.assertEqual(len(MANIFEST["source"]["sha512"]), 128)
         self.assertEqual(len(MANIFEST["maven"]["sha512"]), 128)
         command = build.maven_command(Path("/tools/mvn"), Path("/source"), Path("/cache"), MANIFEST)
         self.assertEqual(command[command.index("--file") + 1], "/source/core/pom.xml")
         self.assertIn("-Djetty.version=12.1.14", command)
+        self.assertIn("-Dguava.version=33.7.2-jre", command)
         self.assertIn("--strict-checksums", command)
         for value in ("-am", "-pl", "-Denforcer.skip=true"):
             self.assertNotIn(value, command)
         self.assertEqual(build.verify_dependency_tree(dependency_tree(), MANIFEST)["scala_library"], ["2.13.18"])
+        network = build.maven_command(Path("/tools/mvn"), Path("/source"), Path("/cache"), MANIFEST, "common/network-common")
+        self.assertEqual(network[network.index("--file") + 1], "/source/common/network-common/pom.xml")
+        self.assertIn("-Dguava.version=33.7.2-jre", network)
+        self.assertIn("common/network-common/pom.xml", MANIFEST["source"]["pom_sha256"])
 
     def test_corrupt_cached_archive_is_not_used_or_refetched(self):
         (self.root / "source.tgz").write_bytes(b"wrong bytes")
@@ -456,6 +506,204 @@ class SparkRuntimeRecipeTests(unittest.TestCase):
         python_match = re.search(r"<<'PY'\n(.*?)\nPY", shell, re.S)
         self.assertIsNotNone(python_match)
         ast.parse(python_match.group(1))
+
+
+class SparkNetworkRuntimeRecipeTests(unittest.TestCase):
+    def setUp(self):
+        scratch = TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        self.baseline, self.rebuilt = self.root / "network-baseline.jar", self.root / "network-rebuilt.jar"
+        network_jar_fixture(self.baseline, guava_version="33.6.0-jre")
+        network_jar_fixture(self.rebuilt)
+
+    def rewrite_rebuilt(self, *, remove=(), replace=None, add=None):
+        destination = self.root / "changed.jar"
+        with zipfile.ZipFile(self.rebuilt) as source, zipfile.ZipFile(destination, "w") as output:
+            for name in source.namelist():
+                if name not in remove:
+                    output.writestr(name, (replace or {}).get(name, source.read(name)))
+            for name, value in (add or {}).items():
+                output.writestr(name, value)
+        return destination
+
+    def test_network_common_keeps_all_spark_classes_and_shades_patched_guava(self):
+        report = network_verify.verify_network_runtime(self.rebuilt, self.baseline)
+        self.assertTrue(report["structural_abi_matches_baseline"])
+        self.assertTrue(report["original_license_and_notice_match_baseline"])
+        self.assertTrue(report["upstream_maven_metadata_retained"])
+        self.assertEqual(report["shaded_guava"]["version"], "33.7.2-jre")
+        self.assertEqual(report["spark_classes_compared"], 3)
+
+    def test_network_common_rejects_stale_guava_or_mixed_spark_release(self):
+        for changes, reason in (({"guava_version": "33.6.0-jre"}, "Guava Maven identity/version"),
+                                ({"spark_version": "4.2.0"}, "Expected Spark network-common")):
+            with self.subTest(changes=changes):
+                network_jar_fixture(self.rebuilt, **changes)
+                with self.assertRaisesRegex(ValueError, reason):
+                    network_verify.verify_network_runtime(self.rebuilt, self.baseline)
+
+    def test_network_common_rejects_changed_spark_public_abi(self):
+        network_jar_fixture(self.rebuilt, descriptor="()J")
+        with self.assertRaisesRegex(ValueError, "structural ABI changed"):
+            network_verify.verify_network_runtime(self.rebuilt, self.baseline)
+
+    def test_network_common_rejects_removed_and_added_spark_classes(self):
+        name = "org/apache/spark/network/Implementation$1.class"
+        with zipfile.ZipFile(self.baseline, "a") as baseline:
+            baseline.writestr(name, class_file(name[:-6]))
+        with self.assertRaisesRegex(ValueError, "class set changed"):
+            network_verify.verify_network_runtime(self.rebuilt, self.baseline)
+        network_jar_fixture(self.baseline, guava_version="33.6.0-jre")
+        added = self.rewrite_rebuilt(add={name: class_file(name[:-6])})
+        with self.assertRaisesRegex(ValueError, "class set changed"):
+            network_verify.verify_network_runtime(added, self.baseline)
+
+    def test_network_common_rejects_missing_real_guava_implementation(self):
+        changed = self.rewrite_rebuilt(remove=("org/sparkproject/guava/cache/CacheBuilder.class",))
+        with self.assertRaisesRegex(ValueError, "Missing network-common implementation"):
+            network_verify.verify_network_runtime(changed, self.baseline)
+
+    def test_network_common_rejects_class_renaming_without_relocation(self):
+        name = "org/sparkproject/guava/cache/CacheBuilder.class"
+        changed = self.rewrite_rebuilt(replace={name: class_file("com/google/common/cache/CacheBuilder")})
+        with self.assertRaisesRegex(ValueError, "implementation class identity mismatch"):
+            network_verify.verify_network_runtime(changed, self.baseline)
+
+    def test_network_common_rejects_unrelocated_guava_payload(self):
+        name = "com/google/common/collect/ImmutableList.class"
+        changed = self.rewrite_rebuilt(add={name: class_file(name[:-6])})
+        with self.assertRaisesRegex(ValueError, "Unrelocated Guava"):
+            network_verify.verify_network_runtime(changed, self.baseline)
+
+    def test_network_common_requires_original_licenses_and_maven_metadata(self):
+        for name in ("META-INF/LICENSE", "META-INF/NOTICE", network_verify.GUAVA_PROPERTIES,
+                     network_verify.GUAVA_PROPERTIES.replace("pom.properties", "pom.xml"),
+                     network_verify.SPARK_PROPERTIES.replace("pom.properties", "pom.xml")):
+            with self.subTest(name=name):
+                changed = self.rewrite_rebuilt(remove=(name,))
+                with self.assertRaises(ValueError):
+                    network_verify.verify_network_runtime(changed, self.baseline)
+        changed = self.rewrite_rebuilt(replace={"META-INF/LICENSE": "Changed upstream license"})
+        with self.assertRaisesRegex(ValueError, "license document changed"):
+            network_verify.verify_network_runtime(changed, self.baseline)
+
+    def test_network_module_tree_checks_patched_guava_without_requiring_java_module_scala(self):
+        report = build.verify_dependency_tree(network_dependency_tree(), MANIFEST, network_verify.ARTIFACT_ID)
+        self.assertEqual(report["guava"], {"guava": "33.7.2-jre", "failureaccess": "1.0.3"})
+        self.assertEqual(report["jetty"], {})
+        self.assertEqual(report["scala_library"], [])
+        bad = network_dependency_tree()
+        bad["children"][1]["version"] = "33.6.0-jre"
+        with self.assertRaisesRegex(ValueError, "Selected Guava dependency is stale"):
+            build.verify_dependency_tree(bad, MANIFEST, network_verify.ARTIFACT_ID)
+        bad = network_dependency_tree()
+        bad["children"].pop()
+        with self.assertRaisesRegex(ValueError, "No complete selected patched Guava"):
+            build.verify_dependency_tree(bad, MANIFEST, network_verify.ARTIFACT_ID)
+
+    def test_core_module_tree_also_rejects_old_guava_selection(self):
+        tree = dependency_tree()
+        tree["children"][-1]["version"] = "33.6.0-jre"
+        with self.assertRaisesRegex(ValueError, "Selected Guava dependency is stale"):
+            build.verify_dependency_tree(tree, MANIFEST)
+
+    def resolved_inputs(self):
+        inputs = {}
+        for artifact, version in (("guava", "33.7.2-jre"), ("failureaccess", "1.0.3")):
+            path = self.root / "repository/com/google/guava" / artifact / version / f"{artifact}-{version}.jar"
+            guava_dependency_fixture(path, artifact, version)
+            inputs[artifact] = path
+        return inputs
+
+    def verify_resolved(self, rebuilt=None, inputs=None):
+        inputs = inputs or self.resolved_inputs()
+        return network_verify.verify_resolved_guava(rebuilt or self.rebuilt, inputs["guava"], inputs["failureaccess"], "33.7.2-jre", "1.0.3")
+
+    def test_resolved_jars_bind_complete_shaded_classes_and_unmodified_metadata(self):
+        inputs = self.resolved_inputs()
+        report = self.verify_resolved(inputs=inputs)
+        self.assertTrue(report["complete_relocated_class_inventory_matches"])
+        self.assertEqual(report["relocated_implementation_classes_verified"], 4)
+        for artifact, path in inputs.items():
+            actual = report["resolved_dependencies"][artifact]
+            self.assertEqual(actual["resolved_jar_sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+            self.assertEqual(len(actual["class_inventory_sha256"]), 64)
+            self.assertTrue(actual["maven_metadata_retained_byte_for_byte"])
+
+    def test_resolved_inventory_rejects_missing_and_extra_classes(self):
+        name = "org/sparkproject/guava/cache/CacheBuilder.class"
+        changed = self.rewrite_rebuilt(remove=(name,))
+        with self.assertRaisesRegex(ValueError, "class inventory mismatch"):
+            self.verify_resolved(changed)
+        name = "org/sparkproject/guava/OldVulnerableOnly.class"
+        changed = self.rewrite_rebuilt(add={name: class_file(name[:-6])})
+        with self.assertRaisesRegex(ValueError, "class inventory mismatch"):
+            self.verify_resolved(changed)
+
+    def test_resolved_inventory_rejects_metadata_only_or_api_replacement(self):
+        name = "org/sparkproject/guava/cache/CacheBuilder.class"
+        changed = self.rewrite_rebuilt(replace={name: class_file(name[:-6], constant=999)})
+        with self.assertRaisesRegex(ValueError, "relocated class structural mismatch"):
+            self.verify_resolved(changed)
+        name = network_verify.GUAVA_PROPERTIES.replace("pom.properties", "pom.xml")
+        changed = self.rewrite_rebuilt(replace={name: "<project>Changed coordinates only</project>"})
+        with self.assertRaisesRegex(ValueError, "metadata was not retained byte-for-byte"):
+            self.verify_resolved(changed)
+
+    def test_resolved_inputs_reject_stale_artifacts_and_duplicate_entries(self):
+        inputs = self.resolved_inputs()
+        guava_dependency_fixture(inputs["guava"], "guava", "33.6.0-jre")
+        with self.assertRaisesRegex(ValueError, "Resolved guava Maven identity/version mismatch"):
+            self.verify_resolved(inputs=inputs)
+        inputs = self.resolved_inputs()
+        with zipfile.ZipFile(inputs["guava"], "a") as jar:
+            with self.assertWarns(UserWarning):
+                jar.writestr(network_verify.GUAVA_PROPERTIES, "duplicate")
+        with self.assertRaisesRegex(ValueError, "Duplicate resolved guava"):
+            self.verify_resolved(inputs=inputs)
+
+    def test_module_build_paths_cannot_expand_to_an_unreviewed_reactor(self):
+        for module in ("../other", "core,sql", "."):
+            with self.subTest(module=module):
+                with self.assertRaisesRegex(ValueError, "Unsupported Spark source module"):
+                    build.maven_command(Path("/mvn"), Path("/source"), Path("/repository"), MANIFEST, module)
+
+    def test_driver_exports_both_verified_source_module_artifacts(self):
+        source, output, work = self.root / "source", self.root / "output", self.root / "work"
+        output.mkdir()
+        core_target = source / "core/target/spark-core_2.13-4.2.1.jar"
+        network_target = source / "common/network-common/target/spark-network-common_2.13-4.2.1.jar"
+        core_target.parent.mkdir(parents=True)
+        network_target.parent.mkdir(parents=True)
+        jar_fixture(core_target)
+        network_jar_fixture(network_target)
+        self.resolved_inputs()
+        core_baseline = self.root / "core-baseline.jar"
+        jar_fixture(core_baseline, jetty_version="12.1.8")
+        for name in ("LICENSE", "NOTICE"):
+            (source / name).write_text("Fixture upstream " + name)
+        (output / "spark-core-build-dependencies.json").write_text(json.dumps(dependency_tree()))
+        (output / "spark-network-common-build-dependencies.json").write_text(json.dumps(network_dependency_tree()))
+        version = subprocess.CompletedProcess([], 0, "Apache Maven 3.9.15\nJava version: 17.0.21, vendor: Eclipse Adoptium", "")
+        with patch.object(build, "verify_build_jdk", return_value=(self.root / "jdk", {"java_version_output": "Fixture actual Java report"})):
+            with patch.object(build, "download_verified", return_value=self.root / "archive"):
+                with patch.object(build, "extract_verified", side_effect=[source, self.root / "maven"]):
+                    with patch.object(build, "verify_source", return_value={"fixture": "Source verification is separate"}):
+                        with patch.object(build.subprocess, "run", return_value=version) as run:
+                            with patch.object(build, "run_protobuf_probe", return_value={"fixture": "JVM execution is mocked"}):
+                                build.build(work, output, core_baseline, self.root / "repository", baseline_network=self.baseline)
+        self.assertEqual(run.call_count, 5)
+        core_artifact = output / "spark-core_2.13-4.2.1-d2c-jetty12.1.14.jar"
+        network_artifact = output / "spark-network-common_2.13-4.2.1-d2c-guava33.7.2-jre.jar"
+        self.assertEqual(core_artifact.read_bytes(), core_target.read_bytes())
+        self.assertEqual(network_artifact.read_bytes(), network_target.read_bytes())
+        report = json.loads((output / "spark-source-provenance.json").read_text())
+        self.assertEqual(report["network_artifact"]["sha256"], hashlib.sha256(network_target.read_bytes()).hexdigest())
+        self.assertTrue(report["network_verification"]["structural_abi_matches_baseline"])
+        self.assertTrue(report["network_verification"]["resolved_guava_payload"]["complete_relocated_class_inventory_matches"])
+        self.assertIn("/common/network-common/pom.xml", " ".join(report["network_build_command"]))
+        self.assertEqual(report["source_edits"], [])
 
 
 if __name__ == "__main__":

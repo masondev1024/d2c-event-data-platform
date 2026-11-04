@@ -38,6 +38,57 @@ def class_file(owner, *, descriptor="()Ljava/lang/String;", method=True):
     return header + declaration + methods + b"\x00\x00"
 
 
+def write_jar(path, entries):
+    with ZipFile(path, "w") as jar:
+        for name, value in entries.items():
+            jar.writestr(name, value)
+
+
+def artifact(path, coordinate, source_project=False):
+    return {"coordinate": coordinate, "filename": path.name, "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "source_project": source_project}
+
+
+def guava_fixture(root, module):
+    inputs, bundled = [], {}
+    for name, version, classes in (
+        ("guava", module.GUAVA_VERSION,
+         ("base/Preconditions", "collect/ImmutableList", "collect/CompactHashMap",
+          "collect/CompactHashMap$EntrySetView", "collect/CompactHashSet", "collect/MapMakerInternalMap")),
+        ("failureaccess", module.FAILUREACCESS_VERSION,
+         ("util/concurrent/internal/InternalFutureFailureAccess",)),
+    ):
+        metadata = f"META-INF/maven/com.google.guava/{name}/pom.properties"
+        entries = {metadata: f"groupId=com.google.guava\nartifactId={name}\nversion={version}\n".encode()}
+        bundled[metadata] = entries[metadata]
+        pom = metadata.replace("pom.properties", "pom.xml")
+        entries[pom] = f"<project><groupId>com.google.guava</groupId><artifactId>{name}</artifactId><version>{version}</version></project>".encode()
+        bundled[pom] = entries[pom]
+        for suffix in classes:
+            owner = "com/google/common/" + suffix
+            entries[owner + ".class"] = class_file(owner)
+            relocated = module.GUAVA_PREFIX + suffix
+            bundled[relocated + ".class"] = class_file(relocated)
+        path = root / f"{name}-{version}.jar"
+        write_jar(path, entries)
+        inputs.append(artifact(path, f"com.google.guava:{name}:{version}"))
+    bundle = root / "iceberg-bundled-guava-1.12.0.jar"
+    write_jar(bundle, bundled)
+    return artifact(bundle, "org.apache.iceberg:iceberg-bundled-guava:1.12.0", True), inputs, bundled
+
+
+def subprocess_fixture(command, **_kwargs):
+    if Path(command[0]).name == "javap":
+        return subprocess.CompletedProcess(command, 0, "fixed private code #123 // Method java/util/Map.put\n", "")
+    closure = [index for index, value in enumerate(command) if str(value).endswith("VerifyIcebergGuavaClosure.java")]
+    if closure:
+        with ZipFile(command[closure[0] + 3]) as jar:
+            count = sum(name.endswith(".class") for name in jar.namelist())
+        return subprocess.CompletedProcess(command, 0, json.dumps({"status": "PASS", "class_count": count,
+            "complete_canonical_class_sha256": "a" * 64, "jdk_version": "fixture-only"}), "")
+    return subprocess.CompletedProcess(command, 0, '{"status":"PASS"}\n{"status":"PASS"}\n', "")
+
+
 class SourceSelectionTest(unittest.TestCase):
     def test_spark42_fetches_no_fat_jar(self):
         fetch = load("iceberg/fetch-inputs.py")
@@ -130,6 +181,9 @@ class RuntimeVerifierTest(unittest.TestCase):
         inputs = [{"coordinate": "org.apache.iceberg:" + name + ":1.12.0",
                    "path": str(input_jar), "sha256": hashlib.sha256(input_jar.read_bytes()).hexdigest(),
                    "source_project": True} for name in ("iceberg-spark-4.2_2.13", "iceberg-spark-extensions-4.2_2.13")]
+        bundle, self.guava_inputs, guava_entries = guava_fixture(root, self.module)
+        inputs.append(bundle)
+        entries.update(guava_entries)
         entries.update({name: b"version bytecode" for name in self.module.JACKSON_CLASSES})
         entries.update({name: (runtime / name).read_bytes() for name in ("LICENSE", "NOTICE")})
         return upstream, inputs, entries
@@ -139,9 +193,8 @@ class RuntimeVerifierTest(unittest.TestCase):
         with ZipFile(rebuilt, "w") as jar:
             for name, value in entries.items():
                 jar.writestr(name, value)
-        java = subprocess.CompletedProcess([], 0, '{"status":"PASS"}\n{"status":"PASS"}\n', "")
-        with patch.object(self.module.subprocess, "run", return_value=java):
-            return self.module.verify(inputs, rebuilt, upstream)
+        with patch.object(self.module.subprocess, "run", side_effect=subprocess_fixture):
+            return self.module.verify(inputs, rebuilt, upstream, guava_inputs=self.guava_inputs)
 
     def test_preserved_source_inputs_pass_and_no_published_oracle_is_claimed(self):
         with TemporaryDirectory() as directory:
@@ -170,7 +223,7 @@ class RuntimeVerifierTest(unittest.TestCase):
             input_jar = Path(inputs[0]["path"])
             with ZipFile(input_jar, "a") as jar:
                 jar.writestr(name, original)
-            for artifact in inputs:
+            for artifact in inputs[:2]:
                 artifact["sha256"] = hashlib.sha256(input_jar.read_bytes()).hexdigest()
             entries[name] = class_file(name[:-6], descriptor="()Lorg/apache/iceberg/shaded/com/fasterxml/jackson/JsonNode;")
             report = self.run_verifier(root, upstream, inputs, entries)
@@ -203,6 +256,152 @@ class RuntimeVerifierTest(unittest.TestCase):
         shaded = class_file("org/apache/iceberg/Table", descriptor="()Lorg/apache/iceberg/shaded/com/fasterxml/jackson/JsonNode;")
         self.assertEqual(self.module.public_api(original), self.module.public_api(
             shaded, [("com.fasterxml", "org.apache.iceberg.shaded.com.fasterxml")]))
+
+
+class NestedGuavaVerifierTest(unittest.TestCase):
+    def setUp(self):
+        self.module = load("iceberg/verify-source-runtime.py")
+        self.directory = TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        bundle, self.guava_inputs, self.entries = guava_fixture(self.root, self.module)
+        self.inputs = [bundle]
+        self.rebuilt = self.root / "runtime.jar"
+
+    def verify(self, *, subprocess_effect=subprocess_fixture):
+        write_jar(self.rebuilt, self.entries)
+        with patch.object(self.module.subprocess, "run", side_effect=subprocess_effect):
+            return self.module.verify_guava(self.inputs, self.guava_inputs, self.rebuilt)
+
+    def rewrite_bundle(self, entries):
+        path = Path(self.inputs[0]["path"])
+        write_jar(path, entries)
+        self.inputs[0]["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def test_fixed_actual_inputs_and_final_byte_closure_pass(self):
+        proof = self.verify()
+        self.assertEqual(proof["status"], "PASS")
+        self.assertEqual(proof["version"], "33.7.2-jre")
+        self.assertEqual(proof["failureaccess_version"], "1.0.3")
+        self.assertEqual(proof["retained_class_count"], 7)
+        self.assertEqual(len(proof["cve_affected_retained_classes"]), 4)
+        self.assertEqual(len(proof["cve_affected_implementation_disassembly_sha256"]), 64)
+        self.assertIn("not an independently obtained publisher checksum", proof["limits"])
+
+    def test_missing_actual_nested_receipt_or_changed_input_hash_fails(self):
+        for records in (None, [], [{**self.guava_inputs[0], "sha256": "0" * 64}, self.guava_inputs[1]]):
+            with self.subTest(records=records), self.assertRaises(RuntimeError):
+                self.module.verify_guava(self.inputs, records, self.rebuilt)
+
+    def test_old_selected_version_or_changed_maven_identity_fails(self):
+        self.guava_inputs[0]["coordinate"] = "com.google.guava:guava:33.7.1-jre"
+        with self.assertRaisesRegex(RuntimeError, "fixed Guava"):
+            self.verify()
+        self.guava_inputs[0]["coordinate"] = "com.google.guava:guava:33.7.2-jre"
+        path = Path(self.guava_inputs[0]["path"])
+        with ZipFile(path) as jar:
+            entries = {name: jar.read(name) for name in jar.namelist()}
+        entries[self.module.GUAVA_METADATA] = entries[self.module.GUAVA_METADATA].replace(b"33.7.2", b"33.7.1")
+        write_jar(path, entries)
+        self.guava_inputs[0]["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        with self.assertRaisesRegex(RuntimeError, "Maven identity"):
+            self.verify()
+
+    def test_edited_final_code_or_new_namespace_fails_even_with_fixed_metadata(self):
+        name = self.module.GUAVA_PREFIX + "collect/CompactHashMap.class"
+        original = self.entries[name]
+        self.entries[name] = class_file(name[:-6], descriptor="()I")
+        with self.assertRaisesRegex(RuntimeError, "class payload mismatch"):
+            self.verify()
+        self.entries[name] = original
+        self.entries["hidden/com/google/common/collect/CompactHashMap.class"] = original
+        with self.assertRaisesRegex(RuntimeError, "class closure"):
+            self.verify()
+
+    def test_old_implementation_behind_matching_metadata_and_public_api_fails(self):
+        calls = []
+        def different_code(command, **kwargs):
+            calls.append(command)
+            result = subprocess_fixture(command, **kwargs)
+            if Path(command[command.index("-classpath") + 1]).name.startswith("iceberg-bundled"):
+                result.stdout = result.stdout.replace("fixed private code", "vulnerable private code")
+            return result
+        with self.assertRaisesRegex(RuntimeError, "CVE-affected retained Guava implementation"):
+            self.verify(subprocess_effect=different_code)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all("-p" in command and "-c" in command for command in calls))
+        self.assertTrue(any("CompactHashMap$EntrySetView" in name for name in calls[0]))
+
+    def test_disassembly_normalizes_only_shade_names_and_constant_pool_indexes(self):
+        outputs = [
+            "class com.google.common.collect.CompactHashMap {\n    Code:\n 4: invokevirtual #12 // Method com/google/common/Foo.bar:()I\n}",
+            "class org.apache.iceberg.relocated.com.google.common.collect.CompactHashMap {\n    Code:\n 4: invokevirtual #456 // Method org/apache/iceberg/relocated/com/google/common/Foo.bar:()I\n}",
+        ]
+        def disassembly(command, **kwargs):
+            return subprocess.CompletedProcess(command, 0, outputs.pop(0), "")
+        with patch.object(self.module.subprocess, "run", side_effect=disassembly):
+            before = self.module.normalized_disassembly(self.rebuilt, ["before.class"], "javap")
+            after = self.module.normalized_disassembly(self.rebuilt, ["after.class"], "javap")
+        self.assertEqual(before, after)
+        self.assertIn("L0: invokevirtual #CP", before)
+
+    def test_shade_widened_constant_load_preserves_control_flow_but_not_literal_values(self):
+        before = """class Example {
+    Code:
+       0: ldc #12 // String fixed #123
+       2: ifnonnull 8
+       5: goto 9
+       8: iconst_1
+       9: ireturn
+      Exception table:
+         from to target type
+             0 8 8 Class java/lang/Exception
+}"""
+        after = before.replace("ldc #12", "ldc_w #456").replace("2: ifnonnull 8", "3: ifnonnull 9").replace("5: goto 9", "6: goto 10").replace("8: iconst_1", "9: iconst_1").replace("9: ireturn", "10: ireturn").replace("0 8 8 Class", "0 9 9 Class")
+        self.assertEqual(self.module.normalize_javap_output(before), self.module.normalize_javap_output(after))
+        self.assertNotEqual(self.module.normalize_javap_output(before),
+                            self.module.normalize_javap_output(after.replace("fixed #123", "fixed #456")))
+        self.assertNotEqual(self.module.normalize_javap_output(before),
+                            self.module.normalize_javap_output(after.replace("iconst_1", "iconst_2")))
+
+    def test_original_upstream_minimize_is_preserved_but_cannot_drop_final_classes(self):
+        optional = self.module.GUAVA_PREFIX + "collect/CompactHashSet.class"
+        self.entries.pop(optional)
+        self.rewrite_bundle(self.entries)
+        proof = self.verify()
+        self.assertEqual(proof["upstream_minimized_class_count"], 1)
+        self.assertNotIn(optional, proof["cve_affected_retained_classes"])
+        self.entries.pop(self.module.GUAVA_PREFIX + "collect/ImmutableList.class")
+        with self.assertRaisesRegex(RuntimeError, "class closure"):
+            self.verify()
+
+    def test_original_empty_listenablefuture_is_allowed_only_without_class_payload(self):
+        path = self.root / "listenablefuture.jar"
+        write_jar(path, {"META-INF/NOTICE": b"empty conflict avoidance dependency"})
+        self.guava_inputs.append(artifact(path, "com.google.guava:listenablefuture:9999.0-empty-to-avoid-conflict-with-guava"))
+        self.assertEqual(len(self.verify()["empty_listenablefuture_input"]), 1)
+        write_jar(path, {"com/google/common/util/concurrent/ListenableFuture.class": b"old payload"})
+        self.guava_inputs[-1]["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        with self.assertRaisesRegex(RuntimeError, "empty listenablefuture"):
+            self.verify()
+
+    def test_javap_failure_is_not_reported_as_a_verified_implementation(self):
+        for code, stdout, stderr in ((1, "", "missing"), (0, "", ""), (0, "body", "warning")):
+            with self.subTest(code=code, stderr=stderr), self.assertRaises(RuntimeError):
+                self.verify(subprocess_effect=lambda command, **kwargs: subprocess.CompletedProcess(command, code, stdout, stderr))
+
+    def test_complete_class_verification_cannot_be_skipped_or_replaced_by_an_invalid_receipt(self):
+        for code, payload, stderr in ((1, {"status": "PASS", "class_count": 7}, "mismatch"),
+                                      (0, {"status": "FAIL", "class_count": 7}, ""),
+                                      (0, {"status": "PASS", "class_count": 0}, ""),
+                                      (0, {"status": "PASS", "class_count": 7}, ""),
+                                      (0, None, "")):
+            def invalid_closure(command, **kwargs):
+                if any(str(value).endswith("VerifyIcebergGuavaClosure.java") for value in command):
+                    return subprocess.CompletedProcess(command, code, json.dumps(payload), stderr)
+                return subprocess_fixture(command, **kwargs)
+            with self.subTest(code=code, payload=payload), self.assertRaises(RuntimeError):
+                self.verify(subprocess_effect=invalid_closure)
 
 
 if __name__ == "__main__":

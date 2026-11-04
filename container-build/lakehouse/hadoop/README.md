@@ -27,7 +27,7 @@ ClientProtocolProvider, and the separate
 an upstream **compile** dependency, not `optional=true`; omitting it is an explicit
 D2C capability-profile decision. The recipe explicitly selects
 `mapreduce-client-common` (otherwise reachable only through jobclient), applying
-the same two artifact exclusions to that path. Common/core and their
+the same transport exclusions and Curator replacements to that path. Common/core and their
 LocalClientProtocolProvider/LocalJobRunner remain selected. The original
 ServicesResourceTransformer generates descriptors from those selected modules.
 JLine is retained as a complete dependency with its version fixed to 3.30.17;
@@ -35,6 +35,48 @@ actual Telnet implementation classes and all relevant version metadata are check
 The patch release fixes the upstream
 [Telnet descriptor leak](https://github.com/jline/jline3/security/advisories/GHSA-c87g-867h-cqr6)
 and [Windows native-library issue](https://github.com/jline/jline3/security/advisories/GHSA-6r3w-6jpj-x5w6).
+
+Both ordinary Guava and Hadoop's already shaded Guava must be updated. The
+recipe selects Guava **33.7.2-jre** and the official
+`hadoop-shaded-guava` **1.6.0**, whose pinned original parent POM selects that
+same fixed Guava. Only `hadoop-thirdparty-guava.version` is overridden; the
+separate Hadoop protobuf dependency remains unchanged. The runtime verifier
+checks both original resolved input JAR hashes, the inner and outer Maven
+identities, and the complete Guava class inventories of both generated namespaces.
+An unexpected third namespace or old nested version cannot pass using the
+ordinary Guava descriptor. All generated class references are checked as well.
+
+Curator 5.2.0's standard client embeds another Guava 27.0.1 copy, under
+`org.apache.curator.shaded.com.google`, with its descriptor removed by the
+original Curator build. Updating a Maven Guava property cannot replace those
+pre-shaded implementation classes. The recipe therefore selects the official
+**5.2.0 `osgi` classifiers of client, framework and recipes together**. The
+[official build](https://raw.githubusercontent.com/apache/curator/apache-curator-5.2.0/pom.xml)
+attaches the complete pre-Shade module JAR, and the
+[official documentation](https://curator.apache.org/docs/about/) specifies its
+external Guava dependency. All three modules remain present; their unclassified
+siblings are excluded on every old and new transitive path before assembly.
+Their fixed external Guava is relocated by Hadoop's original shade recipe.
+
+Build verification fetches the unchanged standard three artifacts only as
+comparison baselines. Every module must retain its complete own class set,
+public/protected structural ABI (including protected nested types and exposed
+internal ancestors), Maven identities and original LICENSE/NOTICE. The final
+runtime must contain every selected Curator class after Hadoop relocation.
+Old Curator-Guava class definitions, symbolic references, strings and active
+resources fail verification across both generated Hadoop JARs. An unchanged
+source POM that documents alternative packaging may be recorded only if its
+exact reviewed official SHA and GAV match; no metadata is modified or removed.
+The upstream packaging POMs and API migration evidence are fetched as pinned
+review inputs. These static comparisons require actual CI artifacts and do not
+replace final-image linkage or application regression tests.
+
+The external native `snappy-java` dependency is fixed at **1.1.10.9** in both
+generated source POMs and resolved graphs. Hadoop's unchanged original
+artifact-set exclusions leave that complete dependency outside both fat JARs.
+Checks reject embedded Snappy classes, Maven descriptors, native payloads or
+pre-shaded symbolic references. The final image separately supplies and tests
+the patched native artifact on both supported platforms.
 
 JLine 3.30.17's original `TerminalProvider.load(String)` reads plain class names
 from `META-INF/jline/providers/{dumb,exec,jni,ffm}`. It does not use the legacy
@@ -73,7 +115,7 @@ ContainerShellWebSocket retain their now-unavailable transport references, and
 the generated provenance reports them. Their reviewed source hashes and exact
 reference targets are pinned; new callers or transport targets fail validation.
 The recipe does not hide those API classes, remove service descriptors, invoke
-remote token operations or claim universal bytecode closure. The four reviewed
+remote token operations or claim universal bytecode closure. The five reviewed
 official Java files are downloaded as immutable review evidence, not patched or
 compiled as replacement classes. Their URLs, SHA-256 hashes and branch findings
 are recorded in provenance alongside the original assembly POMs and metadata.
@@ -124,6 +166,15 @@ classloader and requires a shaded DumbTerminalProvider from the rebuilt Hadoop
 runtime JAR. Finding a class without executing JLine's reflective loader cannot
 pass this check. Optional native providers and the FFM backend (which requires
 newer Java APIs) are not instantiated or claimed to work on Java21.
+The Hadoop 3.5 Cluster probe uses its explicit `close()` in a `finally` block:
+the original class does not implement AutoCloseable. It still executes the
+actual local protocol/filesystem bootstrap before closing.
+It also serializes and deserializes small valid CompactHashMap, CompactHashSet
+and MapMakerInternalMap values through both actual Guava namespaces and checks
+their JAR origins. This is a normal compatibility exercise, not an oversized
+allocation proof. An unstarted Curator client and recipe are constructed and
+closed to exercise all three retained modules and their fixed Guava linkage;
+ZooKeeper connections are never started.
 It makes no remote filesystem or YARN call. It is not a Parquet/Iceberg/checkpoint
 recovery test. Those actual D2C regressions and fresh scans of the final immutable
 images, on both target platforms, are independent acceptance requirements.

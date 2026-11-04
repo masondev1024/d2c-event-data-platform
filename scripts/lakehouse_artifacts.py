@@ -52,15 +52,19 @@ REQUIRED = {
     "iceberg": (
         "iceberg-spark-runtime-4.2_2.13-1.12.0-d2c-security1.jar",
         "iceberg-source-provenance.json", "security-runtime-artifacts.json",
-        "iceberg-rebuild-verification.json",
+        "iceberg-rebuild-verification.json", "security-guava-artifacts.json",
     ),
     "spark": (
         "spark-core_2.13-4.2.1-d2c-jetty12.1.14.jar", "spark-source-provenance.json",
         "spark-core-verification.json", "spark-core-build-dependencies.json",
+        "spark-network-common_2.13-4.2.1-d2c-guava33.7.2-jre.jar",
+        "spark-network-common-verification.json", "spark-network-common-build-dependencies.json",
         "LICENSE.spark-4.2.1", "NOTICE.spark-4.2.1",
     ),
     "dependencies": (
         "org.apache.spark_spark-sql-kafka-0-10_2.13-4.2.1.jar",
+        "com.google.guava_guava-33.7.2-jre.jar", "com.google.guava_failureaccess-1.0.3.jar",
+        "org.xerial.snappy_snappy-java-1.1.10.9.jar",
         "dependency-source-provenance.json",
     ),
 }
@@ -183,11 +187,22 @@ def validate_component(root: Path, role: str, source: dict[str, str] | None = No
     require(bool(jars), f"component contains no JARs: {role}")
     if role == "dependencies":
         for relative in jars:
-            require(not re.search(r"(?:^|[._-])(?:hadoop-client-(?:api|runtime)|spark-core_2\.13)-", relative),
+            require(not re.search(r"(?:^|[._-])(?:hadoop-client-(?:api|runtime)|spark-(?:core|network-common)_2\.13)-", relative),
                     f"upstream Hadoop/Spark implementation leaked into dependency bundle: {relative}")
+            for prefix, expected in (("com.google.guava_guava-", "com.google.guava_guava-33.7.2-jre.jar"),
+                                     ("com.google.guava_failureaccess-", "com.google.guava_failureaccess-1.0.3.jar"),
+                                     ("org.xerial.snappy_snappy-java-", "org.xerial.snappy_snappy-java-1.1.10.9.jar")):
+                require(not Path(relative).name.startswith(prefix) or relative == expected,
+                        f"unexpected direct runtime dependency version: {relative}")
         require(isinstance(provenance, dict) and provenance.get("spark_version") == "4.2.1"
                 and provenance.get("artifact_sha256") == {name: sha256(files[name]) for name in jars},
                 "dependency resolver provenance does not match every actual copied JAR")
+        required_requests = {"com.google.guava:guava:33.7.2-jre", "com.google.guava:failureaccess:1.0.3",
+                             "org.xerial.snappy:snappy-java:1.1.10.9"}
+        require(isinstance(provenance.get("requested_packages"), list)
+                and all(isinstance(value, str) for value in provenance["requested_packages"])
+                and required_requests <= set(provenance["requested_packages"]),
+                "patched direct Guava/failureaccess/Snappy requests are absent from resolver provenance")
     if role == "parquet":
         for version in ("1.17.0", "1.17.1"):
             name = f"parquet-jackson-{version}-d2c-jackson2.21.7.jar"

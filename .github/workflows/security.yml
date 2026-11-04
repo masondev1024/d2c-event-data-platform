@@ -697,6 +697,115 @@ jobs:
                         "verified_source_core_jar_sha256": source_sha256, "remote_operations": "NONE"})
           (evidence / "runtime-proof.json").write_text(json.dumps(proof, indent=2) + "\n")
           PYTHON
+      - name: Prove Snappy JNI roundtrips and fixed artifact identity on the actual final runtime
+        id: snappy-native
+        if: ${{ !cancelled() && steps.storage.outcome == 'success' && steps.build.outcome == 'success' }}
+        run: |
+          actualIID="$(cat "$RUNNER_TEMP/lakehouse.iid")"
+          [[ "$actualIID" =~ ^sha256:[0-9a-f]{64}$ ]]
+          name="d2c-snappy-native-$ARCH-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          owner="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+          python3 scripts/container_security_guard.py \
+            --kind test --minimum-free-gib 8 --reserve-free-gib 6 --timeout-seconds 180 \
+            --storage-path "$GITHUB_WORKSPACE" --storage-path /var/lib/docker \
+            --container-name "$name" --owner-token "$owner" \
+            --evidence-dir "$RUNNER_TEMP/d2c-lakehouse-runtime-$ARCH/snappy-native" -- \
+            docker run --rm --pull never --name "$name" --label "d2c.security.owner=$owner" \
+            --platform "linux/$ARCH" --network none --memory 1g --cpus 2 --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=128m \
+            --tmpfs /tmp/d2c-snappy-native/lib:rw,exec,nosuid,nodev,size=16m,mode=1777 --entrypoint /bin/sh "$actualIID" -ec '
+              mkdir -m 700 /tmp/d2c-snappy-classes
+              javac -J-Xmx256m --release 17 -cp "/opt/spark/jars/*" \
+                -d /tmp/d2c-snappy-classes \
+                /usr/share/d2c-security/recipe-source/container-build/lakehouse/native/VerifySnappyRuntime.java
+              java -Xmx256m -cp "/tmp/d2c-snappy-classes:/opt/spark/jars/*" \
+                VerifySnappyRuntime 21 /opt/spark/jars/org.xerial.snappy_snappy-java-1.1.10.9.jar "$1" "$2"
+            ' d2c-snappy-native "$ARCH" "$actualIID"
+          python3 - <<'PYTHON'
+          import hashlib, json, os, re
+          from pathlib import Path, PurePosixPath
+          from zipfile import ZipFile
+          temporary = Path(os.environ["RUNNER_TEMP"])
+          arch = os.environ["ARCH"]
+          native_arch = {"amd64": "x86_64", "arm64": "aarch64"}[arch]
+          evidence = temporary / ("d2c-lakehouse-runtime-" + arch) / "snappy-native"
+          guard = json.loads((evidence / "summary.json").read_text())
+          if (guard.get("outcome") != "completed" or type(guard.get("child_exit")) is not int or guard["child_exit"] != 0
+                  or type(guard.get("exit")) is not int or guard["exit"] != 0
+                  or guard.get("abort", "missing") is not None or guard.get("cleanup_errors") != []):
+              raise SystemExit("Snappy native guard or owned cleanup is incomplete")
+          prefix = "D2C_SNAPPY_RUNTIME_PROOF="
+          records = [json.loads(line[len(prefix):]) for line in (evidence / "command.log").read_text().splitlines()
+                     if line.startswith(prefix)]
+          if len(records) != 1 or not isinstance(records[0], dict):
+              raise SystemExit("Snappy native exact success proof is missing or ambiguous")
+          proof = records[0]
+          expected_keys = {"schema_version", "status", "actual_java_major", "expected_java_major", "java_runtime_version",
+                           "java_vendor", "os_name", "actual_arch", "expected_arch", "image_id", "expected_jar", "actual_jar",
+                           "jar_sha256", "java_artifact_version", "java_artifact_version_source", "class_code_sources",
+                           "native_backend", "native_loaded", "native_configuration", "native_library_version", "native_library_resource",
+                           "native_library_path", "native_library_sha256", "native_resource_sha256", "cases",
+                           "roundtrips_verified", "input_bytes", "uncompressed_lengths_verified"}
+          expected_jar = "/opt/spark/jars/org.xerial.snappy_snappy-java-1.1.10.9.jar"
+          payload = "dependencies/org.xerial.snappy_snappy-java-1.1.10.9.jar"
+          artifacts = temporary / "d2c-artifacts"
+          source_jar = artifacts / payload
+          with source_jar.open("rb") as source:
+              source_sha256 = hashlib.file_digest(source, "sha256").hexdigest()
+          manifest = json.loads((artifacts / "manifest.json").read_text())
+          receipt = json.loads((temporary / ("d2c-lakehouse-artifact-verification-" + arch + ".json")).read_text())
+          if (type(manifest.get("schema_version")) is not int or manifest["schema_version"] != 1
+                  or manifest.get("kind") != "d2c-lakehouse-source-artifacts"
+                  or manifest.get("payload_sha256", {}).get(payload) != source_sha256
+                  or not re.fullmatch(r"[0-9a-f]{64}", manifest.get("source_recipe_sha256", ""))
+                  or receipt.get("action") != "verify" or receipt.get("result") != "PASS"
+                  or receipt.get("source_recipe_sha256") != manifest["source_recipe_sha256"]):
+              raise SystemExit("Snappy source JAR is not the sealed, verified transferred artifact")
+          native_resource = "org/xerial/snappy/native/Linux/" + native_arch + "/libsnappyjava.so"
+          with ZipFile(source_jar) as source:
+              matches = [entry for entry in source.infolist() if entry.filename == native_resource]
+              if len(matches) != 1 or not 0 < matches[0].file_size <= 8 * 1024 * 1024:
+                  raise SystemExit("Snappy source JAR native payload is missing, ambiguous or unbounded")
+              native_sha256 = hashlib.sha256(source.read(matches[0])).hexdigest()
+          image_id = (temporary / "lakehouse.iid").read_text().strip()
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+              raise SystemExit("Snappy target is not the immutable final image ID")
+          native_path = PurePosixPath(str(proof.get("native_library_path", "")))
+          inputs = proof.get("input_bytes")
+          metadata_sources = {"META-INF/maven/org.xerial.snappy/snappy-java/pom.properties",
+                              "META-INF/MANIFEST.MF:Implementation-Version", "META-INF/MANIFEST.MF:Bundle-Version"}
+          if (set(proof) != expected_keys or type(proof.get("schema_version")) is not int or proof["schema_version"] != 1
+                  or proof.get("status") != "passed" or proof.get("image_id") != image_id
+                  or type(proof.get("actual_java_major")) is not int or proof["actual_java_major"] != 21
+                  or type(proof.get("expected_java_major")) is not int or proof["expected_java_major"] != 21
+                  or not isinstance(proof.get("java_runtime_version"), str) or not proof["java_runtime_version"]
+                  or not isinstance(proof.get("java_vendor"), str) or not proof["java_vendor"]
+                  or proof.get("os_name") != "Linux" or proof.get("actual_arch") != arch or proof.get("expected_arch") != arch
+                  or proof.get("expected_jar") != expected_jar or proof.get("actual_jar") != expected_jar
+                  or proof.get("jar_sha256") != source_sha256 or proof.get("java_artifact_version") != "1.1.10.9"
+                  or proof.get("java_artifact_version_source") not in metadata_sources
+                  or proof.get("class_code_sources") != {name: expected_jar for name in
+                      ("org.xerial.snappy.Snappy", "org.xerial.snappy.SnappyNative")}
+                  or proof.get("native_backend") != "JNI" or proof.get("native_loaded") is not True
+                  or proof.get("native_configuration") != {"use_systemlib": "false", "disable_bundled_libs": "false",
+                      "purejava": "false", "lib_path": "", "lib_name": "", "tempdir": "/tmp/d2c-snappy-native/lib/owned"}
+                  or not isinstance(proof.get("native_library_version"), str)
+                  or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", proof["native_library_version"])
+                  or proof.get("native_library_resource") != native_resource
+                  or str(native_path.parent) != "/tmp/d2c-snappy-native/lib/owned"
+                  or not re.fullmatch(r"snappy-[A-Za-z0-9._-]+-libsnappyjava\.so", native_path.name)
+                  or proof.get("native_library_sha256") != native_sha256 or proof.get("native_resource_sha256") != native_sha256
+                  or proof.get("cases") != ["UTF8", "BINARY"]
+                  or type(proof.get("roundtrips_verified")) is not int or proof["roundtrips_verified"] != 2
+                  or not isinstance(inputs, list) or len(inputs) != 2
+                  or any(type(size) is not int for size in inputs) or inputs != [53, 4096]
+                  or proof.get("uncompressed_lengths_verified") is not True):
+              raise SystemExit("Snappy Java 21, fixed origin, native mapping or bounded roundtrip proof is incomplete")
+          proof.update({"platform": "linux/" + arch, "verified_source_jar_sha256": source_sha256,
+                        "verified_source_native_sha256": native_sha256, "remote_operations": "NONE",
+                        "scope": "Valid synthetic Snappy JNI roundtrips only; no exploit, service data or remote service exercised"})
+          (evidence / "runtime-proof.json").write_text(json.dumps(proof, indent=2) + "\n")
+          PYTHON
       - name: Pull the pinned Kafka index and record its actual native image ID
         id: broker
         if: ${{ !cancelled() && steps.storage.outcome == 'success' && steps.build.outcome == 'success' }}

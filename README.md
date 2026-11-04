@@ -177,8 +177,9 @@ docker compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh \
 
 `lakehouse` profile은 외부 AWS catalog나 object storage를 만들지 않는 로컬 검증용입니다.
 Spark 4.2.1(Scala 2.13)와 Iceberg 1.12.0의 보안 재빌드 runtime을 이미지 build 시 고정해 실행 중 Maven
-다운로드에 의존하지 않습니다. Hadoop/Parquet/Iceberg의 공식 조립 절차에 Jackson 2.21.7과
-JLine 3.30.17을 적용하며, 원본 소스 해시·클래스·라이선스와 실제 패치된 구현을 확인합니다.
+다운로드에 의존하지 않습니다. Hadoop/Parquet/Iceberg의 공식 조립 절차에 Jackson 2.21.7,
+JLine 3.30.17과 Guava 33.7.2-jre를 적용하며, 원본 소스 해시·클래스·라이선스와 실제 패치된
+구현을 확인합니다. Snappy Java/JNI는 1.1.10.9를 사용합니다.
 개발 헤더·컴파일러는 최종 runtime에서 제외하고 JVM/Python/JNI runtime 라이브러리는 유지합니다.
 고정된 공식 Spark 이미지의 Temurin 21.0.13과 공급자 메타데이터를 유지합니다.
 JVM/Python/JNI 호환성은 두 플랫폼의 실제 최종 이미지로 검증하며, 컨테이너 스캔만으로
@@ -385,8 +386,8 @@ HIGH/CRITICAL 결과·gate 결과·SPDX·실제 이미지 ID·Trivy/DB 시점을
 누락·오래된 결과·다른 이미지의 결과·인프라 실패는 0건으로 간주하지 않습니다.
 기존 `container-scan` check는 모든 matrix 결과를 집계해 실패를 유지합니다.
 
-Python 이미지는 공개 Wolfi 패키지의 Python **3.12.16-r3**와 별도 build stage의 가상 환경을
-사용합니다. Python 3.12 계열과 수정 버전 하한을 유지하며 같은 계열의 보안 revision은
+Python 이미지는 공개 Wolfi 패키지의 Python **3.12**와 별도 build stage의 가상 환경을
+사용합니다. 수정 버전 하한 **3.12.16-r3**를 유지하며 같은 계열의 보안 revision은
 공식 APK 저장소에서 받습니다. 실제 설치 버전은 이미지별 SBOM에 기록합니다.
 APK 데이터베이스와 Python 패키지 metadata를 그대로 보존합니다.
 API의 Psycopg는 requirements에 고정한 동일 버전의 C 구현을 소스에서 빌드하여 시스템
@@ -399,6 +400,14 @@ Lakehouse는
 고정된 Spark **4.2.1** 배포와 Temurin **21.0.13**을 사용하며, 같은 Spark source의 원래 core
 shade 조립을 Jetty **12.1.14**로 재빌드합니다. Iceberg **1.12.0**의 공식 Spark 4.2 source module과
 Parquet **1.17.0/1.17.1** 조립에는 Jackson **2.21.7**을 적용합니다.
+Guava는 외부 JAR과 Hadoop·Iceberg·Spark network-common의 개별 shaded 사본까지
+**33.7.2-jre**로 조립하고, failureaccess는 **1.0.3**을 사용합니다. Hadoop이 사용하는 Curator
+**5.2.0**의 공식 `osgi` classifier는 Guava를 내장하지 않는 원본 모듈입니다. 기본 artifact와
+모든 자체 클래스·공개/보호 ABI·라이선스·Maven metadata를 비교하고, 과거 shaded Guava의
+실행 참조가 남으면 조립을 거부합니다. 이는 완성된 JAR에서 취약 클래스를 삭제하는 방식이
+아닙니다. 실제 최종 JVM의 호환성 시험도 별도로 통과해야 합니다.
+Snappy **1.1.10.9**는 최종 이미지의 실제 클래스 출처와 source manifest의 JAR SHA를
+대조하고, 작은 합성 데이터의 JNI 압축·복원과 실제 로드된 플랫폼별 `.so`의 SHA를 검사합니다.
 Spark source 빌드는 공식 배포본과 같은 Java 17 컴파일러(Temurin **17.0.21+9**)로 고정합니다.
 최종 실행 환경은 Java 21이며, 양쪽 플랫폼에서 실제 protobuf merge·wire 동작과 재빌드 JAR 출처를
 확인합니다. 빌드 컴파일러와 실행 JVM을 구분하여 원래 클래스 집합·ABI 검증을 유지합니다.

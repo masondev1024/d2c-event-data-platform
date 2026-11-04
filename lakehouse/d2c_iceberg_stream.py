@@ -289,15 +289,21 @@ def canonical_source_ranges(
     return hashlib.sha256(source_ranges_json.encode("utf-8")).hexdigest(), source_ranges_json
 
 
-def create_spark_session(settings: LakehouseSettings) -> Any:
+def create_spark_session(settings: LakehouseSettings, *, local_master: str | None = None) -> Any:
     """Build a UTC Spark session with the only Iceberg catalog used locally."""
 
     from pyspark import SparkConf
     from pyspark.sql import SparkSession
 
-    master = SparkConf().get("spark.master", "local[*]")
-    if not re.fullmatch(r"local(?:\[(?:\*|[1-9][0-9]*)(?:,[1-9][0-9]*)?\])?", master):
+    configured_master = SparkConf().get("spark.master", None)
+    # Before the JVM exists, SparkConf cannot observe spark-submit defaults.
+    # A bounded local caller can therefore select its master explicitly.
+    master = (local_master if local_master is not None else
+              configured_master if configured_master is not None else "local[*]")
+    if not isinstance(master, str) or not re.fullmatch(r"local(?:\[(?:\*|[1-9][0-9]*)(?:,[1-9][0-9]*)?\])?", master):
         raise ValueError("the D2C lakehouse profile requires a local Spark master")
+    if local_master is not None and configured_master is not None and configured_master != local_master:
+        raise ValueError("the explicit local Spark master conflicts with spark.master")
     return (
         SparkSession.builder.appName(settings.stream_id)
         .master(master)

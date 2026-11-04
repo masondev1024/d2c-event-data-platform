@@ -37,6 +37,17 @@ gradle.afterProject { component ->
         destination.mkdirs()
         new File(destination, 'security-runtime-artifacts.json').text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(records)) + '\n'
         new File(destination, 'runtime-dependencies.txt').text = records.collect { it.coordinate }.join('\n') + '\n'
+        // The runtime consumes the source project's already relocated Guava JAR.
+        // Record that project's actual original shade inputs as a separate layer.
+        def guavaProject = runtime.rootProject.project(':iceberg-bundled-guava')
+        def guavaRecords = guavaProject.configurations.compileClasspath.resolvedConfiguration.resolvedArtifacts.collect { artifact ->
+          def id = artifact.moduleVersion.id
+          [coordinate: "${id.group}:${id.name}:${id.version}", filename: artifact.file.name,
+           path: artifact.file.absolutePath,
+           sha256: java.security.MessageDigest.getInstance('SHA-256').digest(artifact.file.bytes).encodeHex().toString(),
+           source_project: artifact.id.componentIdentifier instanceof org.gradle.api.artifacts.component.ProjectComponentIdentifier]
+        }.sort { a, b -> a.coordinate <=> b.coordinate }
+        new File(destination, 'security-guava-artifacts.json').text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(guavaRecords)) + '\n'
       }
     }
   }

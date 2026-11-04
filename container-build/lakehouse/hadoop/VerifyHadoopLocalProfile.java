@@ -1,7 +1,14 @@
 /* Run explicitly against the final image's actual classpath. No remote service
  * is contacted; test data is created in a new temporary directory only. */
 import java.nio.file.Files;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.lang.reflect.Method;
+import java.util.Collection;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.ServiceLoader;
 import java.util.Set;
 
@@ -98,6 +105,75 @@ public class VerifyHadoopLocalProfile {
     System.out.println("jline_shaded_dumb_provider_loader=PASS;native_and_FFM_backends=NOT_INVOKED");
   }
 
+  private static Object roundTrip(Object value) throws Exception {
+    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+    try (ObjectOutputStream output = new ObjectOutputStream(bytes)) {
+      output.writeObject(value);
+    }
+    try (ObjectInputStream input = new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
+      return input.readObject();
+    }
+  }
+
+  @SuppressWarnings("unchecked")
+  private static void verifyFixedGuavaAndCurator() throws Exception {
+    String runtime = "hadoop-client-runtime-3.5.0-d2c-local1.jar";
+    for (String prefix : new String[] {"org.apache.hadoop.shaded.com.google.common.",
+                                      "org.apache.hadoop.thirdparty.com.google.common."}) {
+      for (String collection : new String[] {"CompactHashMap", "CompactHashSet"}) {
+        Class<?> type = Class.forName(prefix + "collect." + collection);
+        requireOrigin(type, runtime);
+        Method create = type.getDeclaredMethod("create");
+        create.setAccessible(true); // Guava's own compact implementations are package private.
+        Object value = create.invoke(null);
+        if (value instanceof Map) {
+          ((Map<Object, Object>) value).put("d2c", "fixed-guava");
+          require("fixed-guava".equals(((Map<?, ?>) roundTrip(value)).get("d2c")),
+                  "Compact map serialization failed: " + prefix);
+        } else {
+          ((Collection<Object>) value).add("fixed-guava");
+          require(((Collection<?>) roundTrip(value)).contains("fixed-guava"),
+                  "Compact set serialization failed: " + prefix);
+        }
+      }
+      Class<?> maker = Class.forName(prefix + "collect.MapMaker");
+      requireOrigin(maker, runtime);
+      Object builder = maker.getConstructor().newInstance();
+      // Force the custom implementation with strong keys/values: a weak-key
+      // deserialization assertion would legitimately race garbage collection.
+      Class<?> equivalence = Class.forName(prefix + "base.Equivalence");
+      requireOrigin(equivalence, runtime);
+      Method keyEquivalence = maker.getDeclaredMethod("keyEquivalence", equivalence);
+      keyEquivalence.setAccessible(true);
+      keyEquivalence.invoke(builder, equivalence.getMethod("equals").invoke(null));
+      Map<Object, Object> map = (Map<Object, Object>) maker.getMethod("makeMap").invoke(builder);
+      require(map.getClass().getName().startsWith(prefix + "collect.MapMakerInternalMap"),
+              "Actual MapMakerInternalMap not selected");
+      requireOrigin(map.getClass(), runtime);
+      map.put("d2c", "fixed-guava");
+      Map<?, ?> copy = (Map<?, ?>) roundTrip(map);
+      require(copy.size() == 1 && copy.containsValue("fixed-guava"), "MapMaker serialization failed");
+    }
+    String curator = "org.apache.hadoop.shaded.org.apache.curator.";
+    Class<?> policy = Class.forName(curator + "RetryPolicy");
+    Class<?> retry = Class.forName(curator + "retry.ExponentialBackoffRetry");
+    Class<?> factory = Class.forName(curator + "framework.CuratorFrameworkFactory");
+    Class<?> framework = Class.forName(curator + "framework.CuratorFramework");
+    Class<?> mutex = Class.forName(curator + "framework.recipes.locks.InterProcessMutex");
+    for (Class<?> type : new Class<?>[] {policy, retry, factory, framework, mutex}) requireOrigin(type, runtime);
+    Object client = factory.getMethod("newClient", String.class, policy)
+        .invoke(null, "127.0.0.1:1", retry.getConstructor(int.class, int.class).newInstance(10, 1));
+    try {
+      require(framework.getMethod("getState").invoke(client).toString().equals("LATENT"),
+              "Curator client must remain unstarted");
+      mutex.getConstructor(framework, String.class).newInstance(client, "/d2c-offline-probe");
+    } finally {
+      framework.getMethod("close").invoke(client);
+    }
+    requireAbsent(curator + "shaded.com.google.common.collect.CompactHashMap");
+    System.out.println("guava_two_namespaces_small_serialization=PASS;curator_client_framework_recipes_init=PASS;zookeeper_network_calls=NONE");
+  }
+
   public static void main(String[] args) throws Exception {
     requireOrigin(Configuration.class, "hadoop-client-api-3.5.0-d2c-local1.jar");
     Class<?> jackson = Class.forName("org.apache.hadoop.shaded.com.fasterxml.jackson.databind.ObjectMapper");
@@ -127,6 +203,7 @@ public class VerifyHadoopLocalProfile {
     instantiateServices(TokenRenewer.class);
     verifyLocalMaster();
     verifyShadedJlineDumbProvider();
+    verifyFixedGuavaAndCurator();
 
     Configuration conf = new Configuration();
     conf.set("fs.defaultFS", "file:///");
@@ -151,8 +228,12 @@ public class VerifyHadoopLocalProfile {
       TaskAttemptContextImpl context = new TaskAttemptContextImpl(job.getConfiguration(), new TaskAttemptID());
       FileOutputCommitter committer = new FileOutputCommitter(output, context);
       require(committer.getWorkPath() != null, "MapReduce output committer API unavailable");
-      try (Cluster cluster = new Cluster(conf)) {
+      // Hadoop 3.5.0 Cluster has close(), but does not implement AutoCloseable.
+      Cluster cluster = new Cluster(conf);
+      try {
         require(cluster.getFileSystem().getUri().getScheme().equals("file"), "Local provider bootstrap failed");
+      } finally {
+        cluster.close();
       }
     }
     System.out.println("hadoop_local_profile_boot=PASS;jackson=2.21.7;remote_operations=NONE");

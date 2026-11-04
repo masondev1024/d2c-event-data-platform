@@ -2,6 +2,8 @@
   "schema_version": 1,
   "spark_version": "4.2.1",
   "jetty_version": "12.1.14",
+  "guava_version": "33.7.2-jre",
+  "failureaccess_version": "1.0.3",
   "scala_binary_version": "2.13",
   "source": {
     "filename": "spark-4.2.1.tgz",
@@ -12,7 +14,8 @@
     "tag_url": "https://github.com/apache/spark/tree/v4.2.1",
     "pom_sha256": {
       "pom.xml": "2685bfc815d4075c25deb3500f797d35d8790c0d988c335e9cd348389c37380b",
-      "core/pom.xml": "21f59b60e1497bed036de67a21f3d2c057899491280c0b69b214f2058a18511f"
+      "core/pom.xml": "21f59b60e1497bed036de67a21f3d2c057899491280c0b69b214f2058a18511f",
+      "common/network-common/pom.xml": "a11aca83e51dacd0a0bb8b07d8932a2b2eff54e3ee85e091da2ffe6c8f213da6"
     }
   },
   "maven": {
@@ -48,6 +51,8 @@
     "java.minimum.version": "17.0.11",
     "maven.version": "3.9.15",
     "jetty.version": "12.1.8",
+    "guava.version": "33.6.0-jre",
+    "guava.failureaccess.version": "1.0.3",
     "scala.version": "2.13.18",
     "scala.binary.version": "2.13",
     "hadoop.version": "3.5.0",
@@ -58,8 +63,9 @@
     "jakartaservlet.version": "6.0.0"
   },
   "overrides": {
-    "jetty.version": "12.1.14"
+    "jetty.version": "12.1.14",
+    "guava.version": "33.7.2-jre"
   },
   "reviewed_on": "2026-11-04",
-  "compatibility_scope": "A rebuilt core for a coherent Spark 4.2.1 distribution; never a core replacement in Spark 4.1.x."
+  "compatibility_scope": "Rebuilt core and network-common for a coherent Spark 4.2.1 distribution; never replacements in Spark 4.1.x."
 }

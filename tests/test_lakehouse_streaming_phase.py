@@ -67,6 +67,33 @@ class DedicatedState:
 
 
 class PhaseBoundaryTest(unittest.TestCase):
+    def test_every_phase_selects_and_checks_the_exact_bounded_master_before_sink_or_kafka_io(self):
+        for label in phase.PHASES:
+            for effective, configured in (("local[1]", "local[1]"), ("local[2]", "local[1]"),
+                                          ("local[1]", "local[*]"), ("local[1]", "yarn")):
+                with self.subTest(phase=label, effective=effective, configured=configured), TemporaryDirectory() as directory:
+                    spark = MagicMock()
+                    spark.sparkContext.master = effective
+                    spark.sparkContext.getConf.return_value.get.return_value = configured
+                    args = SimpleNamespace(state_dir=DedicatedState(Path(directory)), phase=label,
+                                           bootstrap_server="broker:9092", query_timeout_seconds=30)
+                    with patch.dict(phase.os.environ, {"D2C_SECURITY_IMAGE_ID": IID, "D2C_SECURITY_OWNER": OWNER}), \
+                            patch.object(phase, "load_manifest", return_value=(manifest(), [])), \
+                            patch.object(phase, "create_spark_session", return_value=spark) as factory, \
+                            patch.object(phase, "create_tables", side_effect=RuntimeError("stop after master guards")) as tables, \
+                            patch.object(phase, "publish") as publish:
+                        if effective == configured == "local[1]":
+                            with self.assertRaisesRegex(RuntimeError, "stop after master guards"):
+                                phase.run_phase(args)
+                            tables.assert_called_once()
+                        else:
+                            with self.assertRaisesRegex(AssertionError, "local\\[1\\]"):
+                                phase.run_phase(args)
+                            tables.assert_not_called()
+                        self.assertEqual(factory.call_args.kwargs, {"local_master": "local[1]"})
+                        publish.assert_not_called()
+                    spark.stop.assert_called_once()
+
     def test_uncommitted_batch_two_is_required_then_recovered(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -199,6 +226,7 @@ class PhaseBoundaryTest(unittest.TestCase):
         checkpoint(root, [0, 1, 2], [0, 1])
         spark = MagicMock()
         spark.sparkContext.master = "local[1]"
+        spark.sparkContext.getConf.return_value.get.return_value = "local[1]"
         spark.sparkContext.applicationId = "local-new-process"
         spark.version = "4.2.1"
         spark._jvm.java.lang.System.getProperty.return_value = "21.0.13"
@@ -258,6 +286,7 @@ class PhaseBoundaryTest(unittest.TestCase):
                     else:
                         proof = phase.run_phase(args)
                         self.assertEqual(proof["status"], "PASS")
+                        self.assertEqual(proof["spark_conf_master"], "local[1]")
                         self.assertTrue(proof["expected_failure"]["production_write_completed"])
                         self.assertEqual(proof["observed_batches"], [{"batch_id": 2, "offsets": [5]}])
                         self.assertEqual(writer.call_args.args[:2], (batch, 2))
