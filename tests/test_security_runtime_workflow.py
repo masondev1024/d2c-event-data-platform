@@ -140,8 +140,8 @@ class SecurityRuntimeWorkflowTest(unittest.TestCase):
                          '--platform "linux/$ARCH"', "--phase-timeout-seconds 300 --total-timeout-seconds 1200",
                          "--guard-script scripts/container_security_guard.py"):
             self.assertIn(required, harness)
-        # 30m build + 75m bounded scan + 20m pull + 20m harness + 15m setup/upload.
-        self.assertGreaterEqual(int(self.runtime["timeout-minutes"]), 160)
+        # 30m build + 75m scan + 20m pull + 20m harness + 3m Hadoop + 15m setup/upload.
+        self.assertGreaterEqual(int(self.runtime["timeout-minutes"]), 163)
 
     def test_six_non_lakehouse_native_images_have_owned_python_probe_after_the_scan(self):
         job = self.jobs["image-scan"]
@@ -169,7 +169,7 @@ class SecurityRuntimeWorkflowTest(unittest.TestCase):
         code = compile(heredoc(step), "python-runtime-workflow-proof", "exec")
         guard = {"outcome": "completed", "child_exit": 0, "exit": 0, "abort": None, "cleanup_errors": []}
         for role in ("worker", "api", "catalog"):
-            for corruption in (None, "status", "machine", "duplicate", "cleanup"):
+            for corruption in (None, "chainguard", "other-os", "status", "machine", "duplicate", "cleanup"):
                 with self.subTest(role=role, corruption=corruption), TemporaryDirectory() as scratch:
                     root = Path(scratch)
                     evidence = root / ("d2c-python-runtime-" + role + "-amd64")
@@ -177,10 +177,15 @@ class SecurityRuntimeWorkflowTest(unittest.TestCase):
                     (root / (role + ".iid")).write_text("sha256:" + "1" * 64)
                     proof = {"schema_version": 1, "status": "PASS", "role": role, "uid": 10001,
                              "python": "3.12.15", "python_implementation": "cpython", "virtual_environment": "/opt/venv",
-                             "os_id": "wolfi", "machine": "x86_64", "openssl": "OpenSSL fixture", "elapsed_seconds": 1,
+                             "os_id": "wolfi", "os_release": {"ID": "wolfi", "NAME": "unmodified release identity"},
+                             "apk_versions": {"python-3.12": "3.12.15-r0"},
+                             "machine": "x86_64", "openssl": "OpenSSL fixture", "elapsed_seconds": 1,
                              "checks": {"native_fixture": True, "normal_gunicorn": {"owned_child_reaped": True},
                                         "normal_catalog_server": {"owned_child_reaped": True}}, "limits": "local ABI/startup only"}
                     state = copy.deepcopy(guard)
+                    if corruption in ("chainguard", "other-os"):
+                        proof["os_id"] = "chainguard" if corruption == "chainguard" else "debian"
+                        proof["os_release"]["ID"] = proof["os_id"]
                     if corruption == "status": proof["status"] = "FAIL"
                     if corruption == "machine": proof["machine"] = "aarch64"
                     if corruption == "cleanup": state["cleanup_errors"] = ["unconfirmed"]
@@ -188,13 +193,15 @@ class SecurityRuntimeWorkflowTest(unittest.TestCase):
                     (evidence / "command.log").write_text(line * (2 if corruption == "duplicate" else 1))
                     (evidence / "summary.json").write_text(json.dumps(state))
                     with patch.dict(os.environ, {"RUNNER_TEMP": str(root), "ROLE": role, "ARCH": "amd64"}):
-                        if corruption:
+                        if corruption not in (None, "chainguard"):
                             with self.assertRaises(SystemExit): exec(code, {})
                             self.assertFalse((evidence / "runtime-proof.json").exists())
                         else:
                             exec(code, {})
                             actual = json.loads((evidence / "runtime-proof.json").read_text())
                             self.assertEqual(actual["image_id"], "sha256:" + "1" * 64)
+                            self.assertEqual(actual["os_release"], proof["os_release"])
+                            self.assertEqual(actual["apk_versions"], proof["apk_versions"])
 
     def test_broker_inspection_uses_actual_id_and_platform_without_leaking_environment(self):
         code = compile(heredoc(self.steps["broker"]), "broker-workflow-proof", "exec")
@@ -248,6 +255,67 @@ class SecurityRuntimeWorkflowTest(unittest.TestCase):
                         with self.assertRaises(SystemExit): exec(code, {})
                     else:
                         exec(code, {})
+
+    def test_hadoop_final_image_probe_is_guarded_offline_and_does_not_skip_kafka_on_failure(self):
+        step = self.steps["hadoop-local"]
+        steps = self.runtime["steps"]
+        self.assertLess(steps.index(self.steps["build"]), steps.index(step))
+        self.assertLess(steps.index(step), steps.index(self.steps["broker"]))
+        self.assertNotIn("continue-on-error", step)
+        self.assertTrue(expression(step["if"], scan="failure"))
+        self.assertFalse(expression(step["if"], build="failure"))
+        self.assertFalse(expression(step["if"], storage="failure"))
+        for name in ("broker", "streaming"):
+            self.assertTrue(expression(self.steps[name]["if"], **{"hadoop-local": "failure"}))
+        for required in ("--kind test --minimum-free-gib 8 --reserve-free-gib 6 --timeout-seconds 180",
+                         '--container-name "$name" --owner-token "$owner"',
+                         'docker run --rm --name "$name" --label "d2c.security.owner=$owner"',
+                         '--platform "linux/$ARCH" --network none --memory 1g --cpus 2 --read-only',
+                         '--tmpfs /tmp:rw,nosuid,nodev,size=128m "$actualIID"',
+                         "java --class-path '/opt/spark/jars/*'",
+                         "/usr/share/d2c-security/recipe-source/container-build/lakehouse/hadoop/VerifyHadoopLocalProfile.java ."):
+            self.assertIn(required, step["run"])
+        self.assertNotIn("--volume", step["run"])
+        self.assertNotIn("--publish", step["run"])
+        upload = next(item for item in steps if "container-security/" in item.get("with", {}).get("path", ""))
+        self.assertEqual(upload["if"], "always()")
+        self.assertIn("d2c-lakehouse-runtime-${{ matrix.arch }}", upload["with"]["path"])
+
+    def test_hadoop_success_requires_exact_marker_actual_id_and_complete_guard(self):
+        code = compile(heredoc(self.steps["hadoop-local"]), "hadoop-workflow-proof", "exec")
+        marker = "hadoop_local_profile_boot=PASS;jackson=2.21.7;remote_operations=NONE"
+        valid = {"outcome": "completed", "child_exit": 0, "exit": 0, "abort": None, "cleanup_errors": []}
+        for corruption in (None, "missing", "substring", "wrong-jackson", "duplicate", "child-exit", "exit",
+                           "cleanup", "abort", "missing-abort", "boolean-exit", "mutable-id"):
+            with self.subTest(corruption=corruption), TemporaryDirectory() as scratch:
+                root = Path(scratch)
+                evidence = root / "d2c-lakehouse-runtime-amd64/hadoop-local"
+                evidence.mkdir(parents=True)
+                (root / "lakehouse.iid").write_text("tag:latest" if corruption == "mutable-id" else "sha256:" + "1" * 64)
+                guard = copy.deepcopy(valid)
+                text = "ordinary bootstrap log\n" + marker + "\n"
+                if corruption == "missing": text = "bootstrap exited without a proof\n"
+                if corruption == "substring": text = "prefix:" + marker + "\n"
+                if corruption == "wrong-jackson": text = marker.replace("2.21.7", "2.21.6") + "\n"
+                if corruption == "duplicate": text = marker + "\n" + marker + "\n"
+                if corruption == "child-exit": guard["child_exit"] = 1
+                if corruption == "exit": guard["exit"] = 70
+                if corruption == "cleanup": guard["cleanup_errors"] = ["unknown"]
+                if corruption == "abort": guard["abort"] = "storage reserve reached"
+                if corruption == "missing-abort": guard.pop("abort")
+                if corruption == "boolean-exit": guard["exit"] = False
+                (evidence / "summary.json").write_text(json.dumps(guard))
+                (evidence / "command.log").write_text(text)
+                with patch.dict(os.environ, {"RUNNER_TEMP": str(root), "ARCH": "amd64"}):
+                    if corruption:
+                        with self.assertRaises(SystemExit): exec(code, {})
+                        self.assertFalse((evidence / "runtime-proof.json").exists())
+                    else:
+                        exec(code, {})
+                        proof = json.loads((evidence / "runtime-proof.json").read_text())
+                        self.assertEqual(proof["image_id"], "sha256:" + "1" * 64)
+                        self.assertEqual(proof["marker"], marker)
+                        self.assertEqual(proof["remote_operations"], "NONE")
 
     def test_shell_steps_parse_without_dispatching_any_commands(self):
         for job in self.jobs.values():

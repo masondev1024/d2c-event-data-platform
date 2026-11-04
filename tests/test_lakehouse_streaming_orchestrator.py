@@ -34,7 +34,8 @@ class Engine:
             return subprocess.CompletedProcess(args, code, value if isinstance(value, str) else json.dumps(value), stderr)
         if args[:2] == ["image", "inspect"]:
             identity = FINAL if args[2] == FINAL else BROKER
-            return done([{"Id": identity, "Os": "linux", "Architecture": "arm64", "Config": {"Volumes": {}, "Env": ["SECRET=must-not-appear"]}}])
+            volumes = {} if identity == FINAL else {path: {} for path in module.BROKER_TMPFS_BYTES}
+            return done([{"Id": identity, "Os": "linux", "Architecture": "arm64", "Config": {"User": "appuser", "Volumes": volumes, "Env": ["SECRET=must-not-appear"]}}])
         if args[:2] == ["image", "ls"]:
             return done(FINAL + "\n" + BROKER + "\n")
         if args[:2] == ["container", "ls"]:
@@ -66,11 +67,17 @@ class Engine:
             label = args[args.index("--label") + 1].split("=", 1)[1]
             identity = "2" * 64
             network = args[args.index("--network") + 1]
-            self.containers[identity] = {"Id": identity, "Name": "/" + name, "Config": {"Labels": {module.OWNER_LABEL: label}}, "State": {"Running": True}, "network": network}
+            tmpfs = dict(args[index + 1].split(":", 1) for index, value in enumerate(args) if value == "--tmpfs")
+            mounts = [{"Destination": path, "Type": "tmpfs", "Source": "", "RW": True} for path in tmpfs]
+            self.containers[identity] = {"Id": identity, "Name": "/" + name, "Config": {"Labels": {module.OWNER_LABEL: label}}, "State": {"Running": True}, "network": network,
+                                         "Mounts": mounts, "HostConfig": {"Tmpfs": tmpfs}}
             next(item for item in self.networks.values() if item["Name"] == network)["Containers"][identity] = {}
             return done(identity)
         if args[0] == "logs":
             return done("Kafka Server started\n")
+        if args[0] == "exec":
+            return done("\n".join("D2C_BROKER_MOUNT=" + path + ":tmpfs:tmpfs\nD2C_BROKER_MODE=" + path + ":1000:1000:700"
+                                   for path in module.BROKER_TMPFS_BYTES))
         if args[0] == "stop":
             identity = args[-1]
             self.containers.pop(identity)
@@ -99,6 +106,8 @@ class Harness(module.StreamingTest):
         if label == "init":
             payload = json.loads(stdin)
             return "D2C_STREAM_INIT=" + json.dumps({"source_sha256": payload["sha256"]})
+        if label == "broker-identity":
+            return "D2C_BROKER_IDENTITY=1000:1000\n"
         return module.PROOF_PREFIX + json.dumps({"phase": label, "status": "PASS", "image_id": FINAL, "owner": self.token})
 
 
@@ -130,7 +139,7 @@ class OrchestratorTest(unittest.TestCase):
         self.assertEqual(set(engine.volumes), {"user-data"})
         self.assertEqual(set(engine.networks), {"d" * 64})
         self.assertNotIn("SECRET", json.dumps(instance.summary))
-        self.assertEqual(len(instance.guard_calls), 5)
+        self.assertEqual(len(instance.guard_calls), 6)
         self.assertFalse(any(call[:2] in (("image", "rm"), ("system", "prune")) for call in engine.calls))
 
     def test_phase_runs_are_independent_immutable_and_guarded(self):
@@ -138,7 +147,9 @@ class OrchestratorTest(unittest.TestCase):
         with patch.object(module, "available", return_value=50 * module.GIB):
             self.assertEqual(instance.run(), 0)
         names = []
-        for guarded, command in instance.guard_calls[1:]:
+        for guarded, command in instance.guard_calls:
+            if "/opt/spark/bin/spark-submit" not in command:
+                continue
             self.assertEqual(guarded[guarded.index("--kind") + 1], "test")
             self.assertEqual(guarded[guarded.index("--minimum-free-gib") + 1], "8")
             self.assertEqual(guarded[guarded.index("--reserve-free-gib") + 1], "6")
@@ -177,15 +188,71 @@ class OrchestratorTest(unittest.TestCase):
         self.assertEqual(command[command.index("--memory") + 1], "512m")
         self.assertEqual(command[command.index("--cpus") + 1], "1")
         self.assertIn("KAFKA_HEAP_OPTS=-Xms128m -Xmx256m", command)
-        self.assertTrue(any(value.startswith("KAFKA_LOG_DIRS=/tmp/") for value in command))
+        self.assertIn("KAFKA_LOG_DIRS=/var/lib/kafka/data/d2c-" + instance.token, command)
+        self.assertEqual(command.count("--tmpfs"), 3)
         self.assertNotIn("--publish", command)
-        self.assertFalse(any(call[0] == "exec" for call in engine.calls))
+        metadata_reads = [call for call in engine.calls if call[0] == "exec"]
+        self.assertEqual(len(metadata_reads), 1)
+        self.assertIn("/proc/self/mountinfo", metadata_reads[0][-1])
+        self.assertNotIn("java", metadata_reads[0])
 
     def test_storage_admission_prevents_all_docker_calls(self):
         instance = self.instance()
         with patch.object(module, "available", return_value=7 * module.GIB), patch.object(instance, "docker") as docker:
             self.assertEqual(instance.run(), 1)
         docker.assert_not_called()
+
+    def test_only_exact_official_broker_volume_declarations_are_allowed(self):
+        instance = self.instance()
+        data = {"Id": BROKER, "Os": "linux", "Architecture": "arm64",
+                "Config": {"User": "appuser", "Volumes": {path: {} for path in module.BROKER_TMPFS_BYTES}}}
+        data["Config"]["Volumes"]["/unexpected-data"] = {}
+        with patch.object(instance, "inspect", return_value=data):
+            with self.assertRaisesRegex(module.StreamingError, "declared volumes"):
+                instance.image(BROKER, "broker")
+
+    def test_actual_nonroot_broker_identity_controls_private_bounded_tmpfs(self):
+        instance = self.instance()
+        with patch.object(instance, "guarded", return_value="D2C_BROKER_IDENTITY=1000:1000\n") as guarded:
+            instance.verify_broker_identity(BROKER)
+        command = guarded.call_args.args[2]
+        self.assertEqual(command.count("--tmpfs"), 3)
+        self.assertIn("none", command)
+        self.assertEqual(instance.summary["broker_identity"]["uid"], 1000)
+        for path, options in instance.broker_mount_profile.items():
+            self.assertIn("uid=1000,gid=1000", options)
+            self.assertIn("mode=0700", options)
+            self.assertIn("size=" + str(module.BROKER_TMPFS_BYTES[path]), options)
+
+    def test_broker_unexpected_mount_type_source_or_options_are_refused(self):
+        instance = self.instance()
+        instance.broker_mount_profile = instance.broker_tmpfs(1000, 1000)
+        def inventory():
+            return {"Mounts": [{"Destination": path, "Type": "tmpfs", "Source": "", "RW": True}
+                               for path in module.BROKER_TMPFS_BYTES],
+                    "HostConfig": {"Tmpfs": dict(instance.broker_mount_profile)}}
+        instance.verify_broker_mounts(inventory())
+        legacy = inventory(); legacy["Mounts"] = []
+        instance.verify_broker_mounts(legacy)
+        for field, wrong in (("Type", "volume"), ("Source", "user-data"), ("RW", False)):
+            with self.subTest(field=field):
+                data = inventory(); data["Mounts"][0][field] = wrong
+                with self.assertRaisesRegex(module.StreamingError, "fresh writable tmpfs"):
+                    instance.verify_broker_mounts(data)
+        data = inventory(); data["HostConfig"]["Tmpfs"]["/etc/kafka/secrets"] = "mode=0777"
+        with self.assertRaisesRegex(module.StreamingError, "size limits"):
+            instance.verify_broker_mounts(data)
+
+    def test_broker_kernel_mount_source_and_private_ownership_are_required(self):
+        instance = self.instance()
+        instance.summary["broker_identity"] = {"uid": 1000, "gid": 1000}
+        valid = "\n".join("D2C_BROKER_MOUNT=" + path + ":tmpfs:tmpfs\nD2C_BROKER_MODE=" + path + ":1000:1000:700"
+                          for path in module.BROKER_TMPFS_BYTES)
+        with patch.object(instance, "checked", return_value=valid):
+            instance.verify_broker_kernel_mounts("2" * 64)
+        for wrong in (valid.replace(":tmpfs:tmpfs", ":ext4:/user-data", 1), valid.replace(":1000:1000:700", ":0:0:777", 1)):
+            with patch.object(instance, "checked", return_value=wrong), self.assertRaisesRegex(module.StreamingError, "kernel mount"):
+                instance.verify_broker_kernel_mounts("2" * 64)
 
     def test_foreign_container_is_never_stopped_or_removed(self):
         instance = self.instance(); name = instance.names["initial"]

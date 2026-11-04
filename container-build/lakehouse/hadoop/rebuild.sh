@@ -19,6 +19,7 @@ run_maven() {
     "$maven" --batch-mode --no-transfer-progress \
         -Dhadoop.version=3.5.0 \
         -Djackson2.version=2.21.7 -Djackson2.databind.version=2.21.7 \
+        -Djline.version=3.30.15 \
         -Dmaven-shade-plugin.version=3.6.1 \
         -Dproject.build.outputTimestamp=2026-11-04T00:00:00Z \
         -DskipTests -Dmaven.javadoc.skip=true -Dcheckstyle.skip=true "$@"

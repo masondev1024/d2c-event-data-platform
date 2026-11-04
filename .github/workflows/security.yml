@@ -49,7 +49,32 @@ jobs:
           pip-audit --requirement app/requirements.txt --strict
 
       - name: Scan Python source
-        run: bandit --recursive app services scripts lakehouse --severity-level medium --confidence-level medium
+        if: ${{ !cancelled() }}
+        run: |
+          evidence="$RUNNER_TEMP/d2c-bandit-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          test ! -e "$evidence"
+          mkdir -m 700 "$evidence"
+          printf 'BANDIT_EVIDENCE=%s\n' "$evidence" >> "$GITHUB_ENV"
+          set +e
+          bandit --recursive app services scripts lakehouse \
+            --severity-level medium --confidence-level medium \
+            --format json --output "$evidence/report.json" \
+            > "$evidence/bandit.log" 2>&1
+          bandit_exit=$?
+          set -e
+          printf '%s\n' "$bandit_exit" > "$evidence/bandit.exit"
+          python3 scripts/validate_bandit_report.py \
+            --report "$evidence/report.json" --bandit-exit-code "$bandit_exit" \
+            > "$evidence/validation.json" 2> "$evidence/validation.log"
+
+      - name: Preserve Bandit reports and scan errors even after failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.BANDIT_EVIDENCE }}
+          retention-days: 14
+          if-no-files-found: error
 
   repository-scan:
     runs-on: ubuntu-latest
@@ -60,9 +85,21 @@ jobs:
         with:
           python-version: "3.12"
       - name: Set up pinned Trivy
-        uses: aquasecurity/setup-trivy@e07451d2e059ed86c2870430ea286b3a9e0bf241
+        run: |
+          python3 scripts/install_trivy.py \
+            --install-dir "$RUNNER_TEMP/d2c-trivy/bin" \
+            --evidence-dir "$RUNNER_TEMP/d2c-trivy-install" \
+            --github-path "$GITHUB_PATH" \
+            --guard-script scripts/container_security_guard.py \
+            --storage-path "$GITHUB_WORKSPACE" --storage-path /var/lib/docker
+      - name: Preserve Trivy installation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          version: v0.76.1
+          retention-days: 14
+          name: repository-trivy-install-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/d2c-trivy-install
+          if-no-files-found: error
       - name: Scan repository independently of the image jobs
         run: |
           mkdir -p repository-security
@@ -130,9 +167,21 @@ jobs:
       - name: Install policy validation dependencies
         run: python -m pip install --requirement requirements-dev.txt
       - name: Set up pinned Trivy
-        uses: aquasecurity/setup-trivy@e07451d2e059ed86c2870430ea286b3a9e0bf241
+        run: |
+          python3 scripts/install_trivy.py \
+            --install-dir "$RUNNER_TEMP/d2c-trivy/bin" \
+            --evidence-dir "$RUNNER_TEMP/d2c-trivy-install" \
+            --github-path "$GITHUB_PATH" \
+            --guard-script scripts/container_security_guard.py \
+            --storage-path "$GITHUB_WORKSPACE" --storage-path /var/lib/docker
+      - name: Preserve Trivy installation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          version: v0.76.1
+          retention-days: 14
+          name: security-trivy-install-${{ matrix.role }}-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/d2c-trivy-install
+          if-no-files-found: error
       - name: Build exactly one isolated role and platform
         id: build
         continue-on-error: true
@@ -216,7 +265,7 @@ jobs:
                   or type(proof.get("uid")) is not int or proof["uid"] != 10001
                   or not re.fullmatch(r"3\.12\.\d+", str(proof.get("python", "")))
                   or proof.get("python_implementation") != "cpython" or proof.get("virtual_environment") != "/opt/venv"
-                  or proof.get("os_id") != "wolfi" or proof.get("machine") not in machines[arch]
+                  or proof.get("os_id") not in {"wolfi", "chainguard"} or proof.get("machine") not in machines[arch]
                   or not isinstance(proof.get("openssl"), str) or not proof["openssl"]
                   or not isinstance(proof.get("checks"), dict) or not proof["checks"]
                   or not isinstance(proof.get("limits"), str) or not proof["limits"]
@@ -397,9 +446,21 @@ jobs:
           --artifacts "$RUNNER_TEMP/d2c-artifacts" --source-root .
           > "$RUNNER_TEMP/d2c-lakehouse-artifact-verification-$ARCH.json"
       - name: Set up pinned Trivy
-        uses: aquasecurity/setup-trivy@e07451d2e059ed86c2870430ea286b3a9e0bf241
+        run: |
+          python3 scripts/install_trivy.py \
+            --install-dir "$RUNNER_TEMP/d2c-trivy/bin" \
+            --evidence-dir "$RUNNER_TEMP/d2c-trivy-install" \
+            --github-path "$GITHUB_PATH" \
+            --guard-script scripts/container_security_guard.py \
+            --storage-path "$GITHUB_WORKSPACE" --storage-path /var/lib/docker
+      - name: Preserve Trivy installation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          version: v0.76.1
+          retention-days: 14
+          name: lakehouse-trivy-install-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/d2c-trivy-install
+          if-no-files-found: error
       - name: Build the native final runtime from verified artifacts
         id: build
         continue-on-error: true
@@ -429,6 +490,45 @@ jobs:
             --guard-script scripts/container_security_guard.py \
             --guard-storage-path "$GITHUB_WORKSPACE" --guard-storage-path /var/lib/docker \
             --output-dir "container-security/lakehouse-$ARCH"
+      - name: Prove the Hadoop local profile on the actual final runtime
+        id: hadoop-local
+        if: ${{ !cancelled() && steps.storage.outcome == 'success' && steps.build.outcome == 'success' }}
+        run: |
+          actualIID="$(cat "$RUNNER_TEMP/lakehouse.iid")"
+          name="d2c-hadoop-local-$ARCH-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          owner="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+          python3 scripts/container_security_guard.py \
+            --kind test --minimum-free-gib 8 --reserve-free-gib 6 --timeout-seconds 180 \
+            --storage-path "$GITHUB_WORKSPACE" --storage-path /var/lib/docker \
+            --container-name "$name" --owner-token "$owner" \
+            --evidence-dir "$RUNNER_TEMP/d2c-lakehouse-runtime-$ARCH/hadoop-local" -- \
+            docker run --rm --name "$name" --label "d2c.security.owner=$owner" \
+            --platform "linux/$ARCH" --network none --memory 1g --cpus 2 --read-only \
+            --tmpfs /tmp:rw,nosuid,nodev,size=128m "$actualIID" \
+            java --class-path '/opt/spark/jars/*' \
+            /usr/share/d2c-security/recipe-source/container-build/lakehouse/hadoop/VerifyHadoopLocalProfile.java .
+          python3 - <<'PYTHON'
+          import json, os, re
+          from pathlib import Path
+          temporary = Path(os.environ["RUNNER_TEMP"])
+          evidence = temporary / ("d2c-lakehouse-runtime-" + os.environ["ARCH"]) / "hadoop-local"
+          guard = json.loads((evidence / "summary.json").read_text())
+          if (guard.get("outcome") != "completed" or type(guard.get("child_exit")) is not int or guard["child_exit"] != 0
+                  or type(guard.get("exit")) is not int or guard["exit"] != 0
+                  or guard.get("abort", "missing") is not None or guard.get("cleanup_errors") != []):
+              raise SystemExit("Hadoop local-profile guard or owned cleanup is incomplete")
+          marker = "hadoop_local_profile_boot=PASS;jackson=2.21.7;remote_operations=NONE"
+          if (evidence / "command.log").read_text().splitlines().count(marker) != 1:
+              raise SystemExit("Hadoop local-profile exact success marker is missing or ambiguous")
+          image_id = (temporary / "lakehouse.iid").read_text().strip()
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+              raise SystemExit("Hadoop local-profile target is not the immutable final image ID")
+          (evidence / "runtime-proof.json").write_text(json.dumps({
+              "schema_version": 1, "status": "PASS", "image_id": image_id, "marker": marker,
+              "jackson": "2.21.7", "remote_operations": "NONE",
+              "scope": "Final-image Hadoop local profile only; no remote Hadoop service was exercised"
+          }, indent=2) + "\n")
+          PYTHON
       - name: Pull the pinned Kafka index and record its actual native image ID
         id: broker
         if: ${{ !cancelled() && steps.storage.outcome == 'success' && steps.build.outcome == 'success' }}

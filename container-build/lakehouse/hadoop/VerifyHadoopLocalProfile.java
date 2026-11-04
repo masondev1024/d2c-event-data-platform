@@ -10,8 +10,10 @@ import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.mapred.Master;
 import org.apache.hadoop.mapreduce.Cluster;
 import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.MRConfig;
 import org.apache.hadoop.mapreduce.TaskAttemptID;
 import org.apache.hadoop.mapreduce.lib.output.FileOutputCommitter;
 import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
@@ -20,6 +22,8 @@ import org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl;
 import org.apache.hadoop.security.SecurityInfo;
 import org.apache.hadoop.security.token.TokenIdentifier;
 import org.apache.hadoop.security.token.TokenRenewer;
+import org.apache.hadoop.yarn.client.util.YarnClientUtils;
+import org.apache.hadoop.yarn.conf.YarnConfiguration;
 
 public class VerifyHadoopLocalProfile {
   private static void require(boolean value, String message) {
@@ -52,6 +56,27 @@ public class VerifyHadoopLocalProfile {
     }
   }
 
+  private static void verifyLocalMaster() throws Exception {
+    // Upstream 3.5.0 treats every non-CLASSIC framework, including LOCAL, as
+    // YarnClientUtils.getRmPrincipal(conf). Exercise that real path rather than
+    // treating the symbolic YARN reference as unreachable or changing Master.
+    Class.forName(Master.class.getName(), true, VerifyHadoopLocalProfile.class.getClassLoader());
+    requireOrigin(Master.class, "hadoop-client-api-3.5.0-d2c-local1.jar");
+    requireOrigin(YarnClientUtils.class, "hadoop-client-api-3.5.0-d2c-local1.jar");
+    require(Master.State.values().length == 2, "Master enum initialization failed");
+    Configuration local = new Configuration(false);
+    local.set(MRConfig.FRAMEWORK_NAME, MRConfig.LOCAL_FRAMEWORK_NAME);
+    local.set(MRConfig.MASTER_ADDRESS, "localhost:8012");
+    require(Master.getMasterAddress(local).equals("localhost"), "Local Master address lookup changed");
+    require(Master.getMasterPrincipal(local) == null, "Unset local Master principal must remain null");
+    local.set(YarnConfiguration.RM_ADDRESS, "localhost:8032");
+    String fixturePrincipal = "rm/local-profile@D2C.TEST";
+    local.set(YarnConfiguration.RM_PRINCIPAL, fixturePrincipal);
+    require(fixturePrincipal.equals(Master.getMasterPrincipal(local)), "Local Master principal utility is unavailable");
+    require(fixturePrincipal.equals(YarnClientUtils.getRmPrincipal(local)), "Retained principal utility changed");
+    System.out.println("master_local_principal=PASS;interactive_websocket_transport=NOT_INVOKED");
+  }
+
   public static void main(String[] args) throws Exception {
     requireOrigin(Configuration.class, "hadoop-client-api-3.5.0-d2c-local1.jar");
     Class<?> jackson = Class.forName("org.apache.hadoop.shaded.com.fasterxml.jackson.databind.ObjectMapper");
@@ -60,12 +85,11 @@ public class VerifyHadoopLocalProfile {
         .getField("VERSION").get(null);
     require(version.toString().equals("2.21.7"), "Unexpected shaded Jackson implementation: " + version);
     for (String name : new String[] {
-        "org.apache.hadoop.yarn.client.api.YarnClient",
-        "org.apache.hadoop.yarn.client.api.impl.YarnClientImpl",
         "org.apache.hadoop.mapred.YarnClientProtocolProvider",
         "org.apache.hadoop.mapred.YARNRunner",
         "org.apache.hadoop.shaded.org.eclipse.jetty.client.HttpClient",
-        "org.apache.hadoop.shaded.org.eclipse.jetty.http.HttpParser"}) {
+        "org.apache.hadoop.shaded.org.eclipse.jetty.http.HttpParser",
+        "org.apache.hadoop.shaded.org.eclipse.jetty.websocket.client.WebSocketClient"}) {
       requireAbsent(name);
     }
     Set<String> filesystems = instantiateServices(FileSystem.class);
@@ -80,6 +104,7 @@ public class VerifyHadoopLocalProfile {
     instantiateServices(SecurityInfo.class);
     instantiateServices(TokenIdentifier.class);
     instantiateServices(TokenRenewer.class);
+    verifyLocalMaster();
 
     Configuration conf = new Configuration();
     conf.set("fs.defaultFS", "file:///");

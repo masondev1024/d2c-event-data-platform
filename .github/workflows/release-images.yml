@@ -257,9 +257,14 @@ jobs:
 
       - name: Set up Trivy
         if: ${{ !cancelled() && steps.storage.outcome == 'success' }}
-        uses: aquasecurity/setup-trivy@e07451d2e059ed86c2870430ea286b3a9e0bf241
-        with:
-          version: v0.76.1
+        run: |
+          test -n "${RELEASE_EVIDENCE:-}"
+          python3 scripts/install_trivy.py \
+            --install-dir "$RUNNER_TEMP/d2c-trivy/bin" \
+            --evidence-dir "$RELEASE_EVIDENCE/trivy-install" \
+            --github-path "$GITHUB_PATH" \
+            --guard-script scripts/container_security_guard.py \
+            --storage-path "$GITHUB_WORKSPACE" --storage-path /var/lib/docker
 
       - name: Scan every original OCI runtime before publishing
         id: scan
@@ -288,6 +293,8 @@ jobs:
           path: |
             ${{ env.RELEASE_EVIDENCE }}/source-artifact-verification.json
             ${{ env.RELEASE_EVIDENCE }}/source-artifact-verification.log
+            ${{ env.RELEASE_EVIDENCE }}/trivy-install/*.json
+            ${{ env.RELEASE_EVIDENCE }}/trivy-install/*.log
             ${{ env.RELEASE_EVIDENCE }}/*-build-metadata.json
             ${{ env.RELEASE_EVIDENCE }}/*-build-guard/*.json
             ${{ env.RELEASE_EVIDENCE }}/*-build-guard/*.log

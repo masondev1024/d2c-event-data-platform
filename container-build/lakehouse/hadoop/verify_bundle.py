@@ -10,9 +10,9 @@ from zipfile import ZipFile
 
 from patch_pom import patch_source
 from runtime_profile import (
-    DEPENDENCY_VERSIONS, EXCLUDED_MODULES, FILESYSTEM_PROVIDERS, LOCAL_PROVIDER,
+    DEPENDENCY_VERSIONS, EXCLUDED_ARTIFACTS, EXCLUDED_MODULES, FILESYSTEM_PROVIDERS, LOCAL_PROVIDER,
     MAVEN_VERSION, MODULES, PROTOCOL_SERVICE, REQUIRED_MODULES, SOURCE_INPUTS, SOURCE_ROOT_URL,
-    SUPPORTED_PROFILE, UNSUPPORTED_CAPABILITIES, UPSTREAM_VERSION, VARIANT_VERSION,
+    SOURCE_REVIEWS, SUPPORTED_PROFILE, UNSUPPORTED_CAPABILITIES, UPSTREAM_VERSION, VARIANT_VERSION,
 )
 
 REQUIRED_CLASSES = (
@@ -21,6 +21,7 @@ REQUIRED_CLASSES = (
     "org/apache/hadoop/fs/Path", "org/apache/hadoop/fs/FSDataInputStream",
     "org/apache/hadoop/fs/FSDataOutputStream", "org/apache/hadoop/io/Text",
     "org/apache/hadoop/security/UserGroupInformation", "org/apache/hadoop/mapred/JobConf",
+    "org/apache/hadoop/mapred/Master", "org/apache/hadoop/yarn/client/util/YarnClientUtils",
     "org/apache/hadoop/mapred/LocalJobRunner", "org/apache/hadoop/mapred/LocalClientProtocolProvider",
     "org/apache/hadoop/mapreduce/Job", "org/apache/hadoop/mapreduce/TaskAttemptContext",
     "org/apache/hadoop/mapreduce/lib/input/FileInputFormat",
@@ -29,10 +30,10 @@ REQUIRED_CLASSES = (
     "org/apache/hadoop/mapreduce/task/JobContextImpl",
     "org/apache/hadoop/mapreduce/task/TaskAttemptContextImpl",
 )
-# This provider is retained, not hidden. Its renew/cancel operations require
-# TimelineClient, a YARN capability outside this local-only image's contract.
-OPTIONAL_YARN_CALLERS = {
-    "org/apache/hadoop/yarn/security/client/TimelineDelegationTokenIdentifier$Renewer",
+TRANSPORT_PREFIX = "org/apache/hadoop/shaded/org/eclipse/jetty/websocket/"
+REMOVED_JOBCLIENT_CLASSES = {
+    "org/apache/hadoop/mapred/YarnClientProtocolProvider",
+    "org/apache/hadoop/mapred/YARNRunner", "org/apache/hadoop/mapred/ResourceMgrDelegate",
 }
 
 
@@ -85,11 +86,20 @@ def class_references(content: bytes) -> set[str]:
     return refs
 
 
-def excluded_client_reference(name: str) -> bool:
-    return name.startswith((
-        "org/apache/hadoop/yarn/client/api/", "org/apache/hadoop/yarn/client/cli/",
-        "org/apache/hadoop/yarn/client/util/",
-    )) or name == "org/apache/hadoop/yarn/client/SCMAdmin"
+def excluded_transport_reference(name: str) -> bool:
+    return name.startswith((TRANSPORT_PREFIX, "org/eclipse/jetty/websocket/"))
+
+
+def validate_class_references(binary_name: str, refs: set[str]) -> list[str]:
+    missing_transport = {ref for ref in refs if excluded_transport_reference(ref)}
+    allowed = {TRANSPORT_PREFIX + suffix for suffix in SOURCE_REVIEWS.get(binary_name, {}).get("missing_transport_targets", ())}
+    require(missing_transport <= allowed,
+            f"unreviewed reference to removed WebSocket transport: {binary_name}: {sorted(missing_transport)}")
+    require(not refs & REMOVED_JOBCLIENT_CLASSES, f"reference to excluded remote jobclient: {binary_name}")
+    if binary_name in REQUIRED_CLASSES:
+        jetty = {ref for ref in refs if ref.startswith(("org/eclipse/jetty/", "org/apache/hadoop/shaded/org/eclipse/jetty/"))}
+        require(not jetty, f"required local API references a Jetty subsystem: {binary_name}")
+    return sorted(missing_transport)
 
 
 def validate_graph(graph: dict, module: str) -> dict:
@@ -107,6 +117,10 @@ def validate_graph(graph: dict, module: str) -> dict:
             allowed = VARIANT_VERSION if node["artifactId"] in MODULES else UPSTREAM_VERSION
             require(node["version"] == allowed, f"mixed Hadoop versions: {coordinate}")
             require(node["artifactId"] not in EXCLUDED_MODULES, f"unsupported module reintroduced: {coordinate}")
+        if node["groupId"] == "org.jline":
+            require(node["version"] == "3.30.15", f"unpatched interactive library: {coordinate}")
+        require((node["groupId"], node["artifactId"]) not in EXCLUDED_ARTIFACTS,
+                f"excluded profile artifact reintroduced: {coordinate}")
         require(not (node["groupId"] == "org.eclipse.jetty" and node["artifactId"] in ("jetty-client", "jetty-http")),
                 f"unexpected HTTP client/parser dependency: {coordinate}")
         require(not node["groupId"].startswith("org.eclipse.jetty.websocket"),
@@ -171,12 +185,17 @@ def verify(source_root: Path, output: Path) -> dict:
         graphs[module] = validate_graph(json.loads(graph_file.read_text()), module)
 
     classes, services, artifacts, jetty_modules = set(), {}, [], set()
-    yarn_references, jetty_references = {}, {}
+    yarn_references, jetty_references, transport_references = {}, {}, {}
     for module in MODULES:
         path = output / f"{module}-{VARIANT_VERSION}.jar"
         with ZipFile(path) as jar:
             metadata = properties(jar.read(f"META-INF/maven/org.apache.hadoop/{module}/pom.properties"))
             require(metadata.get("version") == VARIANT_VERSION, f"incorrect local artifact metadata: {module}")
+            if module == "hadoop-client-api":
+                for original in ("hadoop-mapreduce-client-core", "hadoop-yarn-client"):
+                    metadata = properties(jar.read(f"META-INF/maven/org.apache.hadoop/{original}/pom.properties"))
+                    require(metadata.get("version") == UPSTREAM_VERSION,
+                            f"required original Hadoop module metadata missing/changed: {original}")
             for name in jar.namelist():
                 if name.startswith("META-INF/services/") and not name.endswith("/"):
                     services.setdefault(name.removeprefix("META-INF/services/"), set()).update(service_providers(jar.read(name)))
@@ -186,27 +205,25 @@ def verify(source_root: Path, output: Path) -> dict:
                     continue
                 binary_name = name.removesuffix(".class")
                 classes.add(binary_name)
-                require(not excluded_client_reference(binary_name), f"excluded YARN implementation present: {name}")
-                require(binary_name not in ("org/apache/hadoop/mapred/YarnClientProtocolProvider",
-                        "org/apache/hadoop/mapred/YARNRunner", "org/apache/hadoop/mapred/ResourceMgrDelegate"),
+                require(binary_name not in REMOVED_JOBCLIENT_CLASSES,
                         f"excluded jobclient implementation present: {name}")
                 require(not binary_name.startswith((
                     "org/apache/hadoop/shaded/org/eclipse/jetty/client/",
                     "org/apache/hadoop/shaded/org/eclipse/jetty/http/",
                     "org/apache/hadoop/shaded/org/eclipse/jetty/websocket/",
+                    "org/eclipse/jetty/client/", "org/eclipse/jetty/http/", "org/eclipse/jetty/websocket/",
                 )), f"unexpected excluded subsystem implementation: {name}")
                 if binary_name.startswith("org/apache/hadoop/") and "/shaded/" not in binary_name:
                     refs = class_references(jar.read(name))
-                    yarn = sorted(ref for ref in refs if excluded_client_reference(ref))
-                    jetty = sorted(ref for ref in refs if "/org/eclipse/jetty/" in ref)
+                    yarn = sorted(ref for ref in refs if ref.startswith("org/apache/hadoop/yarn/client/"))
+                    jetty = sorted(ref for ref in refs if ref.startswith(("org/eclipse/jetty/", "org/apache/hadoop/shaded/org/eclipse/jetty/")))
+                    transport = validate_class_references(binary_name, refs)
                     if yarn:
                         yarn_references[binary_name] = yarn
-                        require(binary_name in OPTIONAL_YARN_CALLERS,
-                                f"unreviewed reference to removed YARN client: {binary_name}: {yarn}")
+                    if transport:
+                        transport_references[binary_name] = transport
                     if jetty:
                         jetty_references[binary_name] = jetty
-                    if binary_name in REQUIRED_CLASSES:
-                        require(not yarn and not jetty, f"required local API references an excluded subsystem: {name}")
             if module == "hadoop-client-runtime":
                 for coordinate, version in DEPENDENCY_VERSIONS.items():
                     value = properties(jar.read(f"META-INF/maven/{coordinate}/pom.properties"))
@@ -214,24 +231,37 @@ def verify(source_root: Path, output: Path) -> dict:
                 for package in ("core/json", "databind/cfg"):
                     name = f"org/apache/hadoop/shaded/com/fasterxml/jackson/{package}/PackageVersion.class"
                     require(b"2.21.7" in jar.read(name), f"incorrect actual Jackson implementation: {name}")
+                for name in ("org/jline/builtins/telnet/Telnet.class", "org/jline/builtins/telnet/TelnetIO.class"):
+                    jar.getinfo("org/apache/hadoop/shaded/" + name)
             require("META-INF/LICENSE.txt" in jar.namelist() and "META-INF/NOTICE.txt" in jar.namelist(),
                     f"upstream license/notice missing: {module}")
         artifacts.append({"upstream": f"org.apache.hadoop:{module}:{UPSTREAM_VERSION}",
                           "coordinate": f"org.apache.hadoop:{module}:{VARIANT_VERSION}",
                           "file": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
     require(set(REQUIRED_CLASSES) <= classes, "required local filesystem/MapReduce API classes missing")
+    require("org/apache/hadoop/yarn/client/util/YarnClientUtils" in yarn_references.get("org/apache/hadoop/mapred/Master", []),
+            "Master's actual required utility reference changed; review upstream behavior")
     validate_services(services, classes)
+    reviews = {name: {**review, "source_url": SOURCE_ROOT_URL + review["source"],
+                       "source_sha256": SOURCE_INPUTS[review["source"]]}
+               for name, review in SOURCE_REVIEWS.items()}
     return {
         "variant": VARIANT_VERSION, "profile": SUPPORTED_PROFILE,
         "method": "upstream source-free API/runtime shade assemblies; whole-module selection before assembly",
+        "upstream_java_source_changes": False,
+        "required_local_principal_utility_modules": {"hadoop-mapreduce-client-core": UPSTREAM_VERSION,
+                                                      "hadoop-yarn-client": UPSTREAM_VERSION},
         "excluded_modules": list(EXCLUDED_MODULES), "unsupported_capabilities": list(UNSUPPORTED_CAPABILITIES),
-        "additional_unsupported_capability": "YARN Timeline delegation-token renewal/cancellation; retained provider's lazy TimelineClient reference is reported, not removed",
+        "excluded_artifacts": [f"{group}:{artifact}" for group, artifact in EXCLUDED_ARTIFACTS],
+        "profile_selection_note": "WebSocket transport is an upstream compile dependency, not optional=true. Omitting that complete artifact is a D2C local capability choice; no upstream Java class or JAR metadata is edited.",
         "sources": sources, "patched_recipe_sha256": recipes, "artifacts": artifacts,
         "tools": {"maven": maven_version, "maven-shade-plugin": "3.6.1", "maven-dependency-plugin": "3.8.1",
                   "maven_version_report_sha256": hashlib.sha256(version_report).hexdigest()},
         "verified_dependency_versions": DEPENDENCY_VERSIONS, "resolved_graphs": graphs,
         "service_providers": {name: sorted(values) for name, values in sorted(services.items())},
         "yarn_client_symbolic_references": yarn_references,
+        "reviewed_source_paths": reviews,
+        "missing_websocket_symbolic_references_in_unsupported_shell_classes": transport_references,
         "jetty_symbolic_references_in_optional_hadoop_classes": jetty_references,
         "retained_jetty_module_metadata": sorted(jetty_modules),
         "verification": {"source_graph_and_generated_artifact_checks": "PASS",

@@ -9,6 +9,7 @@ import io
 import json
 from pathlib import Path
 import signal
+import stat
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, call, patch
@@ -64,6 +65,28 @@ def mock_http(*, return_value=None, side_effect=None):
 
 
 class RuntimeDispatchTest(unittest.TestCase):
+    def test_gunicorn_worker_directory_is_private_and_removed_after_child_cleanup(self):
+        native = SimpleNamespace(pq=SimpleNamespace(__impl__="binary", version=lambda: 170009))
+        application = Mock()
+        client = application.app.test_client.return_value.__enter__ = Mock()
+        application.app.test_client.return_value.__exit__ = Mock(return_value=False)
+        client.return_value.get.return_value.status_code = 200
+        client.return_value.get.return_value.get_json.return_value = {"status": "ok"}
+        temporary = []
+        def server(command, *_args, **_kwargs):
+            path = Path(command[command.index("--worker-tmp-dir") + 1])
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
+            temporary.append(path)
+            return {"owned_child_reaped": True}
+        with patch.object(probe, "import_versions", return_value={}), \
+             patch.object(probe.importlib, "import_module", side_effect=lambda name: native if name == "psycopg" else application), \
+             patch.object(probe, "local_port", return_value=8765), \
+             patch.object(probe, "server_probe", side_effect=server), patch.dict(probe.os.environ, {}):
+            result = probe.api_probe(100)
+        self.assertTrue(result["normal_gunicorn"]["owned_child_reaped"])
+        self.assertEqual(len(temporary), 1)
+        self.assertFalse(temporary[0].exists())
+
     def test_each_role_dispatches_only_its_own_checks_and_restores_alarm(self):
         for role in probe.ROLES:
             with self.subTest(role=role), ExitStack() as stack:

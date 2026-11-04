@@ -79,14 +79,14 @@ class HadoopLocalSourceRecipeTest(unittest.TestCase):
                 excluded = {(recipe.text(node, "m:groupId"), recipe.text(node, "m:artifactId"))
                             for node in aggregator.findall("m:exclusions/m:exclusion", recipe.NS)}
                 self.assertEqual(excluded, {("xml-apis", "xml-apis"),
-                    ("org.apache.hadoop", "hadoop-yarn-client"),
+                    ("org.eclipse.jetty.websocket", "websocket-client"),
                     ("org.apache.hadoop", "hadoop-mapreduce-client-jobclient")})
                 dependencies = {recipe.text(node, "m:artifactId"): node
                                 for node in result.findall("m:dependencies/m:dependency", recipe.NS)}
                 common = dependencies["hadoop-mapreduce-client-common"]
                 self.assertEqual(recipe.text(common, "m:version"), "3.5.0")
-                self.assertEqual({recipe.text(node, "m:artifactId") for node in common.findall(
-                    "m:exclusions/m:exclusion", recipe.NS)}, set(profile.EXCLUDED_MODULES))
+                self.assertEqual({(recipe.text(node, "m:groupId"), recipe.text(node, "m:artifactId"))
+                    for node in common.findall("m:exclusions/m:exclusion", recipe.NS)}, set(profile.EXCLUDED_ARTIFACTS))
                 if name == "hadoop-client-runtime":
                     api = dependencies["hadoop-client-api"]
                     self.assertEqual(recipe.text(api, "m:version"), "3.5.0-d2c-local1")
@@ -106,14 +106,23 @@ class HadoopLocalSourceRecipeTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "required local data-processing module absent"):
             verification.validate_graph(graph, "hadoop-client-api")
 
-    def test_resolved_graph_rejects_transitive_yarn_or_http_reintroduction(self) -> None:
-        for node in (dependency("hadoop-yarn-client"), dependency("hadoop-mapreduce-client-jobclient"),
-                     dependency("jetty-http", "9.4.58.v20250814", "org.eclipse.jetty")):
+    def test_resolved_graph_rejects_remote_jobclient_transport_or_unpatched_jline(self) -> None:
+        for node in (dependency("hadoop-mapreduce-client-jobclient"),
+                     dependency("websocket-client", "9.4.58.v20250814", "org.eclipse.jetty.websocket"),
+                     dependency("jetty-http", "9.4.58.v20250814", "org.eclipse.jetty"),
+                     dependency("jline", "3.9.0", "org.jline")):
             with self.subTest(artifact=node["artifactId"]):
                 graph = graph_fixture("hadoop-client-api")
                 graph["children"][0]["children"].append(node)
                 with self.assertRaises(ValueError):
                     verification.validate_graph(graph, "hadoop-client-api")
+
+    def test_local_principal_utility_module_cannot_be_removed(self) -> None:
+        graph = graph_fixture("hadoop-client-api")
+        graph["children"][0]["children"] = [node for node in graph["children"][0]["children"]
+                                               if node["artifactId"] != "hadoop-yarn-client"]
+        with self.assertRaisesRegex(ValueError, "required local data-processing module absent: hadoop-yarn-client"):
+            verification.validate_graph(graph, "hadoop-client-api")
 
     def test_runtime_graph_must_use_the_matching_local_api(self) -> None:
         graph = graph_fixture("hadoop-client-runtime")
@@ -173,8 +182,30 @@ class HadoopProfileArtifactValidatorTest(unittest.TestCase):
         content += utf(caller) + b"\x07\x00\x01" + utf(target) + b"\x07\x00\x03"
         content += utf(f"(L{other};)V") + b"\x05" + b"\x00" * 8 + utf("unused")
         self.assertEqual(verification.class_references(content), {caller, target, other})
-        self.assertTrue(verification.excluded_client_reference(target))
-        self.assertFalse(verification.excluded_client_reference(other))
+        self.assertTrue(verification.excluded_transport_reference(verification.TRANSPORT_PREFIX + "client/WebSocketClient"))
+        self.assertFalse(verification.excluded_transport_reference(other))
+
+    def test_master_retains_its_required_local_utility_instead_of_ignoring_the_reference(self) -> None:
+        master = "org/apache/hadoop/mapred/Master"
+        utility = "org/apache/hadoop/yarn/client/util/YarnClientUtils"
+        self.assertEqual(verification.validate_class_references(master, {utility}), [])
+        self.assertIn(utility, verification.REQUIRED_CLASSES)
+        with self.assertRaisesRegex(ValueError, "unreviewed reference"):
+            verification.validate_class_references(master, {verification.TRANSPORT_PREFIX + "client/WebSocketClient"})
+
+    def test_transport_reference_review_is_target_and_caller_specific(self) -> None:
+        caller = "org/apache/hadoop/yarn/client/api/impl/YarnClientImpl"
+        reviewed = verification.TRANSPORT_PREFIX + "client/WebSocketClient"
+        self.assertEqual(verification.validate_class_references(caller, {reviewed}), [reviewed])
+        with self.assertRaisesRegex(ValueError, "unreviewed reference"):
+            verification.validate_class_references(caller, {verification.TRANSPORT_PREFIX + "unreviewed/NewTransport"})
+        with self.assertRaisesRegex(ValueError, "unreviewed reference"):
+            verification.validate_class_references("org/apache/hadoop/fs/LocalFileSystem", {reviewed})
+
+    def test_each_reviewed_path_is_bound_to_a_pinned_official_source_input(self) -> None:
+        for review in profile.SOURCE_REVIEWS.values():
+            with self.subTest(source=review["source"]):
+                self.assertRegex(profile.SOURCE_INPUTS[review["source"]], r"^[a-f0-9]{64}$")
 
     def test_dependency_version_requires_exact_metadata_value(self) -> None:
         self.assertEqual(verification.properties(b"# release\nversion=2.21.7\n")["version"], "2.21.7")

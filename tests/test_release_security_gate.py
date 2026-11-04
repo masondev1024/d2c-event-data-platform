@@ -366,6 +366,23 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertIn('>> "$GITHUB_ENV"', prepare["run"])
         self.assertIn('mkdir --parents "$evidence" "$private"', prepare["run"])
 
+    def test_release_uses_the_pinned_trivy_helper_and_preserves_install_evidence(self):
+        steps = self.workflow()["jobs"]["publish"]["steps"]
+        self.assertFalse(any("aquasecurity/setup-trivy@" in step.get("uses", "") for step in steps))
+        installer = next(step for step in steps if step.get("name") == "Set up Trivy")
+        self.assertEqual(installer["if"], "${{ !cancelled() && steps.storage.outcome == 'success' }}")
+        self.assertIn("python3 scripts/install_trivy.py", installer["run"])
+        self.assertIn('--install-dir "$RUNNER_TEMP/d2c-trivy/bin"', installer["run"])
+        self.assertIn('--evidence-dir "$RELEASE_EVIDENCE/trivy-install"', installer["run"])
+        self.assertIn('--github-path "$GITHUB_PATH"', installer["run"])
+        prepare = next(step for step in steps if step.get("name") == "Prepare fresh release directories")
+        self.assertLess(steps.index(prepare), steps.index(installer))
+        self.assertIn('test -n "${RELEASE_EVIDENCE:-}"', installer["run"])
+        upload = next(step for step in steps if step.get("id") == "evidence")
+        self.assertEqual(upload["if"], "${{ always() }}")
+        self.assertIn("/trivy-install/*.json", upload["with"]["path"])
+        self.assertIn("/trivy-install/*.log", upload["with"]["path"])
+
     def test_every_failed_or_skipped_gate_prevents_registry_login_and_publish(self):
         steps = self.workflow()["jobs"]["publish"]["steps"]
         for step in steps:

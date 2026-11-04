@@ -28,6 +28,8 @@ OWNER_LABEL = "d2c.security.owner"
 PHASES = ("initial", "resume", "crash", "recover")
 PROOF_PREFIX = "D2C_STREAM_PROOF="
 GIB = 2**30
+BROKER_TMPFS_BYTES = {"/etc/kafka/secrets": 1_048_576, "/var/lib/kafka/data": 67_108_864,
+                      "/mnt/shared/config": 4_194_304}
 CANCEL_RESERVE_SECONDS = 90
 CLEANUP_RESERVE_SECONDS = 60
 FINALIZATION_RESERVE_SECONDS = CANCEL_RESERVE_SECONDS + CLEANUP_RESERVE_SECONDS
@@ -98,6 +100,7 @@ class StreamingTest:
         self.prefix = "d2c-stream-" + self.token[:16]
         self.names = {"network": self.prefix + "-net", "volume": self.prefix + "-state",
                       "broker": self.prefix + "-broker", "init": self.prefix + "-init",
+                      "broker_identity": self.prefix + "-broker-identity",
                       **{phase: self.prefix + "-" + phase for phase in PHASES}}
         self.started = time.monotonic()
         self.deadline = self.started + options.total_timeout_seconds
@@ -110,6 +113,7 @@ class StreamingTest:
         self.guard_uncertain = False
         self.cleaning = False
         self.cleanup_deadline = None
+        self.broker_mount_profile = {}
         self.summary = {
             "schema_version": 1, "started_at": timestamp(), "outcome": "starting",
             "platform": options.platform, "owner_token": self.token,
@@ -204,11 +208,17 @@ class StreamingTest:
             raise StreamingError("final image inspection did not match the requested immutable ID")
         if data.get("Os", "") + "/" + data.get("Architecture", "") != self.options.platform:
             raise StreamingError(f"{role} image platform does not match the requested platform")
-        if (data.get("Config") or {}).get("Volumes"):
+        config = data.get("Config") or {}
+        declared = set(config.get("Volumes") or {})
+        if role == "broker":
+            if declared != set(BROKER_TMPFS_BYTES) or config.get("User") != "appuser":
+                raise StreamingError("broker image user/declared volumes differ from the official 3.7.0 profile")
+        elif declared:
             raise StreamingError(f"{role} image declares implicit anonymous volumes; no container was created")
         self.summary.setdefault("images", {})[role] = {
             key: data.get(key) for key in ("Id", "Os", "Architecture", "RepoDigests", "Created")
         }
+        self.summary["images"][role]["declared_volumes"] = sorted(declared)
         return data["Id"]
 
     def require_fresh_names(self):
@@ -339,9 +349,83 @@ class StreamingTest:
             raise StreamingError("fresh volume initialization proof is missing or ambiguous")
         self.summary["phase_source_sha256"] = payload["sha256"]
 
+    def broker_tmpfs(self, uid, gid):
+        return {path: f"rw,nosuid,nodev,noexec,size={size},mode=0700,uid={uid},gid={gid}"
+                for path, size in BROKER_TMPFS_BYTES.items()}
+
+    def add_broker_tmpfs(self, command, profile):
+        for path, options in profile.items():
+            command += ["--tmpfs", path + ":" + options]
+
+    def verify_broker_identity(self, image_id):
+        # Run as the image's configured appuser. No UID/GID is inferred from an
+        # unpinned base image's adduser defaults, and every VOLUME is covered.
+        command = self.container_options(self.names["broker_identity"], memory="128m", cpus="1", network="none")
+        self.add_broker_tmpfs(command, self.broker_tmpfs(0, 0))
+        command += ["--entrypoint", "/bin/sh", image_id, "-c",
+                    "printf 'D2C_BROKER_IDENTITY=%s:%s\\n' \"$(id -u)\" \"$(id -g)\""]
+        result = self.guarded("broker-identity", self.names["broker_identity"], command, timeout=60)
+        identities = re.findall(r"^D2C_BROKER_IDENTITY=([0-9]+):([0-9]+)$", result, re.MULTILINE)
+        if len(identities) != 1:
+            raise StreamingError("broker runtime UID/GID proof is missing or ambiguous")
+        uid, gid = map(int, identities[0])
+        if uid <= 0 or gid <= 0:
+            raise StreamingError("broker must use its non-root image identity")
+        self.broker_mount_profile = self.broker_tmpfs(uid, gid)
+        self.summary["broker_identity"] = {"uid": uid, "gid": gid,
+            "source": "https://github.com/apache/kafka/blob/3.7.0/docker/jvm/Dockerfile",
+            "source_blob": "df552ad019abd77650678c9de3f42cd7d7f3bd23",
+            "temporary_mounts": self.broker_mount_profile}
+        self.save()
+
+    def verify_broker_mounts(self, data):
+        mounts = data.get("Mounts")
+        if not isinstance(mounts, list):
+            raise StreamingError("broker mount inventory differs from its dedicated temporary profile")
+        by_path = {mount.get("Destination"): mount for mount in mounts}
+        # Legacy --tmpfs is represented by HostConfig.Tmpfs, not necessarily
+        # Mounts (Moby container.GetMountPoints). The kernel is checked below.
+        if len(by_path) != len(mounts) or not set(by_path) <= set(BROKER_TMPFS_BYTES):
+            raise StreamingError("broker has an unexpected mount destination")
+        for mount in mounts:
+            if (mount.get("Type") != "tmpfs" or mount.get("Source", "") not in ("", "tmpfs")
+                    or mount.get("Name") or mount.get("RW") is not True):
+                raise StreamingError("broker mount is not a fresh writable tmpfs; no phase may run")
+        if (data.get("HostConfig") or {}).get("Tmpfs") != self.broker_mount_profile:
+            raise StreamingError("broker tmpfs ownership, privacy or size limits changed")
+
+    def verify_broker_kernel_mounts(self, identity):
+        script = """awk '$5=="/etc/kafka/secrets" || $5=="/var/lib/kafka/data" || $5=="/mnt/shared/config" {for(i=7;i<=NF;i++) if($i=="-"){print "D2C_BROKER_MOUNT=" $5 ":" $(i+1) ":" $(i+2); break}}' /proc/self/mountinfo
+stat -c 'D2C_BROKER_MODE=%n:%u:%g:%a' /etc/kafka/secrets /var/lib/kafka/data /mnt/shared/config"""
+        raw = self.checked("exec", identity, "/bin/sh", "-c", script, timeout=10)
+        mounts, permissions = {}, {}
+        for line in raw.splitlines():
+            if line.startswith("D2C_BROKER_MOUNT="):
+                path, filesystem, source = line.removeprefix("D2C_BROKER_MOUNT=").split(":")
+                if path in mounts:
+                    raise StreamingError("duplicate broker kernel mount identity")
+                mounts[path] = {"filesystem": filesystem, "source": source}
+            elif line.startswith("D2C_BROKER_MODE="):
+                path, uid, gid, mode = line.removeprefix("D2C_BROKER_MODE=").split(":")
+                if path in permissions:
+                    raise StreamingError("duplicate broker directory identity")
+                permissions[path] = {"uid": int(uid), "gid": int(gid), "mode": mode}
+        expected = self.summary["broker_identity"]
+        if set(mounts) != set(BROKER_TMPFS_BYTES) or set(permissions) != set(BROKER_TMPFS_BYTES):
+            raise StreamingError("broker kernel temporary mounts are missing or unexpected")
+        for path in BROKER_TMPFS_BYTES:
+            if mounts[path] != {"filesystem": "tmpfs", "source": "tmpfs"} or permissions[path] != {
+                    "uid": expected["uid"], "gid": expected["gid"], "mode": "700"}:
+                raise StreamingError("broker kernel mount type/source or private ownership differs")
+        self.summary["broker_kernel_mounts"] = {path: {**mounts[path], **permissions[path]} for path in mounts}
+        self.save()
+
     def start_broker(self, image_id):
         self.sample(admission=True)
+        if not self.broker_mount_profile:
+            raise StreamingError("broker UID/GID verification must precede launch")
         command = self.container_options(self.names["broker"], memory="512m", cpus="1", network=self.names["network"])
+        self.add_broker_tmpfs(command, self.broker_mount_profile)
         command += ["--detach", "--network-alias", "broker"]
         environment = {
             "KAFKA_NODE_ID": "1", "KAFKA_PROCESS_ROLES": "broker,controller",
@@ -353,7 +437,10 @@ class StreamingTest:
             "KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR": "1", "KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR": "1",
             "KAFKA_TRANSACTION_STATE_LOG_MIN_ISR": "1", "KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS": "0",
             "KAFKA_NUM_PARTITIONS": "1", "KAFKA_AUTO_CREATE_TOPICS_ENABLE": "true",
-            "KAFKA_LOG_DIRS": "/tmp/d2c-kafka-" + self.token, "KAFKA_HEAP_OPTS": "-Xms128m -Xmx256m",
+            # The official 3.7.0 Dockerfile assigns this data directory to
+            # appuser. The exact declared VOLUME is explicitly private tmpfs.
+            # https://github.com/apache/kafka/blob/3.7.0/docker/jvm/Dockerfile
+            "KAFKA_LOG_DIRS": "/var/lib/kafka/data/d2c-" + self.token, "KAFKA_HEAP_OPTS": "-Xms128m -Xmx256m",
             "CLUSTER_ID": base64.urlsafe_b64encode(uuid.uuid4().bytes).decode().rstrip("="),
         }
         for key, value in environment.items():
@@ -361,7 +448,11 @@ class StreamingTest:
         command += [image_id]
         self.attempt_container(self.names["broker"])
         result = self.docker(*command[1:])
-        self.owned_container(self.names["broker"])
+        data = self.owned_container(self.names["broker"])
+        if data is None:
+            raise StreamingError("broker launch identity was not retained")
+        self.verify_broker_mounts(data)
+        self.verify_broker_kernel_mounts(data["Id"])
         if result.returncode:
             raise StreamingError("broker launch did not report success")
         end = time.monotonic() + min(90, self.budget())
@@ -370,6 +461,7 @@ class StreamingTest:
             data = self.owned_container(self.names["broker"])
             if data is None or not data["State"]["Running"]:
                 raise StreamingError("fresh broker stopped before readiness")
+            self.verify_broker_mounts(data)
             logs = self.docker("logs", "--tail", "80", data["Id"])
             if logs.returncode:
                 raise StreamingError("cannot read the owned broker readiness log")
@@ -505,6 +597,7 @@ class StreamingTest:
             self.require_fresh_names()
             self.create_resources()
             self.initialize(image_id)
+            self.verify_broker_identity(broker_id)
             self.start_broker(broker_id)
             for phase in PHASES:
                 self.phase(phase, image_id)

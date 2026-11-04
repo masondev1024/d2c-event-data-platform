@@ -394,13 +394,16 @@ APK 데이터베이스와 Python 패키지 metadata를 그대로 보존합니다
 shade 조립을 Jetty **12.1.14**로 재빌드합니다. Iceberg **1.12.0**의 공식 Spark 4.2 source module과
 Parquet **1.17.0/1.17.1** 조립에는 Jackson **2.21.7**을 적용합니다.
 
-Hadoop **3.5.0-d2c-local1** API/runtime은 공식 source assembly에서
-`hadoop-yarn-client`와 `hadoop-mapreduce-client-jobclient` 모듈을 선택하지 않는 로컬 프로파일입니다.
-LocalFileSystem·MapReduce core/common을 유지하고, 서비스 제공자와 API를 검증합니다.
-이 프로파일은 YARN 배포·NodeManager 대화형 shell·YARN timeline token 갱신/취소를 지원하지
-않으며, 애플리케이션도 원격 Spark master를 거부합니다. 기존 문서의 `local[...]`와 `file://`
-warehouse/checkpoint 범위에서 사용해야 합니다. 클래스나 scanner metadata를 사후 삭제하는
-방법으로 취약점 검사를 통과시키지 않습니다.
+Hadoop **3.5.0-d2c-local1** API/runtime은 공식 source assembly에서 로컬 동작에 필요한
+`hadoop-yarn-client`와 `YarnClientUtils`를 유지합니다. 원격 MapReduce jobclient와 사용하지
+않는 별도 WebSocket 전송 artifact만 선택에서 제외하며, JLine은 **3.30.15**로 고정합니다.
+이 WebSocket 의존성은 upstream의 compile dependency이므로, 이 조립은 D2C에 한정된
+로컬 프로파일입니다. LocalFileSystem·MapReduce core/common·서비스 제공자를 유지하고,
+최종 JVM 시험에서 Master의 로컬 주소·principal 계산과 실제 JAR 출처까지 확인합니다.
+YARN 배포·NodeManager 대화형 shell·YARN timeline token 갱신/취소는 검증 범위 밖이며,
+애플리케이션도 원격 Spark master를 거부합니다. `local[...]`와 `file://` warehouse/checkpoint
+범위에서 사용해야 합니다. 클래스나 scanner metadata를 사후 삭제하는 방법으로 검사를
+통과시키지 않습니다.
 
 `container-build/lakehouse/`의 helper는 공식 source/tool checksum, dependency graph,
 API·실제 구현·라이선스와 결과 SHA를 검증합니다. `scripts/lakehouse_artifacts.py`의 manifest는

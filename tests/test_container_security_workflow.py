@@ -16,6 +16,26 @@ def workflow():
 
 
 class ContainerSecurityWorkflowTest(unittest.TestCase):
+    def test_all_scanning_jobs_use_the_reviewed_installer_and_keep_failure_receipts(self):
+        value = workflow()
+        for name in ("repository-scan", "image-scan", "lakehouse-scan"):
+            with self.subTest(job=name):
+                steps = value["jobs"][name]["steps"]
+                install = next(step for step in steps if step.get("name") == "Set up pinned Trivy")
+                self.assertNotIn("uses", install)
+                self.assertNotIn("continue-on-error", install)
+                for required in ("python3 scripts/install_trivy.py", '--install-dir "$RUNNER_TEMP/d2c-trivy/bin"',
+                                 '--evidence-dir "$RUNNER_TEMP/d2c-trivy-install"', '--github-path "$GITHUB_PATH"',
+                                 "--guard-script scripts/container_security_guard.py",
+                                 '--storage-path "$GITHUB_WORKSPACE" --storage-path /var/lib/docker'):
+                    self.assertIn(required, install["run"])
+                preserve = next(step for step in steps if step.get("name") == "Preserve Trivy installation evidence")
+                self.assertEqual(preserve["if"], "always()")
+                self.assertEqual(preserve["with"]["path"], "${{ runner.temp }}/d2c-trivy-install")
+                self.assertEqual(preserve["with"]["if-no-files-found"], "error")
+        self.assertFalse(any("setup-trivy@" in step.get("uses", "")
+                             for job in value["jobs"].values() for step in job["steps"]))
+
     def test_each_role_and_architecture_is_independent_and_does_not_fail_fast(self):
         job = workflow()["jobs"]["image-scan"]
         self.assertEqual(job["strategy"]["fail-fast"], "false")

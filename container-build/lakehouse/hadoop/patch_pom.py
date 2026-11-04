@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 import xml.etree.ElementTree as ET
 
-from runtime_profile import EXCLUDED_MODULES, MODULES, SOURCE_INPUTS, UPSTREAM_VERSION, VARIANT_VERSION
+from runtime_profile import EXCLUDED_ARTIFACTS, MODULES, SOURCE_INPUTS, UPSTREAM_VERSION, VARIANT_VERSION
 
 NS = {"m": "http://maven.apache.org/POM/4.0.0"}
 
@@ -38,12 +38,12 @@ def patch_source(source: str, module: str) -> str:
     if dependency.count("</exclusions>") != 1:
         raise ValueError("expected upstream aggregation exclusions")
     additions = "".join(
-        f"        <exclusion>\n          <groupId>org.apache.hadoop</groupId>\n"
+        f"        <exclusion>\n          <groupId>{group}</groupId>\n"
         f"          <artifactId>{name}</artifactId>\n        </exclusion>\n"
-        for name in EXCLUDED_MODULES
+        for group, name in EXCLUDED_ARTIFACTS
     )
     dependency = dependency.replace(
-        "</exclusions>", "<!-- D2C local profile: omit whole YARN client/jobclient modules. -->\n"
+        "</exclusions>", "<!-- D2C local profile: omit remote jobclient and interactive WebSocket transport artifacts. -->\n"
         + additions + "      </exclusions>", 1,
     )
     dependency = dependency.replace(
@@ -52,7 +52,8 @@ def patch_source(source: str, module: str) -> str:
     )
     # In the upstream aggregation, jobclient is the path to common. Select
     # common explicitly so its LocalClientProtocolProvider/LocalJobRunner survive
-    # without jobclient's YARN provider. Apply the same exclusions to this path.
+    # without jobclient's YARN provider. Keep YarnClientUtils and apply the same
+    # transport/jobclient exclusions to this new path.
     local_common = """
     <dependency>
       <groupId>org.apache.hadoop</groupId>

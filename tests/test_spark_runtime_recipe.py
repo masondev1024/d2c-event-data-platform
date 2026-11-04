@@ -14,9 +14,10 @@ import struct
 import subprocess
 import sys
 import tarfile
+from tempfile import TemporaryDirectory
+import unittest
+from unittest.mock import patch
 import zipfile
-
-import pytest
 
 
 RECIPE = Path(__file__).resolve().parents[1] / "container-build/lakehouse/spark"
@@ -74,47 +75,6 @@ def jar_fixture(path: Path, *, jetty_version="12.1.14", spark_version="4.2.1", d
         jar.writestr("META-INF/NOTICE", "Fixture notice")
 
 
-def test_fixture_structural_abi_and_local_jetty_variant(tmp_path):
-    baseline, rebuilt = tmp_path / "baseline.jar", tmp_path / "rebuilt.jar"
-    jar_fixture(baseline, jetty_version="12.1.8")
-    jar_fixture(rebuilt)
-    result = verify.verify_runtime(rebuilt, baseline)
-    assert result["structural_abi_matches_baseline"] is True
-    assert result["spark_classes_compared"] == 2
-    assert result["rebuilt_sha256"] != result["baseline_sha256"]
-
-
-@pytest.mark.parametrize("changes, message", [
-    ({"spark_version": "4.1.3"}, "Expected Spark core"),
-    ({"jetty_version": "12.1.8"}, "Jetty version mismatch"),
-    ({"descriptor": "()J"}, "structural ABI changed"),
-    ({"constant": 43}, "structural ABI changed"),
-    ({"major": 65}, "structural ABI changed"),
-])
-def test_rejects_stale_or_incompatible_jar(tmp_path, changes, message):
-    baseline, rebuilt = tmp_path / "baseline.jar", tmp_path / "rebuilt.jar"
-    jar_fixture(baseline, jetty_version="12.1.8")
-    jar_fixture(rebuilt, **changes)
-    with pytest.raises(ValueError, match=message):
-        verify.verify_runtime(rebuilt, baseline)
-
-
-def test_rejects_unrelocated_jetty_and_missing_implementation(tmp_path):
-    baseline, rebuilt = tmp_path / "baseline.jar", tmp_path / "rebuilt.jar"
-    jar_fixture(baseline)
-    jar_fixture(rebuilt)
-    with zipfile.ZipFile(rebuilt, "a") as jar:
-        jar.writestr("org/eclipse/jetty/http/HttpParser.class", class_file("org/eclipse/jetty/http/HttpParser"))
-    with pytest.raises(ValueError, match="Unrelocated"):
-        verify.verify_runtime(rebuilt, baseline)
-    with zipfile.ZipFile(baseline) as source, zipfile.ZipFile(tmp_path / "missing.jar", "w") as destination:
-        for name in source.namelist():
-            if name != "org/sparkproject/jetty/http/HttpParser.class":
-                destination.writestr(name, source.read(name))
-    with pytest.raises(ValueError, match="Missing implementation"):
-        verify.verify_runtime(tmp_path / "missing.jar", baseline)
-
-
 def dependency_tree():
     return {
         "groupId": "org.apache.spark", "artifactId": "spark-core_2.13", "version": "4.2.1",
@@ -126,67 +86,6 @@ def dependency_tree():
     }
 
 
-@pytest.mark.parametrize("child, version", [(0, "4.1.3"), (1, "12.1.8"), (2, "2.13.17")])
-def test_dependency_tree_rejects_mixed_versions(child, version):
-    tree = dependency_tree()
-    tree["children"][child]["version"] = version
-    with pytest.raises(ValueError):
-        build.verify_dependency_tree(tree, MANIFEST)
-
-
-def test_recipe_retains_original_core_build_and_only_jetty_override():
-    assert MANIFEST["overrides"] == {"jetty.version": "12.1.14"}
-    assert len(MANIFEST["source"]["sha512"]) == 128
-    assert len(MANIFEST["maven"]["sha512"]) == 128
-    command = build.maven_command(Path("/tools/mvn"), Path("/source"), Path("/cache"), MANIFEST)
-    assert command[command.index("--file") + 1] == "/source/core/pom.xml"
-    assert "-Djetty.version=12.1.14" in command
-    assert "--strict-checksums" in command
-    assert not any(value in command for value in ("-am", "-pl", "-Denforcer.skip=true"))
-    assert build.verify_dependency_tree(dependency_tree(), MANIFEST)["scala_library"] == ["2.13.18"]
-
-
-def test_corrupt_cached_archive_is_not_used_or_refetched(tmp_path, monkeypatch):
-    (tmp_path / "source.tgz").write_bytes(b"wrong bytes")
-
-    def forbidden_download(*_args, **_kwargs):
-        pytest.fail("Digest mismatch must not trigger another download")
-
-    monkeypatch.setattr(build, "urlopen", forbidden_download)
-    with pytest.raises(ValueError, match="SHA512 mismatch"):
-        build.download_verified({"filename": "source.tgz", "sha512": "0" * 128}, tmp_path)
-
-
-@pytest.mark.parametrize("name, link", [("../outside", None), ("spark-4.2.1/link", "/outside")])
-def test_archive_cannot_escape_build_tree(tmp_path, name, link):
-    path = tmp_path / "fixture.tgz"
-    with tarfile.open(path, "w:gz") as archive:
-        entry = tarfile.TarInfo(name)
-        if link:
-            entry.type, entry.linkname = tarfile.SYMTYPE, link
-            archive.addfile(entry)
-        else:
-            entry.size = 1
-            archive.addfile(entry, io.BytesIO(b"x"))
-    with pytest.raises(ValueError, match="Unsafe archive"):
-        build.extract_verified(path, tmp_path / "extract", "spark-4.2.1")
-
-
-def test_source_pom_version_drift_fails_before_build(tmp_path):
-    source = tmp_path / "source"
-    (source / "core").mkdir(parents=True)
-    root = '<project xmlns="http://maven.apache.org/POM/4.0.0"><version>4.1.3</version></project>'
-    (source / "pom.xml").write_text(root)
-    (source / "core/pom.xml").write_text("fixture")
-    manifest = copy.deepcopy(MANIFEST)
-    manifest["source"]["pom_sha256"] = {
-        name: hashlib.sha256((source / name).read_bytes()).hexdigest()
-        for name in ("pom.xml", "core/pom.xml")
-    }
-    with pytest.raises(ValueError, match="Unexpected Spark source version"):
-        build.verify_source(source, manifest)
-
-
 def docker_stages():
     text = (RECIPE.parents[2] / "lakehouse/Dockerfile").read_text()
     matches = list(re.finditer(r"^FROM (?:--platform=\$BUILDPLATFORM )?(\S+) AS (\S+)\s*$", text, re.M))
@@ -196,67 +95,199 @@ def docker_stages():
     }
 
 
-@pytest.mark.parametrize("stage, builder, source, destination", [
-    ("hadoop-artifacts", "hadoop-runtime-builder", "/out/hadoop/", "/hadoop/"),
-    ("parquet-artifacts", "parquet-runtime-builder", "/work/output/", "/parquet/"),
-    ("iceberg-artifacts", "iceberg-runtime-builder", "/artifacts/", "/iceberg/"),
-    ("spark-artifacts", "spark-runtime-builder", "/out/spark/", "/spark/"),
-    ("dependency-artifacts", "dependency-resolver", "/opt/spark/extra-jars/", "/dependencies/"),
-])
-def test_component_scratch_export_contract(stage, builder, source, destination):
-    _, stages = docker_stages()
-    assert stages[stage][0] == "scratch"
-    assert f"COPY --from={builder} {source} {destination}" in stages[stage][1]
+class SparkRuntimeRecipeTests(unittest.TestCase):
+    def setUp(self):
+        scratch = TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+
+    def test_fixture_structural_abi_and_local_jetty_variant(self):
+        baseline, rebuilt = self.root / "baseline.jar", self.root / "rebuilt.jar"
+        jar_fixture(baseline, jetty_version="12.1.8")
+        jar_fixture(rebuilt)
+        result = verify.verify_runtime(rebuilt, baseline)
+        self.assertIs(result["structural_abi_matches_baseline"], True)
+        self.assertEqual(result["spark_classes_compared"], 2)
+        self.assertNotEqual(result["rebuilt_sha256"], result["baseline_sha256"])
+
+    def assert_rejected_jar(self, changes, message):
+        baseline, rebuilt = self.root / "baseline.jar", self.root / "rebuilt.jar"
+        jar_fixture(baseline, jetty_version="12.1.8")
+        jar_fixture(rebuilt, **changes)
+        with self.assertRaisesRegex(ValueError, message):
+            verify.verify_runtime(rebuilt, baseline)
+
+    def test_rejects_wrong_spark_version(self):
+        self.assert_rejected_jar({"spark_version": "4.1.3"}, "Expected Spark core")
+
+    def test_rejects_stale_jetty_version(self):
+        self.assert_rejected_jar({"jetty_version": "12.1.8"}, "Jetty version mismatch")
+
+    def test_rejects_changed_method_descriptor(self):
+        self.assert_rejected_jar({"descriptor": "()J"}, "structural ABI changed")
+
+    def test_rejects_changed_public_constant(self):
+        self.assert_rejected_jar({"constant": 43}, "structural ABI changed")
+
+    def test_rejects_changed_classfile_version(self):
+        self.assert_rejected_jar({"major": 65}, "structural ABI changed")
+
+    def test_rejects_unrelocated_jetty_and_missing_implementation(self):
+        baseline, rebuilt = self.root / "baseline.jar", self.root / "rebuilt.jar"
+        jar_fixture(baseline)
+        jar_fixture(rebuilt)
+        with zipfile.ZipFile(rebuilt, "a") as jar:
+            jar.writestr("org/eclipse/jetty/http/HttpParser.class", class_file("org/eclipse/jetty/http/HttpParser"))
+        with self.assertRaisesRegex(ValueError, "Unrelocated"):
+            verify.verify_runtime(rebuilt, baseline)
+        missing = self.root / "missing.jar"
+        with zipfile.ZipFile(baseline) as source, zipfile.ZipFile(missing, "w") as destination:
+            for name in source.namelist():
+                if name != "org/sparkproject/jetty/http/HttpParser.class":
+                    destination.writestr(name, source.read(name))
+        with self.assertRaisesRegex(ValueError, "Missing implementation"):
+            verify.verify_runtime(missing, baseline)
+
+    def assert_rejected_dependency_version(self, child, version):
+        tree = dependency_tree()
+        tree["children"][child]["version"] = version
+        with self.assertRaises(ValueError):
+            build.verify_dependency_tree(tree, MANIFEST)
+
+    def test_dependency_tree_rejects_mixed_spark_version(self):
+        self.assert_rejected_dependency_version(0, "4.1.3")
+
+    def test_dependency_tree_rejects_stale_jetty_version(self):
+        self.assert_rejected_dependency_version(1, "12.1.8")
+
+    def test_dependency_tree_rejects_mixed_scala_version(self):
+        self.assert_rejected_dependency_version(2, "2.13.17")
+
+    def test_recipe_retains_original_core_build_and_only_jetty_override(self):
+        self.assertEqual(MANIFEST["overrides"], {"jetty.version": "12.1.14"})
+        self.assertEqual(len(MANIFEST["source"]["sha512"]), 128)
+        self.assertEqual(len(MANIFEST["maven"]["sha512"]), 128)
+        command = build.maven_command(Path("/tools/mvn"), Path("/source"), Path("/cache"), MANIFEST)
+        self.assertEqual(command[command.index("--file") + 1], "/source/core/pom.xml")
+        self.assertIn("-Djetty.version=12.1.14", command)
+        self.assertIn("--strict-checksums", command)
+        for value in ("-am", "-pl", "-Denforcer.skip=true"):
+            self.assertNotIn(value, command)
+        self.assertEqual(build.verify_dependency_tree(dependency_tree(), MANIFEST)["scala_library"], ["2.13.18"])
+
+    def test_corrupt_cached_archive_is_not_used_or_refetched(self):
+        (self.root / "source.tgz").write_bytes(b"wrong bytes")
+        with patch.object(build, "urlopen", side_effect=AssertionError("Digest mismatch must not trigger another download")) as fetch:
+            with self.assertRaisesRegex(ValueError, "SHA512 mismatch"):
+                build.download_verified({"filename": "source.tgz", "sha512": "0" * 128}, self.root)
+        fetch.assert_not_called()
+
+    def assert_unsafe_archive_rejected(self, name, link):
+        path = self.root / "fixture.tgz"
+        with tarfile.open(path, "w:gz") as archive:
+            entry = tarfile.TarInfo(name)
+            if link:
+                entry.type, entry.linkname = tarfile.SYMTYPE, link
+                archive.addfile(entry)
+            else:
+                entry.size = 1
+                archive.addfile(entry, io.BytesIO(b"x"))
+        with self.assertRaisesRegex(ValueError, "Unsafe archive"):
+            build.extract_verified(path, self.root / "extract", "spark-4.2.1")
+
+    def test_archive_rejects_parent_path_traversal(self):
+        self.assert_unsafe_archive_rejected("../outside", None)
+
+    def test_archive_rejects_absolute_symlink(self):
+        self.assert_unsafe_archive_rejected("spark-4.2.1/link", "/outside")
+
+    def test_source_pom_version_drift_fails_before_build(self):
+        source = self.root / "source"
+        (source / "core").mkdir(parents=True)
+        root = '<project xmlns="http://maven.apache.org/POM/4.0.0"><version>4.1.3</version></project>'
+        (source / "pom.xml").write_text(root)
+        (source / "core/pom.xml").write_text("fixture")
+        manifest = copy.deepcopy(MANIFEST)
+        manifest["source"]["pom_sha256"] = {
+            name: hashlib.sha256((source / name).read_bytes()).hexdigest()
+            for name in ("pom.xml", "core/pom.xml")
+        }
+        with self.assertRaisesRegex(ValueError, "Unexpected Spark source version"):
+            build.verify_source(source, manifest)
+
+    def assert_scratch_export(self, stage, builder, source, destination):
+        _, stages = docker_stages()
+        self.assertEqual(stages[stage][0], "scratch")
+        self.assertIn(f"COPY --from={builder} {source} {destination}", stages[stage][1])
+
+    def test_hadoop_scratch_export_contract(self):
+        self.assert_scratch_export("hadoop-artifacts", "hadoop-runtime-builder", "/out/hadoop/", "/hadoop/")
+
+    def test_parquet_scratch_export_contract(self):
+        self.assert_scratch_export("parquet-artifacts", "parquet-runtime-builder", "/work/output/", "/parquet/")
+
+    def test_iceberg_scratch_export_contract(self):
+        self.assert_scratch_export("iceberg-artifacts", "iceberg-runtime-builder", "/artifacts/", "/iceberg/")
+
+    def test_spark_scratch_export_contract(self):
+        self.assert_scratch_export("spark-artifacts", "spark-runtime-builder", "/out/spark/", "/spark/")
+
+    def test_dependency_scratch_export_contract(self):
+        self.assert_scratch_export("dependency-artifacts", "dependency-resolver", "/opt/spark/extra-jars/", "/dependencies/")
+
+    def test_coherent_official_base_keeps_its_patched_jdk(self):
+        text, stages = docker_stages()
+        pinned = "apache/spark:4.2.1@sha256:0cb70cf0193ec81c93c6c47078208512bbe659dd9dc89535dd2773826f0ea2bf"
+        self.assertEqual(stages["spark-base"][0], pinned)
+        self.assertEqual(stages["source-build-base"][0], pinned)
+        self.assertNotIn("SapMachine", text)
+        self.assertNotIn("AS java-runtime", text)
+        self.assertNotIn("rm -rf /opt/java/openjdk", text)
+        self.assertIn('JAVA_VERSION="21.0.13"', stages["runtime"][1])
+        self.assertIn("spark-sql-kafka-0-10_2.13:4.2.1", text)
+        self.assertIn(MANIFEST["maven"]["sha512"], stages["source-build-base"][1])
+
+    def test_artifact_selection_seals_and_verifies_before_jar_installation(self):
+        text, stages = docker_stages()
+        header = text[:text.index("FROM ")]
+        self.assertIn("ARG D2C_ARTIFACT_STAGE=compiled-artifacts", header)
+        self.assertIn("ARG D2C_PARQUET_STAGE=parquet-artifacts", header)
+        self.assertEqual(stages["selected-artifacts"][0], "${D2C_ARTIFACT_STAGE}")
+        self.assertEqual(stages["selected-parquet"][0], "${D2C_PARQUET_STAGE}")
+        self.assertIn("COPY --from=selected-parquet /parquet/maven/ /rebuilt-repository/", stages["iceberg-runtime-builder"][1])
+        self.assertIn("lakehouse_artifacts.py seal", stages["artifact-sealer"][1])
+        self.assertIn("COPY --from=artifact-sealer /artifacts/ /", stages["compiled-artifacts"][1])
+        runtime = stages["runtime"][1]
+        self.assertIn("type=bind,from=selected-artifacts,target=/tmp/d2c-artifacts,ro", runtime)
+        self.assertLess(runtime.index("lakehouse_artifacts.py verify"), runtime.index("&& cp /tmp/d2c-artifacts/dependencies/*.jar"))
+        self.assertNotIn("COPY --from=hadoop-runtime-builder", runtime)
+        for source in ("hadoop-client-api-3.5.0-d2c-local1.jar", "hadoop-client-runtime-3.5.0-d2c-local1.jar",
+                       "iceberg-spark-runtime-4.2_2.13-1.12.0-d2c-security1.jar",
+                       "spark-core_2.13-4.2.1-d2c-jetty12.1.14.jar"):
+            self.assertIn(source, runtime)
+
+    def test_each_component_records_actual_exit_and_unchanged_recipes_via_wrapper(self):
+        text, stages = docker_stages()
+        for stage, role in (("hadoop-runtime-builder", "hadoop"), ("parquet-runtime-builder", "parquet"),
+                            ("iceberg-runtime-builder", "iceberg"), ("spark-runtime-builder", "spark"),
+                            ("dependency-resolver", "dependencies")):
+            self.assertIn("lakehouse_artifacts.py component", stages[stage][1])
+            self.assertIn(f"--component {role} ", stages[stage][1])
+            self.assertIn("--source-root /recipe-source", stages[stage][1])
+        self.assertNotIn("build-status.json", text)
+        self.assertIn("COPY lakehouse/Dockerfile /recipe-source/lakehouse/Dockerfile", stages["source-build-base"][1])
+
+    def test_dependency_heredoc_shell_and_python_parse_without_execution(self):
+        text, _ = docker_stages()
+        shell_match = re.search(r"<<'SH'\n(.*?)\nSH", text, re.S)
+        self.assertIsNotNone(shell_match)
+        shell = shell_match.group(1)
+        result = subprocess.run(["sh", "-n"], input=shell, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        python_match = re.search(r"<<'PY'\n(.*?)\nPY", shell, re.S)
+        self.assertIsNotNone(python_match)
+        ast.parse(python_match.group(1))
 
 
-def test_coherent_official_base_keeps_its_patched_jdk():
-    text, stages = docker_stages()
-    pinned = "apache/spark:4.2.1@sha256:0cb70cf0193ec81c93c6c47078208512bbe659dd9dc89535dd2773826f0ea2bf"
-    assert stages["spark-base"][0] == pinned
-    assert stages["source-build-base"][0] == pinned
-    assert "SapMachine" not in text and "AS java-runtime" not in text
-    assert "rm -rf /opt/java/openjdk" not in text
-    assert "JAVA_VERSION=\"21.0.13\"" in stages["runtime"][1]
-    assert "spark-sql-kafka-0-10_2.13:4.2.1" in text
-    assert MANIFEST["maven"]["sha512"] in stages["source-build-base"][1]
-
-
-def test_artifact_selection_seals_and_verifies_before_jar_installation():
-    text, stages = docker_stages()
-    header = text[:text.index("FROM ")]
-    assert "ARG D2C_ARTIFACT_STAGE=compiled-artifacts" in header
-    assert "ARG D2C_PARQUET_STAGE=parquet-artifacts" in header
-    assert stages["selected-artifacts"][0] == "${D2C_ARTIFACT_STAGE}"
-    assert stages["selected-parquet"][0] == "${D2C_PARQUET_STAGE}"
-    assert "COPY --from=selected-parquet /parquet/maven/ /rebuilt-repository/" in stages["iceberg-runtime-builder"][1]
-    assert "lakehouse_artifacts.py seal" in stages["artifact-sealer"][1]
-    assert "COPY --from=artifact-sealer /artifacts/ /" in stages["compiled-artifacts"][1]
-    runtime = stages["runtime"][1]
-    assert "type=bind,from=selected-artifacts,target=/tmp/d2c-artifacts,ro" in runtime
-    assert runtime.index("lakehouse_artifacts.py verify") < runtime.index("&& cp /tmp/d2c-artifacts/dependencies/*.jar")
-    assert "COPY --from=hadoop-runtime-builder" not in runtime
-    for source in ("hadoop-client-api-3.5.0-d2c-local1.jar", "hadoop-client-runtime-3.5.0-d2c-local1.jar",
-                   "iceberg-spark-runtime-4.2_2.13-1.12.0-d2c-security1.jar",
-                   "spark-core_2.13-4.2.1-d2c-jetty12.1.14.jar"):
-        assert source in runtime
-
-
-def test_each_component_records_actual_exit_and_unchanged_recipes_via_wrapper():
-    text, stages = docker_stages()
-    for stage, role in (("hadoop-runtime-builder", "hadoop"), ("parquet-runtime-builder", "parquet"),
-                        ("iceberg-runtime-builder", "iceberg"), ("spark-runtime-builder", "spark"),
-                        ("dependency-resolver", "dependencies")):
-        assert "lakehouse_artifacts.py component" in stages[stage][1]
-        assert f"--component {role} " in stages[stage][1]
-        assert "--source-root /recipe-source" in stages[stage][1]
-    assert "build-status.json" not in text
-    assert "COPY lakehouse/Dockerfile /recipe-source/lakehouse/Dockerfile" in stages["source-build-base"][1]
-
-
-def test_dependency_heredoc_shell_and_python_parse_without_execution():
-    text, _ = docker_stages()
-    shell = re.search(r"<<'SH'\n(.*?)\nSH", text, re.S).group(1)
-    result = subprocess.run(["sh", "-n"], input=shell, text=True, capture_output=True)
-    assert result.returncode == 0, result.stderr
-    python = re.search(r"<<'PY'\n(.*?)\nPY", shell, re.S).group(1)
-    ast.parse(python)
+if __name__ == "__main__":
+    unittest.main()

@@ -19,6 +19,7 @@ import socket
 import ssl
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 import time
 import urllib.error
 import urllib.request
@@ -159,11 +160,12 @@ def api_probe(deadline):
         response = client.get("/healthz", base_url="http://localhost")
         require(response.status_code == 200 and response.get_json() == {"status": "ok"}, "production Flask healthz failed")
     port = local_port()
-    command = [sys.executable, "-m", "gunicorn", "--bind", f"127.0.0.1:{port}",
-               "--workers", "1", "--threads", "4", "--worker-tmp-dir", "/dev/shm", "--timeout", "30",
-               "--graceful-timeout", "3", "--access-logfile", "/dev/null", "--error-logfile", "/dev/null", "app:app"]
-    server = server_probe(command, {f"http://127.0.0.1:{port}/healthz": lambda payload: payload == {"status": "ok"}},
-                          deadline, environment=os.environ.copy())
+    with TemporaryDirectory(prefix="d2c-gunicorn-") as worker_directory:
+        command = [sys.executable, "-m", "gunicorn", "--bind", f"127.0.0.1:{port}",
+                   "--workers", "1", "--threads", "4", "--worker-tmp-dir", worker_directory, "--timeout", "30",
+                   "--graceful-timeout", "3", "--access-logfile", "/dev/null", "--error-logfile", "/dev/null", "app:app"]
+        server = server_probe(command, {f"http://127.0.0.1:{port}/healthz": lambda payload: payload == {"status": "ok"}},
+                              deadline, environment=os.environ.copy())
     return {"imports": versions, "native_psycopg": {"implementation": psycopg.pq.__impl__, "libpq_version": psycopg.pq.version()},
             "flask_test_client_healthz": True, "normal_gunicorn": server}
 
