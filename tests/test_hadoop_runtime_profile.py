@@ -769,6 +769,91 @@ class CuratorSourceFreeFixedBundleTest(unittest.TestCase):
                 curator.verify_curator_shaded_module(*args)
 
 
+class CuratorTypedReferenceTest(unittest.TestCase):
+    """Actual JVM descriptor contexts must not be parsed as free-form FQNs."""
+
+    def class_file(self, descriptor="()V", signature=None, literals=(), class_refs=(),
+                   name_and_type=None, method_type=None):
+        pool, strings = [], {}
+
+        def utf(value):
+            if value not in strings:
+                raw = value.encode()
+                pool.append(b"\x01" + struct.pack(">H", len(raw)) + raw)
+                strings[value] = len(pool)
+            return strings[value]
+
+        def ref(tag, index):
+            pool.append(bytes([tag]) + struct.pack(">H", index))
+            return len(pool)
+
+        owner = ref(7, utf("fixture/TypedReference"))
+        superclass = ref(7, utf("java/lang/Object"))
+        method_name, method_descriptor = utf("value"), utf(descriptor)
+        for literal in literals:
+            ref(8, utf(literal))
+        for name in class_refs:
+            ref(7, utf(name))
+        if name_and_type:
+            indexes = (utf("referenced"), utf(name_and_type))
+            pool.append(b"\x0c" + struct.pack(">HH", *indexes))
+        if method_type:
+            ref(16, utf(method_type))
+        attributes = b"\x00\x00"
+        if signature is not None:
+            name, index = utf("Signature"), utf(signature)
+            attributes = struct.pack(">HHIH", 1, name, 2, index)
+        header = struct.pack(">IHHH", 0xcafebabe, 0, 52, len(pool) + 1) + b"".join(pool)
+        body = struct.pack(">HHHHHHHHH", 0x0601, owner, superclass, 0, 0, 1,
+                           0x0401, method_name, method_descriptor) + attributes + b"\x00\x00"
+        return header + body
+
+    def check(self, **options):
+        target = curator.FIXED_GUAVA_PREFIX + "common/base/CharMatcher"
+        return curator._validate_fixed_guava_references("fixture.class", self.class_file(**options),
+                                                        {target}, class_file=True)
+
+    def test_actual_primitive_i_then_object_l_descriptor_is_not_an_ilorg_package(self):
+        target = curator.FIXED_GUAVA_PREFIX + "common/base/CharMatcher"
+        actual = "(IL" + target + ";I)V"
+        for options in ({"descriptor": actual}, {"name_and_type": actual}, {"method_type": actual},
+                        {"descriptor": actual, "literals": (actual,)},
+                        {"descriptor": "(BCDFIJSZL" + target + ";[[L" + target + ";)[L" + target + ";"}):
+            with self.subTest(options=options):
+                self.assertEqual(self.check(**options), [target])
+
+    def test_array_and_generic_contexts_keep_wrong_namespace_and_closure_rejections(self):
+        fixed = curator.FIXED_GUAVA_PREFIX + "common/base/CharMatcher"
+        generic = "(IL" + fixed + ";Ljava/util/List<+L" + fixed + ";>;)V"
+        self.assertEqual(self.check(signature=generic), [fixed])
+        self.assertEqual(self.check(descriptor="([I[L" + fixed + ";)V"), [fixed])
+        self.assertEqual(self.check(class_refs=("[[L" + fixed + ";",)), [fixed])
+        for target in ("foreign/" + fixed, fixed.replace("CharMatcher", "Missing"),
+                       "com/google/common/base/CharMatcher"):
+            for options in ({"descriptor": "(IL" + target + ";I)V"},
+                            {"descriptor": "(I[[L" + target + ";)V"},
+                            {"signature": "(IL" + target + ";Ljava/util/List<+L" + target + ";>;)V"},
+                            {"class_refs": ("[L" + target + ";",)}):
+                with self.subTest(target=target, options=options), self.assertRaises(ValueError):
+                    self.check(**options)
+
+    def test_literal_or_spi_fqn_does_not_acquire_descriptor_context(self):
+        fixed = curator.FIXED_GUAVA_PREFIX + "common/base/CharMatcher"
+        for literal in ("IL" + fixed, "foreign/" + fixed, "foreign." + fixed.replace("/", ".")):
+            with self.subTest(literal=literal), self.assertRaises(ValueError):
+                self.check(literals=(literal,))
+        for provider in ("foreign." + fixed.replace("/", "."),
+                         fixed.replace("CharMatcher", "Missing").replace("/", ".")):
+            with self.subTest(provider=provider), self.assertRaises(ValueError):
+                curator._validate_fixed_guava_references("META-INF/services/fixture", provider.encode(),
+                                                        {fixed}, class_file=False)
+
+    def test_descriptor_parser_rejects_partial_or_invalid_grammar(self):
+        for value in ("(I", "([V)V", "(Lmissing)V", "()VI", "L;", "(I)Jtrailing"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                curator._descriptor_references(value)
+
+
 class JlineTypedResourceTest(unittest.TestCase):
     """Small descriptor fixtures, not executable library or scan artifacts."""
 

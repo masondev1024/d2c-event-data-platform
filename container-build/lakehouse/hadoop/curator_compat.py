@@ -73,6 +73,8 @@ class ClassReader:
     def __init__(self, content: bytes):
         self.stream = io.BytesIO(content)
         self.pool = [None]
+        self.descriptor_indices = set()
+        self.signature_indices = set()
 
     def read(self, size: int) -> bytes:
         value = self.stream.read(size)
@@ -145,6 +147,8 @@ class ClassReader:
             if name in ("Signature", "ConstantValue"):
                 require(len(raw) == 2, f"invalid Curator {name} attribute")
                 index = struct.unpack(">H", raw)[0]
+                if name == "Signature":
+                    self.signature_indices.add(index)
                 result[name] = self.utf8(index) if name == "Signature" else self.constant(index)
             elif name == "Exceptions":
                 require(len(raw) >= 2, "invalid Curator Exceptions attribute")
@@ -169,7 +173,9 @@ class ClassReader:
         for _ in range(self.u2()):
             access = self.u2()
             name = self.utf8(self.u2())
-            descriptor = self.utf8(self.u2())
+            descriptor_index = self.u2()
+            self.descriptor_indices.add(descriptor_index)
+            descriptor = self.utf8(descriptor_index)
             attributes = self.attributes()
             require("InnerClasses" not in attributes, "InnerClasses attribute on Curator member")
             if access & PUBLIC_OR_PROTECTED:
@@ -437,19 +443,77 @@ def _fixed_library_inputs(path: Path, artifact: str, version: str) -> dict:
                 "original_manifest_sha256": hashlib.sha256(original_manifest).hexdigest()}
 
 
+def _descriptor_references(value: str) -> set[str]:
+    """Parse a complete JVM field/method descriptor, including adjacent bases."""
+    position, refs = 0, set()
+
+    def field_type() -> None:
+        nonlocal position
+        require(position < len(value), "truncated JVM descriptor")
+        token = value[position]
+        position += 1
+        if token in "BCDFIJSZ":
+            return
+        if token == "[":
+            field_type()
+            return
+        require(token == "L", f"invalid JVM descriptor type: {value}")
+        end = value.find(";", position)
+        require(end > position, f"invalid JVM object descriptor: {value}")
+        target = value[position:end]
+        require(all(target.split("/")) and not any(c in target for c in ".;[<>()"),
+                f"invalid JVM descriptor class name: {value}")
+        refs.add(target)
+        position = end + 1
+
+    require(bool(value), "empty JVM descriptor")
+    if value.startswith("("):
+        position = 1
+        while position < len(value) and value[position] != ")":
+            field_type()
+        require(position < len(value) and value[position] == ")", "unterminated JVM method descriptor")
+        position += 1
+        if position < len(value) and value[position] == "V":
+            position += 1
+        else:
+            field_type()
+    else:
+        field_type()
+    require(position == len(value), f"trailing JVM descriptor content: {value}")
+    return refs
+
+
 def _validate_fixed_guava_references(name: str, content: bytes, available: set[str], *, class_file: bool) -> list[str]:
     """Require original Curator relocation and closure for Guava implementation references."""
-    values, symbolic = [], set()
+    values, symbolic, typed_values = [], set(), set()
     if class_file:
         reader = ClassReader(content)
         require(reader.u4() == 0xCAFEBABE, f"invalid rebuilt class header: {name}")
         reader.u2(), reader.u2()
         reader.read_pool()
         values = [reader.utf8(i) for i, value in enumerate(reader.pool) if value is not None and value[0] == 1]
+        descriptor_indices = {value[2] for value in reader.pool if value is not None and value[0] == 12}
+        descriptor_indices.update(value[1] for value in reader.pool if value is not None and value[0] == 16)
         for i, value in enumerate(reader.pool):
             if value is not None and value[0] == 7:
                 target = reader.class_name(i)
                 symbolic.update(re.findall(r"L([A-Za-z_$][\w$/]*);", target) if target.startswith("[") else [target])
+                if target.startswith("["):
+                    descriptor_indices.add(value[1])
+        # Member descriptors and Signature attributes are typed by their actual
+        # class-file locations. A free-form UTF8 literal that merely resembles
+        # a descriptor does not acquire this context.
+        reader.u2(), reader.u2(), reader.u2()
+        for _ in range(reader.u2()):
+            reader.u2()
+        reader.members(), reader.members(), reader.attributes()
+        require(not reader.stream.read(1), "trailing class bytes during reference validation")
+        descriptor_indices.update(reader.descriptor_indices)
+        for index in descriptor_indices:
+            descriptor = reader.utf8(index)
+            symbolic.update(_descriptor_references(descriptor))
+            typed_values.add(descriptor)
+        typed_values.update(reader.utf8(index) for index in reader.signature_indices)
         for value in values:
             symbolic.update(re.findall(r"L([A-Za-z_$][\w$/]*)[;<]", value))
     else:
@@ -464,6 +528,12 @@ def _validate_fixed_guava_references(name: str, content: bytes, available: set[s
         require(not any(token in remaining for token in ("com/google/common", "com/google/thirdparty",
                                                         "com.google.common", "com.google.thirdparty")),
                 f"unexpected unrelocated Guava namespace: {name}")
+        if value in typed_values:
+            # Descriptor classes above and signature L... classes below still
+            # undergo the same namespace AND available-class closure checks.
+            # In (ILorg/...;) I is primitive int and L starts the class, rather
+            # than forming the nonexistent package ILorg/....
+            continue
         for separator in ("/", "."):
             escaped = re.escape(separator)
             pattern = (rf"(?:[A-Za-z_$][\w$]*{escaped})*com{escaped}google{escaped}"
