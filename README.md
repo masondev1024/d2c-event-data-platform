@@ -178,7 +178,7 @@ docker compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh \
 `lakehouse` profile은 외부 AWS catalog나 object storage를 만들지 않는 로컬 검증용입니다.
 Spark 4.2.1(Scala 2.13)와 Iceberg 1.12.0의 보안 재빌드 runtime을 이미지 build 시 고정해 실행 중 Maven
 다운로드에 의존하지 않습니다. Hadoop/Parquet/Iceberg의 공식 조립 절차에 Jackson 2.21.7과
-JLine 3.30.15를 적용하며, 원본 소스 해시·클래스·라이선스와 실제 패치된 구현을 확인합니다.
+JLine 3.30.17을 적용하며, 원본 소스 해시·클래스·라이선스와 실제 패치된 구현을 확인합니다.
 개발 헤더·컴파일러는 최종 runtime에서 제외하고 JVM/Python/JNI runtime 라이브러리는 유지합니다.
 고정된 공식 Spark 이미지의 Temurin 21.0.13과 공급자 메타데이터를 유지합니다.
 JVM/Python/JNI 호환성은 두 플랫폼의 실제 최종 이미지로 검증하며, 컨테이너 스캔만으로
@@ -402,7 +402,9 @@ Parquet **1.17.0/1.17.1** 조립에는 Jackson **2.21.7**을 적용합니다.
 
 Hadoop **3.5.0-d2c-local1** API/runtime은 공식 source assembly에서 로컬 동작에 필요한
 `hadoop-yarn-client`와 `YarnClientUtils`를 유지합니다. 원격 MapReduce jobclient와 사용하지
-않는 별도 WebSocket 전송 artifact만 선택에서 제외하며, JLine은 **3.30.15**로 고정합니다.
+않는 별도 WebSocket 전송 artifact만 선택에서 제외하며, JLine은 **3.30.17**로 고정합니다.
+JLine provider 리소스는 Maven Shade 변환기로 실제 shaded 클래스 경로에 맞춰 조립하고,
+최종 JVM에서 `dumb` provider를 직접 로딩하여 확인합니다.
 이 WebSocket 의존성은 upstream의 compile dependency이므로, 이 조립은 D2C에 한정된
 로컬 프로파일입니다. LocalFileSystem·MapReduce core/common·서비스 제공자를 유지하고,
 최종 JVM 시험에서 Master의 로컬 주소·principal 계산과 실제 JAR 출처까지 확인합니다.

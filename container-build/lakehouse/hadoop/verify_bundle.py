@@ -10,6 +10,8 @@ from zipfile import ZipFile
 import xml.etree.ElementTree as ET
 
 from patch_pom import patch_source
+from jline_resources import (LOADER_SHA256, LOADER_SOURCE, SOURCE_ROOT as JLINE_SOURCE_ROOT,
+                             VERSION as JLINE_VERSION, resource_kind, validate_jline_resources)
 from runtime_profile import (
     DEPENDENCY_VERSIONS, EXCLUDED_ARTIFACTS, EXCLUDED_MODULES, FILESYSTEM_PROVIDERS, LOCAL_PROVIDER,
     MAVEN_VERSION, MODULES, PROTOCOL_SERVICE, REQUIRED_MODULES, SOURCE_INPUTS, SOURCE_ROOT_URL,
@@ -120,7 +122,7 @@ def validate_graph(graph: dict, module: str) -> dict:
             require(node["version"] == allowed, f"mixed Hadoop versions: {coordinate}")
             require(node["artifactId"] not in EXCLUDED_MODULES, f"unsupported module reintroduced: {coordinate}")
         if node["groupId"] == "org.jline":
-            require(node["version"] == "3.30.15", f"unpatched interactive library: {coordinate}")
+            require(node["version"] == JLINE_VERSION, f"unpatched interactive library: {coordinate}")
         require((node["groupId"], node["artifactId"]) not in EXCLUDED_ARTIFACTS,
                 f"excluded profile artifact reintroduced: {coordinate}")
         require(not (node["groupId"] == "org.eclipse.jetty" and node["artifactId"] in ("jetty-client", "jetty-http")),
@@ -141,8 +143,11 @@ def validate_graph(graph: dict, module: str) -> dict:
 
 
 def service_providers(content: bytes) -> list[str]:
-    return [line.split("#", 1)[0].strip() for line in content.decode("utf-8").splitlines()
-            if line.split("#", 1)[0].strip()]
+    providers = [line.split("#", 1)[0].strip() for line in content.decode("utf-8").splitlines()
+                 if line.split("#", 1)[0].strip()]
+    require(all(re.fullmatch(r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+", name, re.ASCII)
+                for name in providers), "malformed Java SPI provider class name")
+    return providers
 
 
 def validate_services(services: dict[str, set[str]], classes: set[str]) -> None:
@@ -264,6 +269,22 @@ def validate_artifact_identity(module: str, jar: ZipFile, *, original_pom: bytes
 def verify(source_root: Path, output: Path) -> dict:
     version_report = (output / "maven-version.txt").read_bytes()
     maven_version = validate_maven_version(version_report.decode())
+    loader = (source_root / "jline-source" / LOADER_SOURCE).read_bytes()
+    require(hashlib.sha256(loader).hexdigest() == LOADER_SHA256, "pinned JLine loader source hash mismatch")
+    adapter = json.loads((output / "jline-transformer-build.json").read_text())
+    require(adapter["self_test"] == "PASS" and adapter["compiler_release"] == 17
+            and adapter["shade_api_version"] == "3.6.1" and adapter["command_exit"] == 0,
+            "source-time JLine transformer build/self-test did not succeed")
+    require(hashlib.sha256((output / "jline-transformer-build.log").read_bytes()).hexdigest() == adapter["build_log_sha256"],
+            "JLine transformer build log differs from successful receipt")
+    adapter_sources = Path(__file__).resolve().parent / "jline-transformer"
+    expected_sources = {str(path.relative_to(adapter_sources)): hashlib.sha256(path.read_bytes()).hexdigest()
+                        for path in adapter_sources.rglob("*") if path.is_file() and path.suffix in (".xml", ".java")}
+    require(adapter["source_sha256"] == expected_sources, "JLine transformer sources differ from the compiled receipt")
+    require(adapter["coordinate"] == "io.github.masondev1024.d2c:hadoop-jline-resource-transformer:1.0.0"
+            and adapter["artifact_sha256"] == adapter["installed_artifact_sha256"]
+            and re.fullmatch(r"[a-f0-9]{64}", adapter["artifact_sha256"]) is not None,
+            "JLine build-only adapter identity mismatch")
     sources = []
     for relative, expected in SOURCE_INPUTS.items():
         path = source_root / relative
@@ -291,6 +312,7 @@ def verify(source_root: Path, output: Path) -> dict:
 
     classes, services, artifacts, jetty_modules = set(), {}, [], set()
     yarn_references, jetty_references, transport_references, identities = {}, {}, {}, {}
+    jline_verification = None
     for module in MODULES:
         path = output / f"{module}-{VARIANT_VERSION}.jar"
         artifact_hash = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -304,7 +326,8 @@ def verify(source_root: Path, output: Path) -> dict:
                     verify_maven_properties(required_jar_entry(jar, f"META-INF/maven/org.apache.hadoop/{original}/pom.properties"),
                                             "org.apache.hadoop", original, UPSTREAM_VERSION)
             for name in jar.namelist():
-                if name.startswith("META-INF/services/") and not name.endswith("/"):
+                if not name.endswith("/") and resource_kind(name) == "java-spi":
+                    require(jar.namelist().count(name) == 1, f"duplicate Java SPI descriptor: {name}")
                     services.setdefault(name.removeprefix("META-INF/services/"), set()).update(service_providers(jar.read(name)))
                 if name.startswith("META-INF/maven/org.eclipse.jetty") and name.endswith("/pom.properties"):
                     jetty_modules.add(name.removeprefix("META-INF/maven/").removesuffix("/pom.properties"))
@@ -338,6 +361,12 @@ def verify(source_root: Path, output: Path) -> dict:
                     require(b"2.21.7" in jar.read(name), f"incorrect actual Jackson implementation: {name}")
                 for name in ("org/jline/builtins/telnet/Telnet.class", "org/jline/builtins/telnet/TelnetIO.class"):
                     jar.getinfo("org/apache/hadoop/shaded/" + name)
+                original_path = Path(f"/root/.m2/repository/org/jline/jline/{JLINE_VERSION}/jline-{JLINE_VERSION}.jar")
+                with ZipFile(original_path) as original:
+                    verify_maven_properties(required_jar_entry(original, "META-INF/maven/org.jline/jline/pom.properties"),
+                                            "org.jline", "jline", JLINE_VERSION)
+                    jline_verification = validate_jline_resources(original, jar, classes)
+                jline_verification["official_resolved_aggregate_sha256"] = hashlib.sha256(original_path.read_bytes()).hexdigest()
             require("META-INF/LICENSE.txt" in jar.namelist() and "META-INF/NOTICE.txt" in jar.namelist(),
                     f"upstream license/notice missing: {module}")
         artifacts.append({"upstream": f"org.apache.hadoop:{module}:{UPSTREAM_VERSION}",
@@ -361,6 +390,8 @@ def verify(source_root: Path, output: Path) -> dict:
         "profile_selection_note": "WebSocket transport is an upstream compile dependency, not optional=true. Omitting that complete artifact is a D2C local capability choice; no upstream Java class or JAR metadata is edited.",
         "sources": sources, "patched_recipe_sha256": recipes, "artifacts": artifacts,
         "artifact_identity": identities,
+        "jline_source_time_resource_adapter": adapter,
+        "jline_typed_resource_verification": jline_verification,
         "tools": {"maven": maven_version, "maven-shade-plugin": "3.6.1", "maven-dependency-plugin": "3.8.1",
                   "maven_version_report_sha256": hashlib.sha256(version_report).hexdigest()},
         "verified_dependency_versions": DEPENDENCY_VERSIONS, "resolved_graphs": graphs,

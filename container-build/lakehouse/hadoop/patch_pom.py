@@ -1,6 +1,7 @@
 """Select the local-only module graph in Hadoop's unmodified shade recipes."""
 
 import argparse
+import copy
 import hashlib
 from pathlib import Path
 import re
@@ -9,6 +10,39 @@ import xml.etree.ElementTree as ET
 from runtime_profile import EXCLUDED_ARTIFACTS, MODULES, SOURCE_INPUTS, UPSTREAM_VERSION, VARIANT_VERSION
 
 NS = {"m": "http://maven.apache.org/POM/4.0.0"}
+TRANSFORMER_CLASS = "d2c.shade.hadoop.JlineProviderResourceTransformer"
+TRANSFORMER_GAV = ("io.github.masondev1024.d2c", "hadoop-jline-resource-transformer", "1.0.0")
+
+
+def upstream_profiles(result: ET.Element, module: str) -> bytes:
+    """Remove only our exact build-plugin extension before comparing upstream."""
+    profiles = copy.deepcopy(result.find("m:profiles", NS))
+    if module == "hadoop-client-runtime":
+        plugins = [p for p in profiles.findall("m:profile/m:build/m:plugins/m:plugin", NS)
+                   if text(p, "m:artifactId") == "maven-shade-plugin"]
+        if len(plugins) != 1:
+            raise ValueError("expected one upstream runtime shade plugin")
+        plugin = plugins[0]
+        dependencies = plugin.find("m:dependencies", NS)
+        if dependencies is None or len(dependencies) != 1:
+            raise ValueError("expected exactly our build-only plugin dependency")
+        dependency = dependencies[0]
+        if tuple(text(dependency, "m:" + key) for key in ("groupId", "artifactId", "version")) != TRANSFORMER_GAV:
+            raise ValueError("incorrect build-only transformer coordinate")
+        plugin.remove(dependencies)
+        containers = plugin.findall(".//m:transformers", NS)
+        if len(containers) != 1 or not len(containers[0]):
+            raise ValueError("expected one upstream transformer list")
+        first = containers[0][0]
+        if first.attrib != {"implementation": TRANSFORMER_CLASS} or len(first):
+            raise ValueError("build-only JLine transformer must precede existing transformers")
+        containers[0].remove(first)
+    # XML indentation is not semantic. Ignore only formatting, not attributes/text.
+    for item in profiles.iter():
+        item.tail = None
+        if item.text is not None and not item.text.strip():
+            item.text = None
+    return ET.tostring(profiles)
 
 
 def text(element: ET.Element, path: str) -> str | None:
@@ -72,6 +106,17 @@ def patch_source(source: str, module: str) -> str:
         if patched.count(token) != 1:
             raise ValueError("expected one API dependency")
         patched = patched.replace(token, token + f"\n      <version>{VARIANT_VERSION}</version>", 1)
+        shade = "<artifactId>maven-shade-plugin</artifactId>"
+        if patched.count(shade) != 1 or patched.count("<transformers>") != 1:
+            raise ValueError("review the runtime shade extension points")
+        group, artifact, version = TRANSFORMER_GAV
+        extension = f"""
+            <dependencies>
+              <dependency><groupId>{group}</groupId><artifactId>{artifact}</artifactId><version>{version}</version></dependency>
+            </dependencies>"""
+        patched = patched.replace(shade, shade + extension, 1)
+        patched = patched.replace("<transformers>", "<transformers>\n"
+            + f'                    <transformer implementation="{TRANSFORMER_CLASS}"/>', 1)
     # Jackson's official 2.21.7 release uses annotations 2.21, not 2.21.7.
     management = """  <dependencyManagement>
     <dependencies>
@@ -83,12 +128,12 @@ def patch_source(source: str, module: str) -> str:
     </dependencies>
   </dependencyManagement>
 """
-    if patched.count("  <dependencies>") != 1:
+    if len(re.findall(r"(?m)^  <dependencies>", patched)) != 1:
         raise ValueError("expected one top-level dependency list")
-    patched = patched.replace("  <dependencies>", management + "  <dependencies>", 1)
+    patched = re.sub(r"(?m)^  <dependencies>", management + "  <dependencies>", patched, count=1)
     result = ET.fromstring(patched)
     # Includes every original filter, relocation and service transformer.
-    if ET.tostring(original.find("m:profiles", NS)) != ET.tostring(result.find("m:profiles", NS)):
+    if upstream_profiles(original, "hadoop-client-api") != upstream_profiles(result, module):
         raise ValueError("upstream shade profiles changed")
     return patched
 

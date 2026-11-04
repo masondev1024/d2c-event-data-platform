@@ -19,11 +19,16 @@ run_maven() {
     "$maven" --batch-mode --no-transfer-progress \
         -Dhadoop.version=3.5.0 \
         -Djackson2.version=2.21.7 -Djackson2.databind.version=2.21.7 \
-        -Djline.version=3.30.15 \
+        -Djline.version=3.30.17 \
         -Dmaven-shade-plugin.version=3.6.1 \
         -Dproject.build.outputTimestamp=2026-11-04T00:00:00Z \
         -DskipTests -Dmaven.javadoc.skip=true -Dcheckstyle.skip=true "$@"
 }
+
+# This small authored plugin extension is compiled before Maven shading, never
+# added to a runtime dependency graph and never used to rewrite a finished JAR.
+python3 "$helper_dir/build-jline-transformer.py" --maven "$maven" \
+    --work "$source_root/jline-transformer-build" --output "$output_dir"
 
 # Install the selected API variant first so runtime resolves exactly that API.
 # Neither command modifies an upstream JAR; Maven assembles both from modules.

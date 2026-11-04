@@ -28,6 +28,7 @@ try:
     recipe = load_helper("patch_pom")
     verification = load_helper("verify_bundle")
     profile = load_helper("runtime_profile")
+    jline = load_helper("jline_resources")
 finally:
     sys.path.remove(str(HELPERS))
 
@@ -76,8 +77,8 @@ class HadoopLocalSourceRecipeTest(unittest.TestCase):
                 result = recipe.ET.fromstring(recipe.patch_source(source, name))
                 self.assertEqual(recipe.text(result, "m:version"), "3.5.0-d2c-local1")
                 self.assertEqual(recipe.text(result, "m:parent/m:version"), "3.5.0")
-                self.assertEqual(recipe.ET.tostring(old.find("m:profiles", recipe.NS)),
-                                 recipe.ET.tostring(result.find("m:profiles", recipe.NS)))
+                self.assertEqual(recipe.upstream_profiles(old, "hadoop-client-api"),
+                                 recipe.upstream_profiles(result, name))
                 aggregator = result.find("m:dependencies/m:dependency", recipe.NS)
                 self.assertEqual(recipe.text(aggregator, "m:version"), "3.5.0")
                 excluded = {(recipe.text(node, "m:groupId"), recipe.text(node, "m:artifactId"))
@@ -94,6 +95,15 @@ class HadoopLocalSourceRecipeTest(unittest.TestCase):
                 if name == "hadoop-client-runtime":
                     api = dependencies["hadoop-client-api"]
                     self.assertEqual(recipe.text(api, "m:version"), "3.5.0-d2c-local1")
+                    plugin = result.find("m:profiles/m:profile/m:build/m:plugins/m:plugin", recipe.NS)
+                    extension = plugin.find("m:dependencies/m:dependency", recipe.NS)
+                    self.assertEqual(tuple(recipe.text(extension, "m:" + key) for key in ("groupId", "artifactId", "version")),
+                                     recipe.TRANSFORMER_GAV)
+                    self.assertNotIn(recipe.TRANSFORMER_GAV[1], dependencies)
+                    transformers = plugin.find("m:configuration/m:transformers", recipe.NS)
+                    self.assertEqual(transformers[0].attrib["implementation"], recipe.TRANSFORMER_CLASS)
+                    self.assertEqual(transformers[1].attrib["implementation"],
+                                     "org.apache.maven.plugins.shade.resource.ServicesResourceTransformer")
 
     def test_unknown_upstream_or_sourceful_module_requires_review(self) -> None:
         source = source_fixture("hadoop-client-api")
@@ -114,6 +124,7 @@ class HadoopLocalSourceRecipeTest(unittest.TestCase):
         for node in (dependency("hadoop-mapreduce-client-jobclient"),
                      dependency("websocket-client", "9.4.58.v20250814", "org.eclipse.jetty.websocket"),
                      dependency("jetty-http", "9.4.58.v20250814", "org.eclipse.jetty"),
+                     dependency("jline", "3.30.15", "org.jline"),
                      dependency("jline", "3.9.0", "org.jline")):
             with self.subTest(artifact=node["artifactId"]):
                 graph = graph_fixture("hadoop-client-api")
@@ -323,11 +334,94 @@ class HadoopAssemblyIdentityTest(unittest.TestCase):
             if changed == "duplicate":
                 modified.append((name, entries[name]))
             else:
-                modified = [(key, value.replace(b"version=3.30.15", b"version=3.9.0") if key == name else value)
+                modified = [(key, value.replace(b"version=3.30.17", b"version=3.9.0") if key == name else value)
                             for key, value in modified]
             with self.subTest(changed=changed), ZipFile(io.BytesIO(self.archive(modified))) as archive:
                 with self.assertRaises(ValueError):
                     verification.validate_retained_dependency_metadata(archive)
+
+
+class JlineTypedResourceTest(unittest.TestCase):
+    """Small descriptor fixtures, not executable library or scan artifacts."""
+
+    def inputs(self):
+        return {path: (HELPERS / "fixtures/jline-3.30.17" / path.rsplit("/", 1)[-1]).read_bytes()
+                for path in jline.PROVIDERS}
+
+    def archive(self, entries):
+        return HadoopAssemblyIdentityTest().archive(entries)
+
+    def fixture(self):
+        resources = self.inputs()
+        original = list(resources.items()) + [(name.replace(".", "/") + ".class", b"fixture")
+                                             for name, _ in jline.PROVIDERS.values()]
+        generated = [(path, jline.expected_resource(path, content)) for path, content in resources.items()]
+        classes = {(jline.SHADED_PREFIX + name).replace(".", "/") for name, _ in jline.PROVIDERS.values()}
+        return original, generated, classes
+
+    def check(self, original, generated, classes):
+        with ZipFile(io.BytesIO(self.archive(original))) as source, ZipFile(io.BytesIO(self.archive(generated))) as output:
+            return jline.validate_jline_resources(source, output, classes)
+
+    def test_six_exact_official_descriptors_preserve_comments_and_relocate_only_class_token(self):
+        original, generated, classes = self.fixture()
+        report = self.check(original, generated, classes)
+        self.assertEqual(report["version"], "3.30.17")
+        self.assertEqual(len(report["provider_resources"]), 6)
+        self.assertEqual(report["loader_source_sha256"], jline.LOADER_SHA256)
+        for path, content in self.inputs().items():
+            transformed = dict(generated)[path]
+            self.assertEqual(transformed.replace(jline.SHADED_PREFIX.encode(), b""), content)
+            self.assertIn(b"Licensed", content)
+
+    def test_custom_legacy_properties_are_not_java_spi_classnames(self):
+        self.assertEqual(jline.resource_kind(jline.LEGACY_PREFIX + "jna"), "jline-legacy-properties")
+        self.assertEqual(jline.resource_kind("META-INF/services/java.lang.Runnable"), "java-spi")
+        for path in (jline.MODERN_PREFIX + "unknown", jline.LEGACY_PREFIX + "unknown",
+                     "META-INF/services/not/a/binary/name"):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                jline.resource_kind(path)
+        with self.assertRaisesRegex(ValueError, "malformed Java SPI"):
+            verification.service_providers(b"class = org.example.Provider\n")
+
+    def test_missing_active_provider_class_fails_without_optional_skip(self):
+        original, generated, classes = self.fixture()
+        classes.remove((jline.SHADED_PREFIX + jline.PROVIDERS[jline.MODERN_PREFIX + "dumb"][0]).replace(".", "/"))
+        with self.assertRaisesRegex(ValueError, "provider class missing"):
+            self.check(original, generated, classes)
+
+    def test_wrong_unshaded_escape_or_multiple_provider_values_fail(self):
+        original, generated, classes = self.fixture()
+        path = jline.MODERN_PREFIX + "dumb"
+        for content in (self.inputs()[path], dict(generated)[path].replace(b"org.apache.hadoop.shaded.", b"escape."),
+                        dict(generated)[path] + b"\norg.example.ExtraProvider\n"):
+            with self.subTest(content=content[-100:]), self.assertRaises(ValueError):
+                self.check(original, [(name, content if name == path else value) for name, value in generated], classes)
+        legacy = jline.LEGACY_PREFIX + "jna"
+        with self.assertRaisesRegex(ValueError, "legacy class property"):
+            jline.provider_token(legacy, b"implementation = org.example.Provider\n", shaded=True)
+
+    def test_duplicate_missing_unknown_or_modified_source_resource_fails(self):
+        original, generated, classes = self.fixture()
+        first = generated[0]
+        for changed in (generated + [first], generated[1:], generated + [(jline.MODERN_PREFIX + "unknown", b"bad")]):
+            with self.subTest(paths=[p for p, _ in changed]), self.assertRaisesRegex(ValueError, "missing, duplicate or unknown"):
+                self.check(original, changed, classes)
+        changed = [(name, content + b"# changed\n" if name in jline.PROVIDERS else content) for name, content in original]
+        with self.assertRaisesRegex(ValueError, "differs from pinned source"):
+            self.check(changed, generated, classes)
+
+    def test_legacy_class_presence_must_match_exact_official_baseline(self):
+        original, generated, classes = self.fixture()
+        path = jline.LEGACY_PREFIX + "jna"
+        name = jline.PROVIDERS[path][0]
+        classes.remove((jline.SHADED_PREFIX + name).replace(".", "/"))
+        with self.assertRaisesRegex(ValueError, "provider class missing"):
+            self.check(original, generated, classes)
+        original = [(p, content) for p, content in original if p != name.replace(".", "/") + ".class"]
+        report = self.check(original, generated, classes)
+        self.assertFalse(report["provider_resources"][path]["class_present"])
+        self.assertIn("not read", report["provider_resources"][path]["loader_status"])
 
 
 if __name__ == "__main__":

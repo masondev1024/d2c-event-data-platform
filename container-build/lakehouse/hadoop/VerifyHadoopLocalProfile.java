@@ -77,6 +77,27 @@ public class VerifyHadoopLocalProfile {
     System.out.println("master_local_principal=PASS;interactive_websocket_transport=NOT_INVOKED");
   }
 
+  private static void verifyShadedJlineDumbProvider() throws Exception {
+    // The official 3.30.17 load(String) uses META-INF/jline/providers/<name>
+    // and ClassLoader.loadClass on the descriptor value. Exercise reflection
+    // through that actual loader, rather than merely finding a provider class.
+    Class<?> spi = Class.forName("org.apache.hadoop.shaded.org.jline.terminal.spi.TerminalProvider");
+    requireOrigin(spi, "hadoop-client-runtime-3.5.0-d2c-local1.jar");
+    Thread thread = Thread.currentThread();
+    ClassLoader previous = thread.getContextClassLoader();
+    try {
+      thread.setContextClassLoader(spi.getClassLoader());
+      Object provider = spi.getMethod("load", String.class).invoke(null, "dumb");
+      require(provider.getClass().getName().equals(
+          "org.apache.hadoop.shaded.org.jline.terminal.impl.DumbTerminalProvider"),
+          "Shaded JLine descriptor did not instantiate the actual dumb provider");
+      requireOrigin(provider.getClass(), "hadoop-client-runtime-3.5.0-d2c-local1.jar");
+    } finally {
+      thread.setContextClassLoader(previous);
+    }
+    System.out.println("jline_shaded_dumb_provider_loader=PASS;native_and_FFM_backends=NOT_INVOKED");
+  }
+
   public static void main(String[] args) throws Exception {
     requireOrigin(Configuration.class, "hadoop-client-api-3.5.0-d2c-local1.jar");
     Class<?> jackson = Class.forName("org.apache.hadoop.shaded.com.fasterxml.jackson.databind.ObjectMapper");
@@ -105,6 +126,7 @@ public class VerifyHadoopLocalProfile {
     instantiateServices(TokenIdentifier.class);
     instantiateServices(TokenRenewer.class);
     verifyLocalMaster();
+    verifyShadedJlineDumbProvider();
 
     Configuration conf = new Configuration();
     conf.set("fs.defaultFS", "file:///");

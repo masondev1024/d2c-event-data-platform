@@ -51,9 +51,9 @@ DEPENDENCY_VERSIONS = {
     "com.fasterxml.jackson.core/jackson-core": "2.21.7",
     "com.fasterxml.jackson.core/jackson-databind": "2.21.7",
     "com.fasterxml.jackson.core/jackson-annotations": "2.21",
-    "org.jline/jline": "3.30.15",
-    "org.jline/jline-builtins": "3.30.15",
-    "org.jline/jline-remote-telnet": "3.30.15",
+    "org.jline/jline": "3.30.17",
+    "org.jline/jline-builtins": "3.30.17",
+    "org.jline/jline-remote-telnet": "3.30.17",
 }
 SOURCE_REVIEWS = {
     "org/apache/hadoop/mapred/Master": {
