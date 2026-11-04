@@ -50,6 +50,41 @@ def relocate_structure(value):
     return value
 
 
+def relocated_class_api(content: bytes) -> dict:
+    """Keep ClassReader's member ordering canonical after descriptor relocation."""
+    result = relocate_structure(structural_class_api(content))
+    # ClassReader sorts (name, descriptor). Package mapping can change that
+    # order: Absent.or(com...Optional) sorts before or(java...Object), but
+    # or(org...Optional) sorts after it. Retain every complete member record,
+    # and apply exactly the same key as the parser of the shaded class bytes.
+    for name in ("fields", "methods"):
+        result[name].sort(key=lambda member: (member[0], member[1]))
+    return result
+
+
+def structural_difference(expected: dict, actual: dict) -> str:
+    """Report a few public class-structure differences, never dump a JAR."""
+    pending = [("$", expected, actual)]
+    details = []
+    missing = object()
+    while pending and len(details) < 4:
+        path, before, after = pending.pop()
+        if before == after:
+            continue
+        if isinstance(before, dict) and isinstance(after, dict):
+            pending.extend((f"{path}.{key}", before.get(key, missing), after.get(key, missing))
+                           for key in sorted(before.keys() | after.keys(), reverse=True))
+        elif isinstance(before, list) and isinstance(after, list):
+            if len(before) != len(after):
+                details.append(f"{path}.length expected={len(before)} actual={len(after)}")
+            pending.extend((f"{path}[{index}]", before[index], after[index])
+                           for index in reversed(range(min(len(before), len(after)))))
+        else:
+            render = lambda value: "<missing>" if value is missing else repr(value)[:180]
+            details.append(f"{path} expected={render(before)} actual={render(after)}")
+    return "; ".join(details)[:1600]
+
+
 def verify_resolved_guava(rebuilt: Path, guava: Path, failureaccess: Path,
                           guava_version: str, failureaccess_version: str) -> dict:
     """Bind real shaded classes to the exact dependency JARs Maven resolved.
@@ -85,7 +120,7 @@ def verify_resolved_guava(rebuilt: Path, guava: Path, failureaccess: Path,
                         raise ValueError(f"Overlapping resolved Guava classes: {target}")
                     raw = dependency.read(name)
                     class_hashes[name] = sha256(raw).hexdigest()
-                    expected_classes[target] = relocate_structure(structural_class_api(raw))
+                    expected_classes[target] = relocated_class_api(raw)
                 if not class_hashes:
                     raise ValueError(f"Resolved {artifact} JAR has no Guava implementation classes")
                 # Canonical sorted input names+hashes bind the complete inventory
@@ -101,8 +136,11 @@ def verify_resolved_guava(rebuilt: Path, guava: Path, failureaccess: Path,
         if actual_classes != expected_classes.keys():
             raise ValueError(f"Resolved Guava class inventory mismatch: missing={sorted(expected_classes.keys()-actual_classes)[:10]}, added={sorted(actual_classes-expected_classes.keys())[:10]}")
         for name, expected in sorted(expected_classes.items()):
-            if structural_class_api(new.read(name)) != expected:
-                raise ValueError(f"Resolved Guava relocated class structural mismatch: {name}")
+            actual = structural_class_api(new.read(name))
+            if actual != expected:
+                sections = sorted(key for key in expected if expected[key] != actual.get(key))
+                raise ValueError(f"Resolved Guava relocated class structural mismatch: {name}; sections={sections}; "
+                                 + structural_difference(expected, actual))
     return {
         "resolved_dependencies": evidence,
         "relocated_implementation_classes_verified": len(expected_classes),

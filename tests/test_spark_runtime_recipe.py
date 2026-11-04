@@ -65,6 +65,31 @@ def class_file(name: str, descriptor: str = "()I", constant: int = 42, major: in
     return header + body
 
 
+def class_members_fixture(name: str, fields=(), methods=()) -> bytes:
+    """Construct class-file bytes with real member descriptors, without a JVM."""
+    pool = []
+
+    def utf8(text):
+        raw = text.encode()
+        pool.append(b"\x01" + struct.pack(">H", len(raw)) + raw)
+        return len(pool)
+
+    def reference(index):
+        pool.append(b"\x07" + struct.pack(">H", index))
+        return len(pool)
+
+    this = reference(utf8(name))
+    superclass = reference(utf8("java/lang/Object"))
+    groups = []
+    for members in (fields, methods):
+        entries = [(access, utf8(member), utf8(descriptor)) for member, descriptor, access in members]
+        groups.append(struct.pack(">H", len(entries)) + b"".join(
+            struct.pack(">HHHH", access, member, descriptor, 0) for access, member, descriptor in entries))
+    header = struct.pack(">IHHH", 0xCAFEBABE, 0, 61, len(pool) + 1) + b"".join(pool)
+    # Public abstract interface, no interfaces or class attributes.
+    return header + struct.pack(">HHHH", 0x0601, this, superclass, 0) + b"".join(groups) + b"\x00\x00"
+
+
 def jar_fixture(path: Path, *, jetty_version="12.1.14", spark_version="4.2.1", descriptor="()I", constant=42, major=61):
     with zipfile.ZipFile(path, "w") as jar:
         jar.writestr(verify.SPARK_PROPERTIES, f"groupId=org.apache.spark\nartifactId=spark-core_2.13\nversion={spark_version}\n")
@@ -650,6 +675,55 @@ class SparkNetworkRuntimeRecipeTests(unittest.TestCase):
         changed = self.rewrite_rebuilt(replace={name: "<project>Changed coordinates only</project>"})
         with self.assertRaisesRegex(ValueError, "metadata was not retained byte-for-byte"):
             self.verify_resolved(changed)
+
+    def test_relocated_overloads_are_canonicalized_after_package_mapping(self):
+        # These are Absent.or's three erased descriptor forms in Guava33.7.2.
+        # com < java before shading, while java < org after shading. ClassReader
+        # independently sorts the bytecode members on both sides of the check.
+        methods = [("or", "(Ljava/lang/Object;)Ljava/lang/Object;", 0x0401),
+                   ("or", "(Lcom/google/common/base/Optional;)Lcom/google/common/base/Optional;", 0x0401),
+                   ("or", "(Lcom/google/common/base/Supplier;)Ljava/lang/Object;", 0x0401)]
+        fields = [("VALUE", "Ljava/lang/Object;", 0x0019),
+                  ("VALUE", "Lcom/google/common/base/Optional;", 0x0019)]
+        original_name = "com/google/common/base/Absent"
+        target_name = "org/sparkproject/guava/base/Absent"
+        # Build independent original/relocated class-file bytes; no verifier
+        # mapping helper generates the expected rebuilt test payload.
+        mapped = lambda members: [(name, descriptor.replace("com/google/common/", "org/sparkproject/guava/"), access)
+                                  for name, descriptor, access in members]
+        original = class_members_fixture(original_name, fields, methods)
+        rebuilt = class_members_fixture(target_name, mapped(fields), mapped(methods))
+        source_api, actual_api = verify.structural_class_api(original), verify.structural_class_api(rebuilt)
+        self.assertNotEqual([item[1] for item in source_api["methods"]], [item[1] for item in actual_api["methods"]])
+        inputs = self.resolved_inputs()
+        with zipfile.ZipFile(inputs["guava"], "a") as jar:
+            jar.writestr(original_name + ".class", original)
+        changed = self.rewrite_rebuilt(add={target_name + ".class": rebuilt})
+        self.assertEqual(self.verify_resolved(changed, inputs)["relocated_implementation_classes_verified"], 5)
+        for label, changed_fields, changed_methods in (
+                ("missing-overload", mapped(fields), mapped(methods)[:-1]),
+                ("changed-type", mapped(fields), [("or", "(Ljava/lang/Object;)Ljava/lang/String;", 0x0401)] + mapped(methods)[1:]),
+                ("changed-access", mapped(fields), [("or", mapped(methods)[0][1], 0x0404)] + mapped(methods)[1:]),
+                ("missing-field", mapped(fields)[:-1], mapped(methods)),
+                ("changed-field-type", [("VALUE", "Ljava/lang/String;", 0x0019)] + mapped(fields)[1:], mapped(methods))):
+            with self.subTest(label=label):
+                broken = class_members_fixture(target_name, changed_fields, changed_methods)
+                changed = self.rewrite_rebuilt(add={target_name + ".class": broken})
+                with self.assertRaisesRegex(ValueError, "relocated class structural mismatch"):
+                    self.verify_resolved(changed, inputs)
+
+    def test_structural_failure_diagnostics_show_bounded_actual_differences(self):
+        expected = {"methods": [["or", "(Ljava/lang/Object;)Ljava/lang/Object;", 1, {}]], "access": 1}
+        actual = {"methods": [["or", "(Ljava/lang/Object;)Ljava/lang/String;", 4, {}]], "access": 1}
+        details = network_verify.structural_difference(expected, actual)
+        self.assertIn("$.methods[0][1]", details)
+        self.assertIn("Ljava/lang/String;", details)
+        self.assertIn("$.methods[0][2] expected=1 actual=4", details)
+        self.assertEqual(network_verify.structural_difference(expected, copy.deepcopy(expected)), "")
+        details = network_verify.structural_difference({"methods": ["x" * 10000] * 500}, {"methods": ["y" * 10000] * 499})
+        self.assertIn("$.methods.length expected=500 actual=499", details)
+        self.assertLessEqual(len(details), 1600)
+        self.assertLessEqual(len(details.split("; ")), 4)
 
     def test_resolved_inputs_reject_stale_artifacts_and_duplicate_entries(self):
         inputs = self.resolved_inputs()
