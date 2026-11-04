@@ -773,7 +773,8 @@ class CuratorTypedReferenceTest(unittest.TestCase):
     """Actual JVM descriptor contexts must not be parsed as free-form FQNs."""
 
     def class_file(self, descriptor="()V", signature=None, literals=(), class_refs=(),
-                   name_and_type=None, method_type=None):
+                   name_and_type=None, method_type=None, annotations=(),
+                   annotation_attribute="RuntimeInvisibleAnnotations"):
         pool, strings = [], {}
 
         def utf(value):
@@ -799,10 +800,24 @@ class CuratorTypedReferenceTest(unittest.TestCase):
             pool.append(b"\x0c" + struct.pack(">HH", *indexes))
         if method_type:
             ref(16, utf(method_type))
-        attributes = b"\x00\x00"
+        attributes = []
         if signature is not None:
             name, index = utf("Signature"), utf(signature)
-            attributes = struct.pack(">HHIH", 1, name, 2, index)
+            attributes.append(struct.pack(">HIH", name, 2, index))
+        if annotations:
+            attribute_name = utf(annotation_attribute)
+            annotation_type = utf("Lorg/apache/curator/shaded/com/google/errorprone/annotations/RestrictedApi;")
+            annotation = struct.pack(">HHH", 1, annotation_type, len(annotations))
+            for tag, value, element in annotations:
+                annotation += struct.pack(">HB", utf(element), ord(tag))
+                if tag in ("s", "c"):
+                    annotation += struct.pack(">H", utf(value))
+                elif tag == "e":
+                    annotation += struct.pack(">HH", utf(value[0]), utf(value[1]))
+                else:
+                    raise ValueError("unsupported annotation fixture tag")
+            attributes.append(struct.pack(">HI", attribute_name, len(annotation)) + annotation)
+        attributes = struct.pack(">H", len(attributes)) + b"".join(attributes)
         header = struct.pack(">IHHH", 0xcafebabe, 0, 52, len(pool) + 1) + b"".join(pool)
         body = struct.pack(">HHHHHHHHH", 0x0601, owner, superclass, 0, 0, 1,
                            0x0401, method_name, method_descriptor) + attributes + b"\x00\x00"
@@ -852,6 +867,40 @@ class CuratorTypedReferenceTest(unittest.TestCase):
         for value in ("(I", "([V)V", "(Lmissing)V", "()VI", "L;", "(I)Jtrailing"):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 curator._descriptor_references(value)
+
+    def test_actual_restricted_api_documentary_values_are_preserved_and_reported(self):
+        explanation = "PatternCompiler is an implementation detail of com.google.common.base"
+        source_regex = ".*/com/google/common/base/.*"
+        annotations = (("s", explanation, "explanation"), ("s", source_regex, "allowedOnPath"))
+        content = self.class_file(annotations=annotations)
+        mentions = {}
+        before = hashlib.sha256(content).hexdigest()
+        self.assertEqual(curator._validate_fixed_guava_references(
+            "PatternCompiler.class", content, set(), class_file=True, metadata_mentions=mentions), [])
+        self.assertEqual({item["value"] for item in mentions.values()}, {explanation, source_regex})
+        self.assertEqual(hashlib.sha256(content).hexdigest(), before)
+        for location, item in mentions.items():
+            self.assertIn("#utf8[", location)
+            self.assertEqual(item["utf8_sha256"], hashlib.sha256(item["value"].encode()).hexdigest())
+            self.assertEqual(item["contexts"][0]["attribute"], "RuntimeInvisibleAnnotations")
+            self.assertGreater(item["contexts"][0]["class_byte_offset"], 0)
+        for value in (explanation, source_regex):
+            with self.subTest(shared_executable=value), self.assertRaises(ValueError):
+                self.check(annotations=annotations, literals=(value,))
+        with self.assertRaises(ValueError):
+            self.check(annotations=annotations, annotation_attribute="RuntimeVisibleAnnotations")
+
+    def test_annotation_class_and_enum_values_keep_namespace_and_closure_checks(self):
+        fixed = curator.FIXED_GUAVA_PREFIX + "common/base/CharMatcher"
+        for attribute in ("RuntimeInvisibleAnnotations", "RuntimeVisibleAnnotations"):
+            self.assertEqual(self.check(annotations=(("c", "L" + fixed + ";", "type"),),
+                                        annotation_attribute=attribute), [fixed])
+            self.assertEqual(self.check(annotations=(("c", "V", "type"),), annotation_attribute=attribute), [])
+            for target in ("com/google/common/base/CharMatcher", "foreign/" + fixed,
+                           fixed.replace("CharMatcher", "Missing")):
+                for tag, value in (("c", "[L" + target + ";"), ("e", ("L" + target + ";", "VALUE"))):
+                    with self.subTest(attribute=attribute, target=target, tag=tag), self.assertRaises(ValueError):
+                        self.check(annotations=((tag, value, "type"),), annotation_attribute=attribute)
 
 
 class JlineTypedResourceTest(unittest.TestCase):

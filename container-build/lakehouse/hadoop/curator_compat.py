@@ -75,6 +75,8 @@ class ClassReader:
         self.pool = [None]
         self.descriptor_indices = set()
         self.signature_indices = set()
+        self.annotation_class_indices = set()
+        self.annotation_string_contexts = {}
 
     def read(self, size: int) -> bytes:
         value = self.stream.read(size)
@@ -137,11 +139,73 @@ class ClassReader:
                 self.pool.append(None)
         require(len(self.pool) == count, "invalid wide Curator constant-pool slot")
 
-    def attributes(self) -> dict:
+    def annotation_attribute(self, raw: bytes, attribute: str, context: str, offset: int) -> None:
+        stream = io.BytesIO(raw)
+
+        def read(size):
+            value = stream.read(size)
+            require(len(value) == size, "truncated JVM annotation attribute")
+            return value
+
+        def u1():
+            return read(1)[0]
+
+        def u2():
+            return struct.unpack(">H", read(2))[0]
+
+        def annotation(path):
+            type_index = u2()
+            self.descriptor_indices.add(type_index)
+            annotation_type = self.utf8(type_index)
+            for _ in range(u2()):
+                element = self.utf8(u2())
+                element_value(path + "/" + annotation_type + "/" + element)
+
+        def element_value(path):
+            tag = chr(u1())
+            if tag == "s":
+                position = offset + stream.tell()
+                index = u2()
+                self.utf8(index)  # Annotation strings reference UTF8, not CONSTANT_String.
+                self.annotation_string_contexts.setdefault(index, []).append({
+                    "attribute": attribute, "location": context, "element": path,
+                    "class_byte_offset": position})
+            elif tag in "BCDFIJSZ":
+                u2()
+            elif tag == "e":
+                self.descriptor_indices.add(u2())
+                u2()
+            elif tag == "c":
+                index = u2()
+                self.descriptor_indices.add(index)
+                self.annotation_class_indices.add(index)
+            elif tag == "@":
+                annotation(path + "/nested")
+            elif tag == "[":
+                for index in range(u2()):
+                    element_value(path + f"/[{index}]")
+            else:
+                raise ValueError(f"invalid JVM annotation element tag: {tag}")
+
+        if attribute.endswith("ParameterAnnotations"):
+            for parameter in range(u1()):
+                for _ in range(u2()):
+                    annotation(f"parameter[{parameter}]")
+        elif attribute == "AnnotationDefault":
+            element_value("default")
+        else:
+            for index in range(u2()):
+                annotation(f"annotation[{index}]")
+        require(not stream.read(1), "trailing JVM annotation attribute bytes")
+
+    def attributes(self, context: str = "class") -> dict:
         result = {}
         for _ in range(self.u2()):
             name = self.utf8(self.u2())
             raw = self.read(self.u4())
+            if name in ("RuntimeVisibleAnnotations", "RuntimeInvisibleAnnotations",
+                        "RuntimeVisibleParameterAnnotations", "RuntimeInvisibleParameterAnnotations", "AnnotationDefault"):
+                self.annotation_attribute(raw, name, context, self.stream.tell() - len(raw))
             if name in ("Signature", "ConstantValue", "Exceptions", "InnerClasses"):
                 require(name not in result, f"duplicate Curator structural attribute: {name}")
             if name in ("Signature", "ConstantValue"):
@@ -176,7 +240,7 @@ class ClassReader:
             descriptor_index = self.u2()
             self.descriptor_indices.add(descriptor_index)
             descriptor = self.utf8(descriptor_index)
-            attributes = self.attributes()
+            attributes = self.attributes(context=f"member:{name}{descriptor}")
             require("InnerClasses" not in attributes, "InnerClasses attribute on Curator member")
             if access & PUBLIC_OR_PROTECTED:
                 result.append([name, descriptor, access, attributes])
@@ -483,15 +547,17 @@ def _descriptor_references(value: str) -> set[str]:
     return refs
 
 
-def _validate_fixed_guava_references(name: str, content: bytes, available: set[str], *, class_file: bool) -> list[str]:
+def _validate_fixed_guava_references(name: str, content: bytes, available: set[str], *, class_file: bool,
+                                     metadata_mentions: dict | None = None) -> list[str]:
     """Require original Curator relocation and closure for Guava implementation references."""
-    values, symbolic, typed_values = [], set(), set()
+    values, symbolic, typed_values, documentary_values = [], set(), set(), set()
     if class_file:
         reader = ClassReader(content)
         require(reader.u4() == 0xCAFEBABE, f"invalid rebuilt class header: {name}")
         reader.u2(), reader.u2()
         reader.read_pool()
         values = [reader.utf8(i) for i, value in enumerate(reader.pool) if value is not None and value[0] == 1]
+        literal_values = {reader.utf8(value[1]) for value in reader.pool if value is not None and value[0] == 8}
         descriptor_indices = {value[2] for value in reader.pool if value is not None and value[0] == 12}
         descriptor_indices.update(value[1] for value in reader.pool if value is not None and value[0] == 16)
         for i, value in enumerate(reader.pool):
@@ -511,11 +577,31 @@ def _validate_fixed_guava_references(name: str, content: bytes, available: set[s
         descriptor_indices.update(reader.descriptor_indices)
         for index in descriptor_indices:
             descriptor = reader.utf8(index)
-            symbolic.update(_descriptor_references(descriptor))
+            if descriptor != "V" or index not in reader.annotation_class_indices:
+                symbolic.update(_descriptor_references(descriptor))
             typed_values.add(descriptor)
         typed_values.update(reader.utf8(index) for index in reader.signature_indices)
+        visible_values = {reader.utf8(index) for index, contexts in reader.annotation_string_contexts.items()
+                          if any(not item["attribute"].startswith("RuntimeInvisible") for item in contexts)}
+        actual_class_values = {reader.class_name(index) for index, item in enumerate(reader.pool)
+                               if item is not None and item[0] == 7}
+        for index, contexts in reader.annotation_string_contexts.items():
+            value = reader.utf8(index)
+            # CLASS-retention annotation explanations/source regexes are not
+            # runtime String constants or class-valued elements. A shared
+            # executable/visible context always takes precedence over this one.
+            if (all(item["attribute"].startswith("RuntimeInvisible") for item in contexts)
+                    and value not in literal_values | typed_values | visible_values | actual_class_values):
+                documentary_values.add(value)
+                if metadata_mentions is not None and any(token in value for token in (
+                        "com/google/common", "com/google/thirdparty", "com.google.common", "com.google.thirdparty")):
+                    metadata_mentions[f"{name}#utf8[{index}]"] = {
+                        "kind": "CLASS-retention annotation string; preserved non-runtime metadata",
+                        "value": value, "utf8_sha256": hashlib.sha256(reader.item(index, (1,))[1]).hexdigest(),
+                        "contexts": contexts}
         for value in values:
-            symbolic.update(re.findall(r"L([A-Za-z_$][\w$/]*)[;<]", value))
+            if value not in documentary_values:
+                symbolic.update(re.findall(r"L([A-Za-z_$][\w$/]*)[;<]", value))
     else:
         values = [content.decode("utf-8", errors="surrogateescape")]
         for line in values[0].splitlines():
@@ -524,10 +610,12 @@ def _validate_fixed_guava_references(name: str, content: bytes, available: set[s
                 symbolic.add(provider.replace(".", "/"))
     references = set()
     for value in values:
+        if value in documentary_values:
+            continue
         remaining = value.replace(FIXED_GUAVA_PREFIX, "").replace(FIXED_GUAVA_PREFIX.replace("/", "."), "")
         require(not any(token in remaining for token in ("com/google/common", "com/google/thirdparty",
                                                         "com.google.common", "com.google.thirdparty")),
-                f"unexpected unrelocated Guava namespace: {name}")
+                f"unexpected unrelocated Guava namespace: {name}: {value[:180]!r}")
         if value in typed_values:
             # Descriptor classes above and signature L... classes below still
             # undergo the same namespace AND available-class closure checks.
@@ -595,10 +683,12 @@ def verify_curator_shaded_module(rebuilt_path: Path, osgi_path: Path, baseline_p
             target = f"META-INF/d2c-upstream/{library['artifact']}/META-INF/MANIFEST.MF.original"
             require(target in ref_names and hashlib.sha256(reference.read(target)).hexdigest() == library["original_manifest_sha256"],
                     f"fixed Guava reference original manifest changed/missing: {target}")
+        nonruntime_metadata_mentions = {}
         for entry in sorted(ref_classes):
             require(structural_class_api(reference.read(entry))["name"] == _class_binary_name(entry),
                     f"fixed Guava reference class identity mismatch: {entry}")
-            _validate_fixed_guava_references(entry, reference.read(entry), available, class_file=True)
+            _validate_fixed_guava_references(entry, reference.read(entry), available, class_file=True,
+                                             metadata_mentions=nonruntime_metadata_mentions)
         for library in inputs:
             for entry, digest in library["jpms_module_descriptor_sha256"].items():
                 backup = f"META-INF/d2c-upstream/{library['artifact']}/{entry}.original"
@@ -680,7 +770,8 @@ def verify_curator_shaded_module(rebuilt_path: Path, osgi_path: Path, baseline_p
         for entry in sorted(names):
             if entry.endswith(".class") and not descriptor(entry) or entry.startswith("META-INF/services/") and not entry.endswith("/"):
                 targets = _validate_fixed_guava_references(entry, rebuilt.read(entry), available,
-                                                           class_file=entry.endswith(".class"))
+                                                           class_file=entry.endswith(".class"),
+                                                           metadata_mentions=nonruntime_metadata_mentions)
                 if targets:
                     refs[entry] = targets
         api = _compare_rebuilt_curator_api(rebuilt, names, baseline, baseline_names)
@@ -716,5 +807,6 @@ def verify_curator_shaded_module(rebuilt_path: Path, osgi_path: Path, baseline_p
                 "fixed_guava_symbolic_reference_closure": ref_summary,
                 "inventory_digest_format": "SHA-256 of UTF-8 JSON with sort_keys=True, separators=(',', ':'), ensure_ascii=True; every implementation and symbolic reference is checked before output is summarized",
                 "normal_shade_retained_versioned_jpms_descriptor_sha256": descriptor_hashes if module == "curator-client" else {},
+                "preserved_class_retention_annotation_string_mentions": nonruntime_metadata_mentions,
                 "jpms_note": "No new JPMS deletion filter is applied. Normal Shade omits root module-info.class and retains versioned descriptors; client/reference descriptor bytes must match and every raw input descriptor is preserved under a qualified .original path. This classpath assembly claims no JPMS/OSGi module identity. Every implementation class remains mandatory.",
                 "limits": "Exact reference-class byte equality and public/protected ABI are checked. Source-time Maven input/POM/command provenance, final-image classloading, functional regressions and vulnerability scans are independent requirements."}
