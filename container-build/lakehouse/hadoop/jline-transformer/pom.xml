@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>io.github.masondev1024.d2c</groupId>
+  <artifactId>hadoop-jline-resource-transformer</artifactId>
+  <version>1.0.0</version>
+  <packaging>jar</packaging>
+  <name>D2C Hadoop JLine resource transformer</name>
+  <description>Build-only Maven Shade extension for JLine 3.30.17 provider resources.</description>
+</project>

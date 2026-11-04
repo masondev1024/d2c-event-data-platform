@@ -1,0 +1,22 @@
+version: 2
+updates:
+  - package-ecosystem: docker
+    directories: ["/", "/app", "/lakehouse"]
+    schedule:
+      interval: weekly
+    allow:
+      - dependency-name: cgr.dev/chainguard/wolfi-base
+      - dependency-name: apache/spark
+    ignore:
+      # A new Spark minor needs a matching source recipe and Iceberg module.
+      - dependency-name: apache/spark
+        update-types: [version-update:semver-major, version-update:semver-minor]
+    open-pull-requests-limit: 3
+  - package-ecosystem: pip
+    directories: ["/", "/app"]
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: "*"
+        update-types: [version-update:semver-major]
+    open-pull-requests-limit: 3

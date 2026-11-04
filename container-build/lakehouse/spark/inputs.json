@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "spark_version": "4.2.1",
+  "jetty_version": "12.1.14",
+  "guava_version": "33.7.2-jre",
+  "failureaccess_version": "1.0.3",
+  "scala_binary_version": "2.13",
+  "source": {
+    "filename": "spark-4.2.1.tgz",
+    "directory": "spark-4.2.1",
+    "url": "https://archive.apache.org/dist/spark/spark-4.2.1/spark-4.2.1.tgz",
+    "checksum_url": "https://archive.apache.org/dist/spark/spark-4.2.1/spark-4.2.1.tgz.sha512",
+    "sha512": "a31bb2c65fd7aa5217c5353809b2dfa80ff119171b3b1ae3eb7f7d1a9bbe2d187edb9de7e9498994db54d3ed6d0ac9b40a5616ac72942f6233ff9f18645b1814",
+    "tag_url": "https://github.com/apache/spark/tree/v4.2.1",
+    "pom_sha256": {
+      "pom.xml": "2685bfc815d4075c25deb3500f797d35d8790c0d988c335e9cd348389c37380b",
+      "core/pom.xml": "21f59b60e1497bed036de67a21f3d2c057899491280c0b69b214f2058a18511f",
+      "common/network-common/pom.xml": "a11aca83e51dacd0a0bb8b07d8932a2b2eff54e3ee85e091da2ffe6c8f213da6"
+    }
+  },
+  "maven": {
+    "version": "3.9.15",
+    "filename": "apache-maven-3.9.15-bin.tar.gz",
+    "directory": "apache-maven-3.9.15",
+    "url": "https://archive.apache.org/dist/maven/maven-3/3.9.15/binaries/apache-maven-3.9.15-bin.tar.gz",
+    "checksum_url": "https://archive.apache.org/dist/maven/maven-3/3.9.15/binaries/apache-maven-3.9.15-bin.tar.gz.sha512",
+    "sha512": "33d81e0ec785f0207e3e5e3ffb61863e1dca5784c15ac3fb5ff105f69cffbea484eb8d473ea60467a63f7b0570eef8622f2fed8eee96acbe668aa313391cddb3"
+  },
+  "build_jdk": {
+    "image": "eclipse-temurin:17.0.21_9-jdk-jammy@sha256:057a0daec60e87c96571bf5c9c7792065bcb19e804d584cd37d4144038a35717",
+    "java_version": "17.0.21",
+    "runtime_version_prefix": "17.0.21+9",
+    "implementor": "Eclipse Adoptium",
+    "major": 17,
+    "official_source_url": "https://raw.githubusercontent.com/adoptium/containers/7b7fa6e65eeac043b6ddcc56e7efb36c6fe928e7/17/jdk/ubuntu/jammy/Dockerfile",
+    "official_source_sha256": "6ef46e99d17d82293d8852db768b3000263452fb8bc10cfe2feb0ec36fe750f6",
+    "platforms": {
+      "linux/amd64": {
+        "manifest_sha256": "f1309980e092cb762e6cbf78cf91b7fa0e7d3f3c5fc47a60a582f880b799aa48",
+        "config_sha256": "fee8cb4328cdfa329ad5e2d14266ab9f70132d533f7fab5ebb1dba45758d71c2"
+      },
+      "linux/arm64": {
+        "manifest_sha256": "441f73589332f1649453cff3fe30e1d8a32194cfa215b5601bd2013c95ad7a13",
+        "config_sha256": "5181f90db95a7061190bbd5e4749b11867789f06c3c7ca7eb157aa2a600116df"
+      }
+    },
+    "scope": "Spark compilation and builder probe only; final runtime remains the official Spark image's Java 21.0.13."
+  },
+  "upstream_properties": {
+    "java.version": "17",
+    "java.minimum.version": "17.0.11",
+    "maven.version": "3.9.15",
+    "jetty.version": "12.1.8",
+    "guava.version": "33.6.0-jre",
+    "guava.failureaccess.version": "1.0.3",
+    "scala.version": "2.13.18",
+    "scala.binary.version": "2.13",
+    "hadoop.version": "3.5.0",
+    "kafka.version": "3.9.2",
+    "netty.version": "4.2.13.Final",
+    "fasterxml.jackson.version": "2.21.2",
+    "jersey.version": "3.1.11",
+    "jakartaservlet.version": "6.0.0"
+  },
+  "overrides": {
+    "jetty.version": "12.1.14",
+    "guava.version": "33.7.2-jre"
+  },
+  "reviewed_on": "2026-11-04",
+  "compatibility_scope": "Rebuilt core and network-common for a coherent Spark 4.2.1 distribution; never replacements in Spark 4.1.x."
+}

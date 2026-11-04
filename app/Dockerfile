@@ -1,17 +1,35 @@
-FROM python:3.12-slim
+FROM cgr.dev/chainguard/wolfi-base:latest@sha256:771146c2dfc880902a185f060c3db5571473c46b267edd98c3119c83068dfb61 AS runtime-base
+
+USER root
+RUN apk add --no-cache 'python-3.12>=3.12.16-r3' 'libstdc++>=16.2.0-r2' 'libpq-18>=18.4' \
+    && addgroup -S -g 10001 app \
+    && adduser -S -D -H -u 10001 -G app -s /sbin/nologin app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    VIRTUAL_ENV=/opt/venv \
+    PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /app
 
-RUN groupadd --system --gid 10001 app \
-    && useradd --system --uid 10001 --gid 10001 --home-dir /nonexistent \
-        --shell /usr/sbin/nologin app
-
+FROM runtime-base AS dependencies
 COPY app/requirements.txt ./requirements.txt
-RUN python -m pip install --requirement requirements.txt
+# Compile the same Psycopg API against the signed system libpq family. The
+# published APK availability and actual linking still require a real build.
+# Compiler, headers and pip remain in this build stage.
+RUN apk add --no-cache 'py3.12-pip>=26.2.2-r2' build-base \
+        'python-3.12-dev>=3.12.16-r3' 'postgresql-18-dev>=18.4' \
+    && /usr/bin/python3.12 -m venv --without-pip /opt/venv \
+    && /usr/bin/python3.12 -m pip --python /opt/venv install --no-cache-dir \
+        --no-binary=psycopg-c --requirement requirements.txt \
+    && /opt/venv/bin/python -c 'import sys; from psycopg import pq; sys.exit(0 if pq.__impl__ == "c" and 180004 <= pq.version() < 190000 else "Psycopg C with PostgreSQL 18 libpq >=18.4 is required")'
+
+FROM runtime-base AS runtime
+COPY --from=dependencies /opt/venv /opt/venv
+# Check the copied extension with runtime libraries, independently of the
+# development packages available in the preceding build stage.
+RUN /opt/venv/bin/python -c 'import sys; from psycopg import pq; sys.exit(0 if pq.__impl__ == "c" and 180004 <= pq.version() < 190000 else "Psycopg C with PostgreSQL 18 libpq >=18.4 is required")'
 
 COPY --chown=10001:10001 d2c_contract.py app/app.py app/contracts.py app/schema.py app/outbox_publisher.py ./
 
