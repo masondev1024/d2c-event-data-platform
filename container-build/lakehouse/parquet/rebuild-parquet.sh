@@ -27,6 +27,9 @@ do
     -Dproject.build.outputTimestamp=2026-10-22T00:00:00Z \
     -DskipTests -Dmaven.test.skip=true -Drat.skip=true package
   d2c_module="sources/parquet-$d2c_version/parquet-jackson"
+  python3 "$d2c_parquet_helpers/prepare-source.py" \
+    --sources "$d2c_parquet_helpers/sources.json" --verify-version "$d2c_version" \
+    --report "output/parquet-jackson-$d2c_custom_version-verification.json"
   d2c_repo="output/maven/org/apache/parquet/parquet-jackson/$d2c_custom_version"
   mkdir -p "$d2c_repo"
   cp "$d2c_module/target/parquet-jackson-$d2c_custom_version.jar" "output/"
@@ -57,6 +60,8 @@ for source in json.loads(Path(sys.argv[1]).read_text()):
         'source_checksum_algorithm': source['algorithm'],
         'source_checksum': source['digest'],
         'source_sha256': hashlib.sha256(archive.read_bytes()).hexdigest(),
+        'source_main_files_sha256': source['main_files_sha256'],
+        'bundle_verification': json.loads(Path(f'output/parquet-jackson-{version}-d2c-jackson2.21.7-verification.json').read_text()),
         'jackson_core_version': '2.21.7',
         'jackson_databind_version': '2.21.7',
         'jackson_annotations_version': '2.21',
