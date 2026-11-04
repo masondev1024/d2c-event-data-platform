@@ -8,10 +8,13 @@ HADOOP_SHADED_GUAVA_VERSION = "1.6.0"
 SNAPPY_VERSION = "1.1.10.9"
 CURATOR_VERSION = "5.2.0"
 CURATOR_MODULES = ("curator-client", "curator-framework", "curator-recipes")
-# Official classifiers attach the complete pre-shading module JAR. All three
-# are selected together so their internal Guava references use the fixed
-# external Guava instead of curator-client's hidden Guava 27.0.1 copy.
+# Official classifiers attach the complete pre-shading module JAR. They are
+# build inputs, not direct replacements: CuratorTransactionResult exposes a
+# shaded Guava Predicate in its public ABI. Reassembly preserves that API.
 CURATOR_CLASSIFIER = "osgi"
+CURATOR_VARIANT_GROUP = "io.github.masondev1024.d2c.curator"
+CURATOR_VARIANT_VERSION = "5.2.0-d2c-guava33.7.2-jre"
+FAILUREACCESS_VERSION = "1.0.3"
 CURATOR_SOURCE_ROOT_URL = "https://raw.githubusercontent.com/apache/curator/apache-curator-5.2.0/"
 CURATOR_SOURCE_INPUTS = {
     "pom.xml": "23fec610ccbcad44efb6afbf26f8a0882c8160370bbf07bc3606f8695c0421b7",
@@ -19,6 +22,11 @@ CURATOR_SOURCE_INPUTS = {
     "curator-framework/pom.xml": "ea05969c12127f92e87a1f2d24ae690cc55e2206527eee48440abc9ea18b5c41",
     "curator-recipes/pom.xml": "7277b588fdc968f6bdabf44da98ff1e914366f20a0cc3a1cd9a41377374d870e",
     "src/site/confluence/breaking-changes.confluence": "43f19f2cfc09f49e97029d5aebf93e7daa65c3c0ff87dde310aad73bccb09bb0",
+}
+CURATOR_REVIEWED_METADATA = {
+    "META-INF/maven/org.apache.curator/apache-curator/pom.xml": CURATOR_SOURCE_INPUTS["pom.xml"],
+    **{f"META-INF/maven/org.apache.curator/{module}/pom.xml": CURATOR_SOURCE_INPUTS[f"{module}/pom.xml"]
+       for module in CURATOR_MODULES},
 }
 THIRDPARTY_SOURCE_ROOT_URL = "https://raw.githubusercontent.com/apache/hadoop-thirdparty/rel/release-1.6.0/"
 THIRDPARTY_SOURCE_INPUTS = {
@@ -36,6 +44,7 @@ EXCLUDED_ARTIFACTS = (
     ("org.eclipse.jetty.websocket", "websocket-client"),
 )
 REPLACED_CURATOR_ARTIFACTS = tuple(("org.apache.curator", module) for module in CURATOR_MODULES)
+CURATOR_VARIANT_ARTIFACTS = tuple((CURATOR_VARIANT_GROUP, module) for module in CURATOR_MODULES)
 REQUIRED_MODULES = (
     "hadoop-common", "hadoop-hdfs-client", "hadoop-mapreduce-client-core",
     "hadoop-mapreduce-client-common", "hadoop-yarn-api", "hadoop-yarn-common", "hadoop-yarn-client",
@@ -82,6 +91,8 @@ DEPENDENCY_VERSIONS = {
     "com.google.guava/guava": GUAVA_VERSION,
     "org.apache.hadoop.thirdparty/hadoop-shaded-guava": HADOOP_SHADED_GUAVA_VERSION,
     **{f"org.apache.curator/{module}": CURATOR_VERSION for module in CURATOR_MODULES},
+    **{f"{CURATOR_VARIANT_GROUP}/{module}": CURATOR_VARIANT_VERSION for module in CURATOR_MODULES},
+    "com.google.guava/failureaccess": FAILUREACCESS_VERSION,
 }
 SOURCE_REVIEWS = {
     "org/apache/hadoop/mapreduce/Cluster": {

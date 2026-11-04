@@ -27,6 +27,11 @@ run_maven() {
         -DskipTests -Dmaven.javadoc.skip=true -Dcheckstyle.skip=true "$@"
 }
 
+# Reassemble all complete Curator modules from the official pre-Shade inputs.
+# Preserve their original shaded public Guava Predicate ABI with fixed code.
+python3 "$helper_dir/rebuild_curator.py" --maven "$maven" \
+    --source-root "$source_root" --output "$output_dir"
+
 # This small authored plugin extension is compiled before Maven shading, never
 # added to a runtime dependency graph and never used to rewrite a finished JAR.
 python3 "$helper_dir/build-jline-transformer.py" --maven "$maven" \
@@ -43,13 +48,6 @@ for module in hadoop-client-api hadoop-client-runtime; do
     cp pom.xml "$output_dir/$module-$variant-source-pom.xml"
     cp "/root/.m2/repository/org/apache/hadoop/$module/$variant/$module-$variant.pom" \
         "$output_dir/$module-$variant-installed-pom.xml"
-done
-# These unmodified standard JARs are compatibility baselines only. They are not
-# selected into either output assembly. The complete osgi modules above must
-# retain their own classes and public/protected ABI against these originals.
-for module in curator-client curator-framework curator-recipes; do
-    run_maven org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get \
-        -Dartifact="org.apache.curator:$module:5.2.0" -Dtransitive=false
 done
 python3 "$helper_dir/verify_bundle.py" "$source_root" "$output_dir"
 # provenance records static checks only. The final image must separately execute

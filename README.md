@@ -402,10 +402,11 @@ shade 조립을 Jetty **12.1.14**로 재빌드합니다. Iceberg **1.12.0**의 �
 Parquet **1.17.0/1.17.1** 조립에는 Jackson **2.21.7**을 적용합니다.
 Guava는 외부 JAR과 Hadoop·Iceberg·Spark network-common의 개별 shaded 사본까지
 **33.7.2-jre**로 조립하고, failureaccess는 **1.0.3**을 사용합니다. Hadoop이 사용하는 Curator
-**5.2.0**의 공식 `osgi` classifier는 Guava를 내장하지 않는 원본 모듈입니다. 기본 artifact와
-모든 자체 클래스·공개/보호 ABI·라이선스·Maven metadata를 비교하고, 과거 shaded Guava의
-실행 참조가 남으면 조립을 거부합니다. 이는 완성된 JAR에서 취약 클래스를 삭제하는 방식이
-아닙니다. 실제 최종 JVM의 호환성 시험도 별도로 통과해야 합니다.
+**5.2.0**은 공식 `osgi` 전체 모듈을 입력으로 수정된 Guava와 함께 Maven으로 조립합니다.
+원래 Curator shade namespace와 공개 `Predicate` 반환형을 유지하며, 기본 artifact의 모든
+자체 클래스·공개/보호 ABI·라이선스·Maven metadata를 비교합니다. 새 namespace의 Guava
+전체 구현을 실제 수정 버전 입력과 대조하며, 단순 namespace 허용이나 완성된 취약 JAR의
+클래스 삭제로 검사를 통과시키지 않습니다. 실제 최종 JVM 호환성 시험도 별도로 필요합니다.
 Snappy **1.1.10.9**는 최종 이미지의 실제 클래스 출처와 source manifest의 JAR SHA를
 대조하고, 작은 합성 데이터의 JNI 압축·복원과 실제 로드된 플랫폼별 `.so`의 SHA를 검사합니다.
 Spark source 빌드는 공식 배포본과 같은 Java 17 컴파일러(Temurin **17.0.21+9**)로 고정합니다.

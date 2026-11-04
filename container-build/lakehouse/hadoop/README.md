@@ -42,34 +42,62 @@ recipe selects Guava **33.7.2-jre** and the official
 same fixed Guava. Only `hadoop-thirdparty-guava.version` is overridden; the
 separate Hadoop protobuf dependency remains unchanged. The runtime verifier
 checks both original resolved input JAR hashes, the inner and outer Maven
-identities, and the complete Guava class inventories of both generated namespaces.
-An unexpected third namespace or old nested version cannot pass using the
+identities, and complete Guava class inventories of each declared namespace.
+An unexpected namespace or old nested version cannot pass using the
 ordinary Guava descriptor. All generated class references are checked as well.
 
 Curator 5.2.0's standard client embeds another Guava 27.0.1 copy, under
 `org.apache.curator.shaded.com.google`, with its descriptor removed by the
-original Curator build. Updating a Maven Guava property cannot replace those
-pre-shaded implementation classes. The recipe therefore selects the official
-**5.2.0 `osgi` classifiers of client, framework and recipes together**. The
-[official build](https://raw.githubusercontent.com/apache/curator/apache-curator-5.2.0/pom.xml)
-attaches the complete pre-Shade module JAR, and the
-[official documentation](https://curator.apache.org/docs/about/) specifies its
-external Guava dependency. All three modules remain present; their unclassified
-siblings are excluded on every old and new transitive path before assembly.
-Their fixed external Guava is relocated by Hadoop's original shade recipe.
+original Curator build. Updating an external Maven Guava property cannot replace
+those pre-shaded classes. The official `osgi` classifiers contain the complete
+pre-Shade modules, but direct substitution is not ABI compatible:
+[`CuratorTransactionResult.ofTypeAndPath()`](https://raw.githubusercontent.com/apache/curator/apache-curator-5.2.0/curator-framework/src/main/java/org/apache/curator/framework/api/transaction/CuratorTransactionResult.java)
+publicly returns a Guava Predicate. The strict standard/OSGi comparison detected
+this real mismatch in CI. Removing ListenerContainer in Curator 5.0 did not
+eliminate every public Guava type.
 
-Build verification fetches the unchanged standard three artifacts only as
-comparison baselines. Every module must retain its complete own class set,
-public/protected structural ABI (including protected nested types and exposed
-internal ancestors), Maven identities and original LICENSE/NOTICE. The final
-runtime must contain every selected Curator class after Hadoop relocation.
-Old Curator-Guava class definitions, symbolic references, strings and active
-resources fail verification across both generated Hadoop JARs. An unchanged
-source POM that documents alternative packaging may be recorded only if its
-exact reviewed official SHA and GAV match; no metadata is modified or removed.
-The upstream packaging POMs and API migration evidence are fetched as pinned
-review inputs. These static comparisons require actual CI artifacts and do not
-replace final-image linkage or application regression tests.
+`rebuild_curator.py` therefore uses the three complete official 5.2.0 `osgi`
+artifacts as inputs to normal source-free Maven assemblies. It reapplies the
+[original Curator relocation](https://raw.githubusercontent.com/apache/curator/apache-curator-5.2.0/pom.xml),
+`com.google` to `org.apache.curator.shaded.com.google`, with whole Guava
+**33.7.2-jre** and failureaccess **1.0.3** inputs. Only the client embeds those
+dependencies; complete framework and recipes remain separate modules. The new
+coordinates are `io.github.masondev1024.d2c.curator:curator-{client,framework,recipes}:5.2.0-d2c-guava33.7.2-jre`.
+Their original `org.apache.curator` 5.2.0 Maven identities remain present,
+alongside the distinct custom assembly identities and actual input/output hashes.
+Original normal or OSGi artifacts cannot re-enter the final Hadoop dependency
+graph; only the verified custom trio is selected there.
+
+A separate build-only Maven assembly contains only the two fixed Guava inputs
+under that same original relocation. Every embedded Guava implementation class
+in the new client must exactly match its reference bytes, and the reference
+must match both complete original input class inventories. Actual fixed GAVs,
+source JAR hashes, all Guava references and provider descriptors are checked.
+The reference JAR is not exported to the runtime or published. No upstream Java
+or completed JAR is patched. Maven compiles no replacement Curator Java classes.
+The original namespace is now retained with fixed code, rather than being
+declared vulnerable solely because its name is unchanged.
+
+Every rebuilt module must retain the complete own class set and the original
+standard artifact's public/protected structural ABI, including protected nested
+types and exposed internal ancestors. Original Curator POM/properties and
+LICENSE/NOTICE remain byte-identical; fixed Guava/failureaccess POM/properties
+are retained, including their actual patched versions. Exact source-POM hashes
+distinguish packaging descriptions from executable references. Guava documents,
+each Curator module's license documents, and original input manifests are also
+copied before assembly into qualified `META-INF/d2c-*` paths ending `.original`.
+That suffix prevents Hadoop's unchanged `endsWith(LICENSE/NOTICE)` transformer
+from discarding supplemental copies. Final Hadoop verification requires every
+recorded copy to retain its original bytes/hash. The active custom manifest is
+for the existing Java classpath profile; OSGi and JPMS module support are not
+claimed. Actual multi-release implementation inputs require activating manifests
+and fail verification if that separate contract is unmet.
+
+The final runtime must contain every selected Curator class and all three
+complete fixed Guava namespaces after Hadoop's original relocation. Resolved
+trees, installed POMs, original source recipes, built JAR hashes and successful
+build logs bind those checks to the actual Maven assemblies. These static checks
+require real CI artifacts and do not replace final-image linkage or regressions.
 
 The external native `snappy-java` dependency is fixed at **1.1.10.9** in both
 generated source POMs and resolved graphs. Hadoop's unchanged original
@@ -170,11 +198,13 @@ The Hadoop 3.5 Cluster probe uses its explicit `close()` in a `finally` block:
 the original class does not implement AutoCloseable. It still executes the
 actual local protocol/filesystem bootstrap before closing.
 It also serializes and deserializes small valid CompactHashMap, CompactHashSet
-and MapMakerInternalMap values through both actual Guava namespaces and checks
+and MapMakerInternalMap values through all three actual Guava namespaces and checks
 their JAR origins. This is a normal compatibility exercise, not an oversized
 allocation proof. An unstarted Curator client and recipe are constructed and
 closed to exercise all three retained modules and their fixed Guava linkage;
-ZooKeeper connections are never started.
+ZooKeeper connections are never started. The actual public transaction predicate
+factory must retain the original shaded Predicate return type and successfully
+apply its predicate to a newly constructed transaction result.
 It makes no remote filesystem or YARN call. It is not a Parquet/Iceberg/checkpoint
 recovery test. Those actual D2C regressions and fresh scans of the final immutable
 images, on both target platforms, are independent acceptance requirements.

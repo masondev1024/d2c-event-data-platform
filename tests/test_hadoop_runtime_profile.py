@@ -31,6 +31,7 @@ try:
     profile = load_helper("runtime_profile")
     jline = load_helper("jline_resources")
     curator = load_helper("curator_compat")
+    curator_build = load_helper("rebuild_curator")
 finally:
     sys.path.remove(str(HELPERS))
 
@@ -70,7 +71,7 @@ def graph_fixture(module: str) -> dict:
     selected = [dependency(name) for name in profile.REQUIRED_MODULES]
     selected += [dependency("guava", profile.GUAVA_VERSION, "com.google.guava"),
                  dependency("hadoop-shaded-guava", profile.HADOOP_SHADED_GUAVA_VERSION, "org.apache.hadoop.thirdparty")]
-    selected += [dependency(name, profile.CURATOR_VERSION, "org.apache.curator", classifier="osgi")
+    selected += [dependency(name, profile.CURATOR_VARIANT_VERSION, profile.CURATOR_VARIANT_GROUP)
                  for name in profile.CURATOR_MODULES]
     selected += [dependency("snappy-java", profile.SNAPPY_VERSION, "org.xerial.snappy")]
     children = [dependency("hadoop-client", children=selected)]
@@ -101,21 +102,23 @@ class HadoopLocalSourceRecipeTest(unittest.TestCase):
                             for node in aggregator.findall("m:exclusions/m:exclusion", recipe.NS)}
                 self.assertEqual(excluded, {("xml-apis", "xml-apis"),
                     ("org.eclipse.jetty.websocket", "websocket-client"),
-                    ("org.apache.hadoop", "hadoop-mapreduce-client-jobclient"), *profile.REPLACED_CURATOR_ARTIFACTS})
+                    ("org.apache.hadoop", "hadoop-mapreduce-client-jobclient"),
+                    *profile.REPLACED_CURATOR_ARTIFACTS, *profile.CURATOR_VARIANT_ARTIFACTS})
                 dependencies = {recipe.text(node, "m:artifactId"): node
                                 for node in result.findall("m:dependencies/m:dependency", recipe.NS)}
                 common = dependencies["hadoop-mapreduce-client-common"]
                 self.assertEqual(recipe.text(common, "m:version"), "3.5.0")
                 self.assertEqual({(recipe.text(node, "m:groupId"), recipe.text(node, "m:artifactId"))
                     for node in common.findall("m:exclusions/m:exclusion", recipe.NS)},
-                    set((*profile.EXCLUDED_ARTIFACTS, *profile.REPLACED_CURATOR_ARTIFACTS)))
+                    set((*profile.EXCLUDED_ARTIFACTS, *profile.REPLACED_CURATOR_ARTIFACTS, *profile.CURATOR_VARIANT_ARTIFACTS)))
                 for name in profile.CURATOR_MODULES:
                     selected = dependencies[name]
-                    self.assertEqual(recipe.text(selected, "m:version"), "5.2.0")
-                    self.assertEqual(recipe.text(selected, "m:classifier"), "osgi")
+                    self.assertEqual(recipe.text(selected, "m:groupId"), profile.CURATOR_VARIANT_GROUP)
+                    self.assertEqual(recipe.text(selected, "m:version"), profile.CURATOR_VARIANT_VERSION)
+                    self.assertIsNone(recipe.text(selected, "m:classifier"))
                     self.assertEqual({(recipe.text(node, "m:groupId"), recipe.text(node, "m:artifactId"))
                         for node in selected.findall("m:exclusions/m:exclusion", recipe.NS)},
-                        set(profile.REPLACED_CURATOR_ARTIFACTS))
+                        set((*profile.REPLACED_CURATOR_ARTIFACTS, *profile.CURATOR_VARIANT_ARTIFACTS)))
                 if name == "hadoop-client-runtime":
                     api = dependencies["hadoop-client-api"]
                     self.assertEqual(recipe.text(api, "m:version"), "3.5.0-d2c-local1")
@@ -185,14 +188,21 @@ class HadoopLocalSourceRecipeTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "mixed Hadoop versions"):
             verification.validate_graph(graph, "hadoop-client-runtime")
 
-    def test_complete_curator_osgi_set_cannot_admit_a_standard_or_mixed_version_sibling(self):
+    def test_complete_compatible_curator_set_cannot_admit_original_or_unverified_siblings(self):
         for name in profile.CURATOR_MODULES:
             for version, classifier in (("5.2.0", None), ("5.2.0", ""), ("5.9.0", "osgi")):
                 graph = graph_fixture("hadoop-client-runtime")
                 graph["children"][0]["children"].append(
                     dependency(name, version, "org.apache.curator", classifier=classifier))
                 with self.subTest(name=name, classifier=classifier, version=version):
-                    with self.assertRaisesRegex(ValueError, "unexpected shaded/partial Curator dependency"):
+                    with self.assertRaisesRegex(ValueError, "original Curator input reintroduced"):
+                        verification.validate_graph(graph, "hadoop-client-runtime")
+            for version, classifier in (("5.2.0", None), (profile.CURATOR_VARIANT_VERSION, "osgi")):
+                graph = graph_fixture("hadoop-client-runtime")
+                graph["children"][0]["children"].append(dependency(
+                    name, version, profile.CURATOR_VARIANT_GROUP, classifier=classifier))
+                with self.subTest(version=version, classifier=classifier):
+                    with self.assertRaisesRegex(ValueError, "partial/unverified Curator"):
                         verification.validate_graph(graph, "hadoop-client-runtime")
             graph = graph_fixture("hadoop-client-runtime")
             graph["children"][0]["children"] = [node for node in graph["children"][0]["children"]
@@ -428,19 +438,24 @@ class GuavaCompleteAssemblyTest(unittest.TestCase):
         return (f"META-INF/maven/{group}/{artifact}/pom.properties",
                 f"groupId={group}\nartifactId={artifact}\nversion={version}\n".encode())
 
-    def check(self, generated, direct=None, thirdparty=None):
+    def check(self, generated, direct=None, thirdparty=None, curator_entries=None):
         archive = HadoopAssemblyIdentityTest().archive
         direct = direct if direct is not None else self.entries("com/google/common/") + [
             self.metadata("com.google.guava", "guava", "33.7.2-jre")]
         thirdparty = thirdparty if thirdparty is not None else self.entries(verification.GUAVA_PREFIXES[1]) + [
             self.metadata("com.google.guava", "guava", "33.7.2-jre"),
             self.metadata("org.apache.hadoop.thirdparty", "hadoop-shaded-guava", "1.6.0")]
+        curator_entries = (curator_entries if curator_entries is not None
+                           else self.entries("org/apache/curator/shaded/com/google/common/"))
+        failureaccess = [self.metadata("com.google.guava", "failureaccess", "1.0.3")]
         with ZipFile(io.BytesIO(archive(generated))) as new, ZipFile(io.BytesIO(archive(direct))) as first, \
-                ZipFile(io.BytesIO(archive(thirdparty))) as second:
-            return verification.validate_guava_implementations(new, first, second)
+                ZipFile(io.BytesIO(archive(thirdparty))) as second, \
+                ZipFile(io.BytesIO(archive(curator_entries))) as third, \
+                ZipFile(io.BytesIO(archive(failureaccess))) as failure:
+            return verification.validate_guava_implementations(new, first, second, third, failure)
 
-    def test_complete_two_fixed_namespaces_are_required(self):
-        generated = self.entries(verification.GUAVA_PREFIXES[0]) + self.entries(verification.GUAVA_PREFIXES[1])
+    def test_complete_three_fixed_namespaces_are_required(self):
+        generated = sum((self.entries(prefix) for prefix in verification.GUAVA_PREFIXES), [])
         result = self.check(generated)
         self.assertTrue(result["complete_fixed_input_class_inventory_matches"])
         self.assertEqual(result["pre_shaded_classes"], 4)
@@ -450,7 +465,7 @@ class GuavaCompleteAssemblyTest(unittest.TestCase):
                 self.check(changed)
 
     def test_pre_shaded_artifact_version_cannot_hide_an_old_embedded_guava(self):
-        generated = self.entries(verification.GUAVA_PREFIXES[0]) + self.entries(verification.GUAVA_PREFIXES[1])
+        generated = sum((self.entries(prefix) for prefix in verification.GUAVA_PREFIXES), [])
         old = self.entries(verification.GUAVA_PREFIXES[1]) + [
             self.metadata("com.google.guava", "guava", "33.4.8-jre"),
             self.metadata("org.apache.hadoop.thirdparty", "hadoop-shaded-guava", "1.6.0")]
@@ -512,7 +527,8 @@ class CuratorCompleteModuleCompatibilityTest(unittest.TestCase):
         name = class_options.get("name", "org/apache/curator/Fixture")
         return [(root + "pom.properties", f"groupId=org.apache.curator\nartifactId={module}\nversion=5.2.0\n".encode()),
                 (root + "pom.xml", pom), ("META-INF/LICENSE", b"licensed fixture"),
-                ("META-INF/NOTICE", b"notice fixture"), (name + ".class", self.class_file(**class_options))]
+                ("META-INF/NOTICE", b"notice fixture"), ("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n\n"),
+                (name + ".class", self.class_file(**class_options))]
 
     def check(self, selected, baseline=None):
         baseline = selected if baseline is None else baseline
@@ -594,6 +610,163 @@ class CuratorCompleteModuleCompatibilityTest(unittest.TestCase):
             names.append(reader.utf8(1))
             self.assertEqual(reader.utf8(1).encode("utf-8", errors="surrogateescape"), raw)
         self.assertNotEqual(*names)
+
+
+class CuratorSourceFreeFixedBundleTest(unittest.TestCase):
+    """Exercise code/ABI evidence failures using small non-executable fixtures."""
+
+    def metadata(self, group, artifact, version):
+        root = f"META-INF/maven/{group}/{artifact}/"
+        return [(root + "pom.properties", f"groupId={group}\nartifactId={artifact}\nversion={version}\n".encode()),
+                (root + "pom.xml", (f'<project xmlns="{curator_build.NS}"><groupId>{group}</groupId>'
+                 f'<artifactId>{artifact}</artifactId><version>{version}</version></project>').encode())]
+
+    def fixture(self, root, changed=None, jpms=False):
+        own = CuratorCompleteModuleCompatibilityTest()
+        mapping = {"guava": ("33.7.2-jre", "collect/Fixture"),
+                   "failureaccess": ("1.0.3", "util/concurrent/internal/Failure")}
+        reference, libraries, class_entries = [], {}, []
+        for artifact, (version, suffix) in mapping.items():
+            source_name = "com/google/common/" + suffix
+            fixed_name = "org/apache/curator/shaded/" + source_name
+            entries = self.metadata("com.google.guava", artifact, version)
+            metadata = list(entries)
+            manifest = b"Manifest-Version: 1.0\n\n"
+            entries += [(source_name + ".class", own.class_file(name=source_name)),
+                        ("META-INF/LICENSE", artifact.encode()), ("META-INF/MANIFEST.MF", manifest)]
+            if jpms:
+                entries.append(("META-INF/versions/9/module-info.class", artifact.encode() + b" raw descriptor"))
+            path = root / f"{artifact}.jar"
+            path.write_bytes(HadoopAssemblyIdentityTest().archive(entries))
+            libraries[artifact] = path
+            fixed = (fixed_name + ".class", own.class_file(name=fixed_name))
+            class_entries.append(fixed)
+            reference += metadata + [fixed]
+            reference += [(f"META-INF/d2c-upstream/{artifact}/META-INF/MANIFEST.MF.original", manifest)]
+            if jpms:
+                reference += [(f"META-INF/d2c-upstream/{artifact}/META-INF/versions/9/module-info.class.original",
+                               artifact.encode() + b" raw descriptor")]
+        if jpms:
+            reference.append(("META-INF/versions/9/module-info.class", b"normal Shade retained descriptor"))
+        old_descriptor = "()Lorg/apache/curator/shaded/com/google/common/collect/Fixture;"
+        standard = own.entries(descriptor=old_descriptor)
+        unshaded = own.entries(descriptor="()Lcom/google/common/collect/Fixture;")
+        rebuilt = standard + self.metadata(profile.CURATOR_VARIANT_GROUP, "curator-client", profile.CURATOR_VARIANT_VERSION)
+        rebuilt += [entry for entry in reference]
+        for artifact in libraries:
+            rebuilt += [(f"META-INF/d2c-licenses/{artifact}/META-INF/LICENSE.original", artifact.encode())]
+        for name in ("META-INF/LICENSE", "META-INF/NOTICE"):
+            rebuilt += [(f"META-INF/d2c-licenses/curator-client/{name}.original", dict(standard)[name])]
+        for classifier in ("osgi", "standard"):
+            rebuilt += [(f"META-INF/d2c-upstream/curator-client/{classifier}/META-INF/MANIFEST.MF.original", manifest)]
+        if changed == "code":
+            entry = class_entries[0][0]
+            rebuilt = [(name, own.class_file(name=name[:-6], constant=43) if name == entry else content)
+                       for name, content in rebuilt]
+        elif changed == "public-abi":
+            rebuilt = [(name, own.class_file(descriptor="()Lcom/google/common/collect/Fixture;")
+                        if name == "org/apache/curator/Fixture.class" else content) for name, content in rebuilt]
+        elif changed == "license":
+            rebuilt = [(name, content) for name, content in rebuilt if "d2c-licenses/guava/" not in name]
+        elif changed == "missing-reference":
+            reference = [entry for entry in reference if entry[0] != class_entries[0][0]]
+        elif changed == "old-version":
+            with ZipFile(libraries["guava"]) as jar:
+                entries = [(name, jar.read(name).replace(b"33.7.2-jre", b"27.0.1-jre")
+                           if name.endswith(("pom.xml", "pom.properties")) else jar.read(name)) for name in jar.namelist()]
+            libraries["guava"].write_bytes(HadoopAssemblyIdentityTest().archive(entries))
+        for name, entries in (("rebuilt", rebuilt), ("osgi", unshaded), ("standard", standard), ("reference", reference)):
+            (root / (name + ".jar")).write_bytes(HadoopAssemblyIdentityTest().archive(entries))
+        return (root / "rebuilt.jar", root / "osgi.jar", root / "standard.jar", "curator-client",
+                libraries["guava"], libraries["failureaccess"], root / "reference.jar")
+
+    def test_fixed_bundle_preserves_original_public_guava_abi_and_exact_reference_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = curator.verify_curator_shaded_module(*self.fixture(Path(directory)))
+        self.assertTrue(result["public_protected_structural_abi_matches"])
+        self.assertEqual(result["embedded_fixed_implementation_classes_compared_byte_for_byte"], 2)
+        self.assertEqual(result["coordinate"], f"{profile.CURATOR_VARIANT_GROUP}:curator-client:{profile.CURATOR_VARIANT_VERSION}")
+
+    def test_metadata_cannot_hide_changed_code_or_original_public_abi(self):
+        for changed in ("code", "public-abi", "license", "missing-reference", "old-version"):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaises(ValueError):
+                    curator.verify_curator_shaded_module(*self.fixture(Path(directory), changed))
+
+    def test_direct_osgi_predicate_signature_still_fails_the_original_strict_guard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.fixture(Path(directory))
+            with self.assertRaisesRegex(ValueError, "structural ABI changed"):
+                curator.verify_curator_module(args[1], args[2], "curator-client")
+
+    def test_source_recipe_retains_whole_inputs_and_only_client_embeds_fixed_guava(self):
+        for module in (*profile.CURATOR_MODULES, "curator-guava-reference"):
+            root = recipe.ET.fromstring(curator_build.project_pom(module))
+            deps = root.findall("m:dependencies/m:dependency", recipe.NS)
+            selected = {(recipe.text(dep, "m:groupId"), recipe.text(dep, "m:artifactId")): dep for dep in deps}
+            if module in profile.CURATOR_MODULES:
+                upstream = selected[("org.apache.curator", module)]
+                self.assertEqual(recipe.text(upstream, "m:classifier"), "osgi")
+                self.assertEqual(recipe.text(upstream, "m:exclusions/m:exclusion/m:artifactId"), "*")
+            plugin = root.find("m:build/m:plugins/m:plugin[m:artifactId='maven-shade-plugin']", recipe.NS)
+            config = plugin.find("m:executions/m:execution/m:configuration", recipe.NS)
+            self.assertIsNone(config.find("m:filters", recipe.NS))
+            self.assertEqual(recipe.text(config, "m:relocations/m:relocation/m:pattern"), "com.google")
+            self.assertEqual(recipe.text(config, "m:relocations/m:relocation/m:shadedPattern"), "org.apache.curator.shaded.com.google")
+            has_guava = ("com.google.guava", "guava") in selected
+            self.assertEqual(has_guava, module in ("curator-client", "curator-guava-reference"))
+            if has_guava:
+                self.assertEqual(recipe.text(selected[("com.google.guava", "guava")], "m:version"), "33.7.2-jre")
+                self.assertEqual(recipe.text(selected[("com.google.guava", "failureaccess")], "m:version"), "1.0.3")
+
+    def test_license_resources_are_copied_before_assembly_without_rewriting_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            jar = root / "input.jar"
+            jar.write_bytes(HadoopAssemblyIdentityTest().archive([("META-INF/LICENSE", b"original license")]))
+            before = hashlib.sha256(jar.read_bytes()).hexdigest()
+            receipt = curator_build.preserve_license_sources(root / "source", {"guava": jar})
+            name = "META-INF/d2c-licenses/guava/META-INF/LICENSE.original"
+            self.assertEqual((root / "source/src/main/resources" / name).read_bytes(), b"original license")
+            self.assertEqual(receipt[name]["input_jar_sha256"], before)
+            self.assertEqual(hashlib.sha256(jar.read_bytes()).hexdigest(), before)
+
+    def test_final_hadoop_requires_every_qualified_original_document(self):
+        name = "META-INF/d2c-licenses/curator-client/META-INF/LICENSE.original"
+        content = b"original licensed bytes"
+        modules = {"curator-client": {"qualified_source_documents": {name: hashlib.sha256(content).hexdigest()}}}
+        for entries, okay in (([(name, content)], True), ([], False), ([(name, content + b" changed")], False)):
+            with self.subTest(okay=okay), ZipFile(io.BytesIO(HadoopAssemblyIdentityTest().archive(entries))) as jar:
+                if okay:
+                    self.assertEqual(verification.validate_final_curator_documents(jar, modules),
+                                     modules["curator-client"]["qualified_source_documents"])
+                else:
+                    with self.assertRaises(ValueError):
+                        verification.validate_final_curator_documents(jar, modules)
+
+    def test_multi_release_implementation_is_distinct_from_only_module_descriptor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "input.jar"
+            for name, expected in (("META-INF/versions/9/module-info.class", False),
+                                   ("META-INF/versions/9/com/google/common/Fixture.class", True)):
+                path.write_bytes(HadoopAssemblyIdentityTest().archive([(name, b"inventory")]))
+                self.assertEqual(curator_build.has_multi_release_implementation(path), expected)
+            root = recipe.ET.fromstring(curator_build.project_pom("curator-client", multi_release=True))
+            self.assertEqual(recipe.text(root, "m:build/m:plugins/m:plugin[m:artifactId='maven-jar-plugin']/m:configuration/m:archive/m:manifestEntries/m:Multi-Release"), "true")
+
+    def test_versioned_jpms_metadata_is_retained_and_compared_without_implementation_waiver(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.fixture(Path(directory), jpms=True)
+            result = curator.verify_curator_shaded_module(*args)
+            self.assertIn("META-INF/versions/9/module-info.class",
+                          result["normal_shade_retained_versioned_jpms_descriptor_sha256"])
+            self.assertEqual(result["embedded_fixed_implementation_classes_compared_byte_for_byte"], 2)
+            with ZipFile(args[0]) as jar:
+                altered = [(name, b"changed descriptor" if name == "META-INF/versions/9/module-info.class"
+                            else jar.read(name)) for name in jar.namelist()]
+            args[0].write_bytes(HadoopAssemblyIdentityTest().archive(altered))
+            with self.assertRaisesRegex(ValueError, "JPMS descriptor differs"):
+                curator.verify_curator_shaded_module(*args)
 
 
 class JlineTypedResourceTest(unittest.TestCase):

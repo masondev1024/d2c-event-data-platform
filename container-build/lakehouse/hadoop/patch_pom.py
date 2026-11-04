@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 import xml.etree.ElementTree as ET
 
-from runtime_profile import (CURATOR_CLASSIFIER, CURATOR_MODULES, CURATOR_VERSION,
+from runtime_profile import (CURATOR_MODULES, CURATOR_VARIANT_ARTIFACTS, CURATOR_VARIANT_GROUP, CURATOR_VARIANT_VERSION,
                              EXCLUDED_ARTIFACTS, GUAVA_VERSION, HADOOP_SHADED_GUAVA_VERSION,
                              MODULES, REPLACED_CURATOR_ARTIFACTS, SNAPPY_VERSION, SOURCE_INPUTS,
                              UPSTREAM_VERSION, VARIANT_VERSION)
@@ -77,10 +77,10 @@ def patch_source(source: str, module: str) -> str:
     additions = "".join(
         f"        <exclusion>\n          <groupId>{group}</groupId>\n"
         f"          <artifactId>{name}</artifactId>\n        </exclusion>\n"
-        for group, name in (*EXCLUDED_ARTIFACTS, *REPLACED_CURATOR_ARTIFACTS)
+        for group, name in (*EXCLUDED_ARTIFACTS, *REPLACED_CURATOR_ARTIFACTS, *CURATOR_VARIANT_ARTIFACTS)
     )
     dependency = dependency.replace(
-        "</exclusions>", "<!-- D2C local profile: omit remote transports; select complete unshaded Curator modules explicitly below. -->\n"
+        "</exclusions>", "<!-- D2C local profile: omit remote transports; select complete fixed Curator source-free assemblies below. -->\n"
         + additions + "      </exclusions>", 1,
     )
     dependency = dependency.replace(
@@ -99,18 +99,17 @@ def patch_source(source: str, module: str) -> str:
       <exclusions>
 """ + additions + """      </exclusions>
     </dependency>"""
-    # Classifier is part of Maven's identity. Explicitly retain each full osgi
-    # module, excluding the standard shaded siblings on EVERY transitive path.
-    # dependencyManagement alone cannot replace an unclassified dependency.
+    # Retain every complete compatible Curator assembly explicitly. The custom
+    # bundles preserve the original shaded public API, using the official whole
+    # osgi modules and fixed Guava as source-time Maven assembly inputs.
     curator_exclusions = "".join(
         f"        <exclusion><groupId>{group}</groupId><artifactId>{name}</artifactId></exclusion>\n"
-        for group, name in REPLACED_CURATOR_ARTIFACTS)
+        for group, name in (*REPLACED_CURATOR_ARTIFACTS, *CURATOR_VARIANT_ARTIFACTS))
     curator_dependencies = "".join(f"""
     <dependency>
-      <groupId>org.apache.curator</groupId>
+      <groupId>{CURATOR_VARIANT_GROUP}</groupId>
       <artifactId>{module}</artifactId>
-      <version>{CURATOR_VERSION}</version>
-      <classifier>{CURATOR_CLASSIFIER}</classifier>
+      <version>{CURATOR_VARIANT_VERSION}</version>
       <exclusions>
 {curator_exclusions}      </exclusions>
     </dependency>""" for module in CURATOR_MODULES)

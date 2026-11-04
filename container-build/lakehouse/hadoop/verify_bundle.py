@@ -10,11 +10,13 @@ from zipfile import ZipFile
 import xml.etree.ElementTree as ET
 
 from patch_pom import patch_source
-from curator_compat import validate_final_curator_guava_namespace, verify_curator_module
+from curator_compat import verify_curator_shaded_module
+from rebuild_curator import project_pom
 from jline_resources import (LOADER_SHA256, LOADER_SOURCE, SOURCE_ROOT as JLINE_SOURCE_ROOT,
                              VERSION as JLINE_VERSION, resource_kind, validate_jline_resources)
 from runtime_profile import (
-    CURATOR_CLASSIFIER, CURATOR_MODULES, CURATOR_SOURCE_INPUTS, CURATOR_SOURCE_ROOT_URL, CURATOR_VERSION,
+    CURATOR_CLASSIFIER, CURATOR_MODULES, CURATOR_REVIEWED_METADATA, CURATOR_SOURCE_INPUTS, CURATOR_SOURCE_ROOT_URL, CURATOR_VERSION,
+    CURATOR_VARIANT_GROUP, CURATOR_VARIANT_VERSION, FAILUREACCESS_VERSION,
     DEPENDENCY_VERSIONS, EXCLUDED_ARTIFACTS, EXCLUDED_MODULES, FILESYSTEM_PROVIDERS, LOCAL_PROVIDER,
     GUAVA_VERSION, HADOOP_SHADED_GUAVA_VERSION, MAVEN_VERSION, MODULES, PROTOCOL_SERVICE, REQUIRED_MODULES, SOURCE_INPUTS, SOURCE_ROOT_URL,
     SNAPPY_VERSION, SOURCE_REVIEWS, SUPPORTED_PROFILE, THIRDPARTY_SOURCE_INPUTS, THIRDPARTY_SOURCE_ROOT_URL,
@@ -44,12 +46,8 @@ REMOVED_JOBCLIENT_CLASSES = {
 GUAVA_PREFIXES = (
     "org/apache/hadoop/shaded/com/google/common/",
     "org/apache/hadoop/thirdparty/com/google/common/",
+    "org/apache/hadoop/shaded/org/apache/curator/shaded/com/google/common/",
 )
-CURATOR_REVIEWED_METADATA = {
-    "META-INF/maven/org.apache.curator/apache-curator/pom.xml": CURATOR_SOURCE_INPUTS["pom.xml"],
-    **{f"META-INF/maven/org.apache.curator/{module}/pom.xml": CURATOR_SOURCE_INPUTS[f"{module}/pom.xml"]
-       for module in CURATOR_MODULES},
-}
 
 
 def require(condition: bool, message: str) -> None:
@@ -137,13 +135,17 @@ def validate_graph(graph: dict, module: str) -> dict:
             require(node["version"] == JLINE_VERSION, f"unpatched interactive library: {coordinate}")
         if (node["groupId"], node["artifactId"]) == ("com.google.guava", "guava"):
             require(node["version"] == GUAVA_VERSION, f"unpatched direct Guava library: {coordinate}")
+        if (node["groupId"], node["artifactId"]) == ("com.google.guava", "failureaccess"):
+            require(node["version"] == FAILUREACCESS_VERSION, f"incorrect Guava failureaccess dependency: {coordinate}")
         if (node["groupId"], node["artifactId"]) == ("org.apache.hadoop.thirdparty", "hadoop-shaded-guava"):
             require(node["version"] == HADOOP_SHADED_GUAVA_VERSION,
                     f"unpatched pre-shaded Hadoop Guava library: {coordinate}")
         if node["groupId"] == "org.apache.curator":
-            require(node["artifactId"] in CURATOR_MODULES and node["version"] == CURATOR_VERSION
-                    and node.get("classifier") == CURATOR_CLASSIFIER,
-                    f"unexpected shaded/partial Curator dependency: {coordinate}: {node.get('classifier')}")
+            raise ValueError(f"original Curator input reintroduced into final Hadoop graph: {coordinate}")
+        if node["groupId"] == CURATOR_VARIANT_GROUP:
+            require(node["artifactId"] in CURATOR_MODULES and node["version"] == CURATOR_VARIANT_VERSION
+                    and not node.get("classifier"),
+                    f"unexpected partial/unverified Curator assembly: {coordinate}: {node.get('classifier')}")
         if (node["groupId"], node["artifactId"]) == ("org.xerial.snappy", "snappy-java"):
             require(node["version"] == SNAPPY_VERSION, f"unpatched external native Snappy dependency: {coordinate}")
         require((node["groupId"], node["artifactId"]) not in EXCLUDED_ARTIFACTS,
@@ -163,7 +165,7 @@ def validate_graph(graph: dict, module: str) -> dict:
                        f"org.apache.hadoop.thirdparty:hadoop-shaded-guava:{HADOOP_SHADED_GUAVA_VERSION}"):
         require(coordinate in coordinates, f"required patched Guava dependency absent: {coordinate}")
     for name in CURATOR_MODULES:
-        require(f"org.apache.curator:{name}:{CURATOR_VERSION}" in coordinates,
+        require(f"{CURATOR_VARIANT_GROUP}:{name}:{CURATOR_VARIANT_VERSION}" in coordinates,
                 f"required complete Curator module absent: {name}")
     require(f"org.xerial.snappy:snappy-java:{SNAPPY_VERSION}" in coordinates,
             "required patched external native Snappy dependency absent")
@@ -171,7 +173,8 @@ def validate_graph(graph: dict, module: str) -> dict:
         require(f"org.apache.hadoop:hadoop-client-api:{VARIANT_VERSION}" in coordinates,
                 "runtime must resolve the matching locally rebuilt API")
     return {"coordinates": sorted(coordinates), "edges": edges,
-            "complete_curator_classifiers": {name: CURATOR_CLASSIFIER for name in CURATOR_MODULES}}
+            "complete_curator_compatible_assemblies": {name: f"{CURATOR_VARIANT_GROUP}:{name}:{CURATOR_VARIANT_VERSION}"
+                                                       for name in CURATOR_MODULES}}
 
 
 def service_providers(content: bytes) -> list[str]:
@@ -223,10 +226,13 @@ def validate_retained_dependency_metadata(jar: ZipFile) -> dict:
             for coordinate, version in DEPENDENCY_VERSIONS.items()}
 
 
-def validate_guava_implementations(jar: ZipFile, direct: ZipFile, thirdparty: ZipFile) -> dict:
-    """Bind both generated Guava namespaces to complete, fixed resolved inputs."""
+def validate_guava_implementations(jar: ZipFile, direct: ZipFile, thirdparty: ZipFile,
+                                   curator: ZipFile, failureaccess: ZipFile) -> dict:
+    """Bind all three generated Guava namespaces to complete fixed inputs."""
     verify_maven_properties(required_jar_entry(direct, "META-INF/maven/com.google.guava/guava/pom.properties"),
                             "com.google.guava", "guava", GUAVA_VERSION)
+    verify_maven_properties(required_jar_entry(failureaccess, "META-INF/maven/com.google.guava/failureaccess/pom.properties"),
+                            "com.google.guava", "failureaccess", FAILUREACCESS_VERSION)
     verify_maven_properties(required_jar_entry(thirdparty, "META-INF/maven/org.apache.hadoop.thirdparty/hadoop-shaded-guava/pom.properties"),
                             "org.apache.hadoop.thirdparty", "hadoop-shaded-guava", HADOOP_SHADED_GUAVA_VERSION)
     # This input is pre-shaded; its own version alone does not prove its embedded
@@ -234,14 +240,23 @@ def validate_guava_implementations(jar: ZipFile, direct: ZipFile, thirdparty: Zi
     verify_maven_properties(required_jar_entry(thirdparty, "META-INF/maven/com.google.guava/guava/pom.properties"),
                             "com.google.guava", "guava", GUAVA_VERSION)
     names = jar.namelist()
-    actual = {name for name in names if name.endswith(".class") and "/com/google/common/" in "/" + name}
-    expected_direct = {GUAVA_PREFIXES[0] + name.removeprefix("com/google/common/")
-                       for name in direct.namelist()
-                       if name.startswith("com/google/common/") and name.endswith(".class")}
+    google_prefixes = tuple(prefix.removesuffix("common/") for prefix in GUAVA_PREFIXES)
+    implementation = lambda name: (name.endswith(".class") and any(
+        token in "/" + name for token in ("/com/google/common/", "/com/google/thirdparty/")))
+    actual = {name for name in names if implementation(name)}
+    expected_direct = {name.replace("com/google/", google_prefixes[0], 1)
+                       for name in (*direct.namelist(), *failureaccess.namelist())
+                       if implementation(name)}
     expected_thirdparty = {name for name in thirdparty.namelist()
-                          if name.startswith(GUAVA_PREFIXES[1]) and name.endswith(".class")}
-    expected = expected_direct | expected_thirdparty
-    require(bool(expected_direct) and bool(expected_thirdparty), "fixed Guava input implementation absent")
+                          if implementation(name) and google_prefixes[1] in name}
+    def outer_relocation(name):
+        version = re.match(r"META-INF/versions/[1-9][0-9]*/", name)
+        offset = version.end() if version else 0
+        return name[:offset] + "org/apache/hadoop/shaded/" + name[offset:]
+    expected_curator = {outer_relocation(name) for name in curator.namelist() if implementation(name)}
+    expected = expected_direct | expected_thirdparty | expected_curator
+    require(bool(expected_direct) and bool(expected_thirdparty) and bool(expected_curator),
+            "fixed Guava input implementation absent")
     require(actual == expected,
             f"generated Guava implementation namespaces/classes differ from fixed complete inputs: "
             f"missing={sorted(expected - actual)[:10]}, unexpected={sorted(actual - expected)[:10]}")
@@ -252,7 +267,9 @@ def validate_guava_implementations(jar: ZipFile, direct: ZipFile, thirdparty: Zi
                     f"required actual Guava implementation missing: {prefix}{name}")
     return {"guava_version": GUAVA_VERSION, "hadoop_shaded_guava_version": HADOOP_SHADED_GUAVA_VERSION,
             "direct_namespace": GUAVA_PREFIXES[0], "direct_classes": len(expected_direct),
+            "failureaccess_version": FAILUREACCESS_VERSION,
             "pre_shaded_namespace": GUAVA_PREFIXES[1], "pre_shaded_classes": len(expected_thirdparty),
+            "compatible_curator_namespace": GUAVA_PREFIXES[2], "compatible_curator_classes": len(expected_curator),
             "complete_fixed_input_class_inventory_matches": True,
             "limits": "The original Maven assembly selects these resolved inputs. Inventory and identity checks do not independently prove executable method behavior; runtime and fresh image scans remain required."}
 
@@ -262,8 +279,8 @@ def validate_guava_references(binary_name: str, refs: set[str]) -> None:
         name = ref.lstrip("[")
         if name.startswith("L") and name.endswith(";"):
             name = name[1:-1]
-        if "/com/google/common/" in "/" + name:
-            require(name.startswith(GUAVA_PREFIXES),
+        if any(token in "/" + name for token in ("/com/google/common/", "/com/google/thirdparty/")):
+            require(name.startswith(tuple(prefix.removesuffix("common/") for prefix in GUAVA_PREFIXES)),
                     f"unexpected Guava reference namespace: {binary_name}: {ref}")
 
 
@@ -303,6 +320,23 @@ def validate_final_curator_inventory(jar: ZipFile, selected_modules: dict[str, P
             "duplicate generated Curator implementation class")
     return {"complete_selected_module_classes_match": True, "module_class_counts": module_counts,
             "generated_namespace": prefix + "org/apache/curator/"}
+
+
+def validate_final_curator_documents(jar: ZipFile, modules: dict) -> dict:
+    expected = {}
+    for module, report in modules.items():
+        docs = report["qualified_source_documents"]
+        require(bool(docs), f"upstream Curator document receipt absent: {module}")
+        for entry, digest in docs.items():
+            require(entry.startswith(("META-INF/d2c-licenses/", "META-INF/d2c-upstream/"))
+                    and entry.endswith(".original") and re.fullmatch(r"[a-f0-9]{64}", digest) is not None,
+                    f"unexpected upstream document preservation receipt: {entry}")
+            require(entry not in expected or expected[entry] == digest, "upstream document receipt collision")
+            expected[entry] = digest
+    for entry, digest in expected.items():
+        require(hashlib.sha256(required_jar_entry(jar, entry)).hexdigest() == digest,
+                f"original Curator/Guava document lost or changed during Hadoop assembly: {entry}")
+    return expected
 
 
 def generated_pom_gav(content: bytes) -> tuple[str, str, str]:
@@ -419,13 +453,43 @@ def verify(source_root: Path, output: Path) -> dict:
                     f"official Guava/Curator source review hash mismatch: {folder}/{relative}")
             sources.append({"url": root_url + relative, "sha256": expected, "purpose": "immutable upstream packaging/version review"})
     repository = Path("/root/.m2/repository")
+    direct_guava = repository / "com/google/guava/guava" / GUAVA_VERSION / f"guava-{GUAVA_VERSION}.jar"
+    failureaccess = (repository / "com/google/guava/failureaccess" / FAILUREACCESS_VERSION
+                     / f"failureaccess-{FAILUREACCESS_VERSION}.jar")
+    curator_build = json.loads((output / "curator-bundle-build.json").read_text())
+    require(curator_build["command_exit"] == 0 and curator_build["finished_jar_edits"] is False
+            and curator_build["upstream_java_source_changes"] is False
+            and curator_build["custom_group"] == CURATOR_VARIANT_GROUP
+            and curator_build["custom_version"] == CURATOR_VARIANT_VERSION,
+            "complete compatible Curator assembly did not succeed")
+    require(curator_build["fixed_input_sha256"] == {
+        "guava": hashlib.sha256(direct_guava.read_bytes()).hexdigest(),
+        "failureaccess": hashlib.sha256(failureaccess.read_bytes()).hexdigest()},
+        "actual fixed Curator Guava/failureaccess inputs differ from the build receipt")
+    require(hashlib.sha256((output / "curator-bundle-build.log").read_bytes()).hexdigest()
+            == curator_build["build_log_sha256"], "compatible Curator build log differs from successful receipt")
+    reference = (source_root / "curator-assemblies/curator-guava-reference/target"
+                 / f"curator-guava-reference-{CURATOR_VARIANT_VERSION}.jar")
+    require(hashlib.sha256(reference.read_bytes()).hexdigest() == curator_build["fixed_only_reference_sha256"],
+            "fixed-only Curator Guava bytecode reference differs from successful receipt")
     curator_verification, curator_selected_modules = {}, {}
     for module in CURATOR_MODULES:
-        directory = repository / "org/apache/curator" / module / CURATOR_VERSION
-        curator_selected_modules[module] = directory / f"{module}-{CURATOR_VERSION}-{CURATOR_CLASSIFIER}.jar"
-        curator_verification[module] = verify_curator_module(curator_selected_modules[module],
-            directory / f"{module}-{CURATOR_VERSION}.jar", module, reviewed_metadata=CURATOR_REVIEWED_METADATA)
-    direct_guava = repository / "com/google/guava/guava" / GUAVA_VERSION / f"guava-{GUAVA_VERSION}.jar"
+        original = repository / "org/apache/curator" / module / CURATOR_VERSION
+        directory = repository / CURATOR_VARIANT_GROUP.replace(".", "/") / module / CURATOR_VARIANT_VERSION
+        selected = directory / f"{module}-{CURATOR_VARIANT_VERSION}.jar"
+        curator_selected_modules[module] = selected
+        curator_verification[module] = verify_curator_shaded_module(selected,
+            original / f"{module}-{CURATOR_VERSION}-{CURATOR_CLASSIFIER}.jar",
+            original / f"{module}-{CURATOR_VERSION}.jar", module, direct_guava, failureaccess, reference,
+            reviewed_metadata=CURATOR_REVIEWED_METADATA)
+        receipt = curator_build["modules"][module]
+        require(all(receipt.get(key) == value for key, value in curator_verification[module].items()),
+                f"actual complete compatible Curator artifact differs from successful receipt: {module}")
+        require(hashlib.sha256(project_pom(module, multi_release=curator_build["multi_release_implementation_inputs"]
+            and module == "curator-client").encode()).hexdigest() == receipt["source_pom_sha256"],
+                f"Curator assembly source POM differs from the reviewed recipe: {module}")
+        require(hashlib.sha256(selected.with_suffix(".pom").read_bytes()).hexdigest() == receipt["installed_pom_sha256"],
+                f"actual installed compatible Curator POM differs from successful receipt: {module}")
     shaded_guava = (repository / "org/apache/hadoop/thirdparty/hadoop-shaded-guava" / HADOOP_SHADED_GUAVA_VERSION
                     / f"hadoop-shaded-guava-{HADOOP_SHADED_GUAVA_VERSION}.jar")
     graphs, recipes, assembly_inputs = {}, {}, {}
@@ -446,7 +510,6 @@ def verify(source_root: Path, output: Path) -> dict:
             "built_artifact_sha256": hashlib.sha256((directory / "target" / f"{module}-{VARIANT_VERSION}.jar").read_bytes()).hexdigest()}
 
     classes, services, artifacts, jetty_modules = set(), {}, [], set()
-    reviewed_curator_metadata_mentions = {}
     yarn_references, jetty_references, transport_references, identities = {}, {}, {}, {}
     jline_verification = None
     for module in MODULES:
@@ -462,10 +525,6 @@ def verify(source_root: Path, output: Path) -> dict:
                     verify_maven_properties(required_jar_entry(jar, f"META-INF/maven/org.apache.hadoop/{original}/pom.properties"),
                                             "org.apache.hadoop", original, UPSTREAM_VERSION)
             for name in jar.namelist():
-                mentioned = validate_final_curator_guava_namespace(name, b"" if name.endswith("/") else jar.read(name),
-                                                                  reviewed_metadata=CURATOR_REVIEWED_METADATA)
-                if mentioned:
-                    reviewed_curator_metadata_mentions[f"{module}:{name}"] = CURATOR_REVIEWED_METADATA[name]
                 validate_no_embedded_snappy(name)
                 if not name.endswith("/") and resource_kind(name) == "java-spi":
                     require(jar.namelist().count(name) == 1, f"duplicate Java SPI descriptor: {name}")
@@ -500,8 +559,13 @@ def verify(source_root: Path, output: Path) -> dict:
             if module == "hadoop-client-runtime":
                 validate_retained_dependency_metadata(jar)
                 final_curator_inventory = validate_final_curator_inventory(jar, curator_selected_modules)
-                with ZipFile(direct_guava) as direct, ZipFile(shaded_guava) as shaded:
-                    guava_verification = validate_guava_implementations(jar, direct, shaded)
+                final_curator_documents = validate_final_curator_documents(jar, curator_build["modules"])
+                if curator_build["multi_release_implementation_inputs"]:
+                    require(re.search(rb"(?mi)^Multi-Release:\s*true\s*$", jar.read("META-INF/MANIFEST.MF")) is not None,
+                            "final Hadoop runtime manifest does not activate fixed multi-release implementations")
+                with ZipFile(direct_guava) as direct, ZipFile(shaded_guava) as shaded, \
+                        ZipFile(curator_selected_modules["curator-client"]) as curator, ZipFile(failureaccess) as failure:
+                    guava_verification = validate_guava_implementations(jar, direct, shaded, curator, failure)
                 guava_verification["resolved_direct_input_sha256"] = hashlib.sha256(direct_guava.read_bytes()).hexdigest()
                 guava_verification["resolved_pre_shaded_input_sha256"] = hashlib.sha256(shaded_guava.read_bytes()).hexdigest()
                 for package in ("core/json", "databind/cfg"):
@@ -544,9 +608,10 @@ def verify(source_root: Path, output: Path) -> dict:
         "artifact_identity": identities,
         "jline_source_time_resource_adapter": adapter,
         "jline_typed_resource_verification": jline_verification,
-        "curator_complete_official_osgi_module_compatibility": curator_verification,
+        "curator_source_time_compatible_bundle_build": curator_build,
+        "curator_complete_compatible_module_verification": curator_verification,
         "curator_final_complete_assembly": final_curator_inventory,
-        "curator_exact_reviewed_source_metadata_mentions": reviewed_curator_metadata_mentions,
+        "curator_final_preserved_upstream_documents_sha256": final_curator_documents,
         "guava_complete_fixed_input_assembly": guava_verification,
         "snappy_assembly_boundary": {"embedded_implementation_native_and_metadata_absent": True,
                                      "pre_shaded_snappy_references_absent": True,

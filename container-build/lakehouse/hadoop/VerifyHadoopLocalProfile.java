@@ -119,7 +119,8 @@ public class VerifyHadoopLocalProfile {
   private static void verifyFixedGuavaAndCurator() throws Exception {
     String runtime = "hadoop-client-runtime-3.5.0-d2c-local1.jar";
     for (String prefix : new String[] {"org.apache.hadoop.shaded.com.google.common.",
-                                      "org.apache.hadoop.thirdparty.com.google.common."}) {
+                                      "org.apache.hadoop.thirdparty.com.google.common.",
+                                      "org.apache.hadoop.shaded.org.apache.curator.shaded.com.google.common."}) {
       for (String collection : new String[] {"CompactHashMap", "CompactHashSet"}) {
         Class<?> type = Class.forName(prefix + "collect." + collection);
         requireOrigin(type, runtime);
@@ -170,8 +171,23 @@ public class VerifyHadoopLocalProfile {
     } finally {
       framework.getMethod("close").invoke(client);
     }
-    requireAbsent(curator + "shaded.com.google.common.collect.CompactHashMap");
-    System.out.println("guava_two_namespaces_small_serialization=PASS;curator_client_framework_recipes_init=PASS;zookeeper_network_calls=NONE");
+    // This public 5.2.0 method exposes Curator's shaded Guava Predicate. Direct
+    // osgi replacement changes its descriptor; the rebuilt full modules must
+    // preserve and execute the original API against the fixed implementation.
+    Class<?> transaction = Class.forName(curator + "framework.api.transaction.CuratorTransactionResult");
+    Class<?> operation = Class.forName(curator + "framework.api.transaction.OperationType");
+    Class<?> stat = Class.forName("org.apache.hadoop.shaded.org.apache.zookeeper.data.Stat");
+    Class<?> predicate = Class.forName(curator + "shaded.com.google.common.base.Predicate");
+    for (Class<?> type : new Class<?>[] {transaction, operation, predicate}) requireOrigin(type, runtime);
+    Method ofTypeAndPath = transaction.getMethod("ofTypeAndPath", operation, String.class);
+    require(ofTypeAndPath.getReturnType().equals(predicate), "Original public Curator Predicate descriptor changed");
+    Object create = Enum.valueOf((Class) operation, "CREATE");
+    Object result = transaction.getConstructor(operation, String.class, String.class, stat)
+        .newInstance(create, "/d2c-offline-probe", "/d2c-offline-probe", null);
+    Object filter = ofTypeAndPath.invoke(null, create, "/d2c-offline-probe");
+    require(Boolean.TRUE.equals(predicate.getMethod("apply", Object.class).invoke(filter, result)),
+            "Public Curator Predicate linkage/behavior failed");
+    System.out.println("guava_three_namespaces_small_serialization=PASS;curator_client_framework_recipes_init=PASS;curator_public_predicate_abi=PASS;zookeeper_network_calls=NONE");
   }
 
   public static void main(String[] args) throws Exception {
