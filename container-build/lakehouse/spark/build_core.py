@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import shutil
 import subprocess
 import tarfile
@@ -22,6 +23,15 @@ HELPER_DIR = Path(__file__).resolve().parent
 MANIFEST = HELPER_DIR / "inputs.json"
 NAMESPACE = {"m": "http://maven.apache.org/POM/4.0.0"}
 MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
+PROTOBUF_PROOF_MARKER = "D2C_SPARK_PROTOBUF_PROOF="
+PROTOBUF_CLASSES = {
+    "org.apache.spark.status.protobuf.StoreTypes",
+    "org.apache.spark.status.protobuf.StoreTypes$SparkPlanGraphNodeWrapper",
+    "org.apache.spark.status.protobuf.StoreTypes$SparkPlanGraphNodeWrapper$Builder",
+    "org.apache.spark.status.protobuf.StoreTypes$SparkPlanGraphNodeWrapper$WrapperCase",
+    "org.apache.spark.status.protobuf.StoreTypes$SparkPlanGraphNode",
+    "org.apache.spark.status.protobuf.StoreTypes$SparkPlanGraphClusterWrapper",
+}
 
 
 def digest_file(path: Path, algorithm: str = "sha256") -> str:
@@ -148,12 +158,94 @@ def maven_command(maven: Path, source: Path, repository: Path, manifest: dict) -
     ]
 
 
+def verify_build_jdk(manifest: dict, environment: dict) -> tuple[Path, dict]:
+    """Match the baseline compiler generation without weakening class-set checks."""
+    if not environment.get("JAVA_HOME"):
+        raise ValueError("JAVA_HOME must select the pinned Spark build-only Java 17 JDK")
+    home = Path(environment["JAVA_HOME"]).resolve()
+    release = home / "release"
+    values = {}
+    for line in release.read_text().splitlines():
+        if "=" in line:
+            name, value = line.split("=", 1)
+            values[name] = value.strip().strip('"')
+    expected = manifest["build_jdk"]
+    if values.get("JAVA_VERSION") != expected["java_version"] or values.get("IMPLEMENTOR") != expected["implementor"]:
+        raise ValueError("Unexpected Spark build JDK release/vendor")
+    runtime = values.get("JAVA_RUNTIME_VERSION", "")
+    prefix = expected["runtime_version_prefix"]
+    if runtime != prefix and not runtime.startswith(prefix + "-"):
+        raise ValueError("Unexpected Spark build JDK update/build")
+    environment["JAVA_HOME"] = str(home)
+    environment["PATH"] = str(home / "bin") + os.pathsep + environment.get("PATH", "")
+    reports = {}
+    for tool in ("java", "javac"):
+        executable = home / "bin" / tool
+        if not executable.is_file():
+            raise ValueError(f"Missing build-only JDK executable: {tool}")
+        report = subprocess.run([str(executable), "-version"], check=True, text=True, capture_output=True, env=environment)
+        reports[tool] = (report.stdout + report.stderr).strip()
+    if f'version "{expected["java_version"]}"' not in reports["java"] or prefix not in reports["java"]:
+        raise ValueError("Actual Java executable does not match the pinned Spark compiler JDK")
+    if reports["javac"] != f'javac {expected["java_version"]}':
+        raise ValueError("Actual javac executable does not match the pinned Spark compiler JDK")
+    return home, {
+        "expected_toolchain": expected, "java_home": str(home),
+        "release_sha256": digest_file(release), "release_properties": values,
+        "java_version_output": reports["java"], "javac_version_output": reports["javac"],
+    }
+
+
+def validate_protobuf_proof(stdout: str, target: Path, java_major: int) -> dict:
+    lines = stdout.strip().splitlines()
+    if len(lines) != 1 or not lines[0].startswith(PROTOBUF_PROOF_MARKER):
+        raise ValueError("Missing or ambiguous actual Spark protobuf probe proof")
+    proof = json.loads(lines[0][len(PROTOBUF_PROOF_MARKER):])
+    expected_path = str(target.resolve())
+    if not isinstance(proof, dict):
+        raise ValueError("Spark protobuf probe proof is not an object")
+    if proof.get("status") != "passed" or any(type(proof.get(name)) is not int or proof[name] != value for name, value in {
+        "schema_version": 1, "actual_java_major": java_major, "expected_java_major": java_major,
+    }.items()):
+        raise ValueError("Unexpected actual Spark protobuf probe status/Java version")
+    if proof.get("expected_core_jar") != expected_path or proof.get("actual_core_jar") != expected_path:
+        raise ValueError("Spark protobuf probe loaded a different core JAR")
+    origins = proof.get("class_code_sources")
+    if origins != {name: expected_path for name in PROTOBUF_CLASSES}:
+        raise ValueError("Spark protobuf implementation origins are not the rebuilt core JAR")
+    if proof.get("core_jar_sha256") != digest_file(target):
+        raise ValueError("Spark protobuf probe core JAR hash mismatch")
+    if (proof.get("cases") != ["NODE", "CLUSTER", "WRAPPER_NOT_SET"] or proof.get("unset_merge_preserves_existing") is not True
+            or any(type(proof.get(name)) is not int or proof[name] != 3 for name in ("merge_cases_verified", "wire_roundtrips_verified"))):
+        raise ValueError("Spark protobuf probe did not cover every enum merge/wire branch")
+    if any(not isinstance(proof.get(name), str) or not proof[name] for name in ("java_runtime_version", "java_vendor")):
+        raise ValueError("Spark protobuf probe omitted actual JVM identity")
+    return proof
+
+
+def run_protobuf_probe(jdk: Path, target: Path, work: Path, environment: dict) -> dict:
+    """Execute original generated classes using only this rebuilt JAR."""
+    source = HELPER_DIR / "VerifySparkProtobuf.java"
+    classes = work / "protobuf-probe-classes"
+    classes.mkdir(exist_ok=False)
+    compile_command = [str(jdk / "bin/javac"), "-J-Xmx256m", "--release", "17", "-classpath", str(target), "-d", str(classes), str(source)]
+    subprocess.run(compile_command, check=True, text=True, capture_output=True, env=environment)
+    command = [str(jdk / "bin/java"), "-Xmx128m", "-classpath", str(classes) + os.pathsep + str(target), "VerifySparkProtobuf", "17", str(target)]
+    report = subprocess.run(command, check=True, text=True, capture_output=True, env=environment)
+    proof = validate_protobuf_proof(report.stdout, target, 17)
+    return {"probe_source_sha256": digest_file(source), "compile_command": compile_command, "command": command, "result": proof}
+
+
 def build(work: Path, output: Path, baseline: Path, repository: Path,
           shared_maven_home: Path | None = None, shared_maven_archive: Path | None = None) -> None:
     manifest = json.loads(MANIFEST.read_text())
     # Fail before any large fetch when the Docker stage still has Spark 4.1.x.
     with zipfile.ZipFile(baseline) as jar:
         verify_spark_identity(jar, manifest["spark_version"])
+    environment = os.environ.copy()
+    environment.pop("MAVEN_ARGS", None)
+    environment["MAVEN_OPTS"] = "-Xmx1536m"
+    jdk, jdk_evidence = verify_build_jdk(manifest, environment)
     work.mkdir(parents=True, exist_ok=True)
     output.mkdir(parents=True, exist_ok=True)
     downloads = work / "downloads"
@@ -171,13 +263,11 @@ def build(work: Path, output: Path, baseline: Path, repository: Path,
         maven_root = extract_verified(maven_archive, work / "tools", manifest["maven"]["directory"])
         tool_installation = "downloaded and extracted verified release archive"
     maven = maven_root / "bin/mvn"
-    environment = os.environ.copy()
-    environment.pop("MAVEN_ARGS", None)
-    environment["MAVEN_OPTS"] = "-Xmx1536m"
     version = subprocess.run([str(maven), "--version"], check=True, text=True, capture_output=True, env=environment)
     if f"Apache Maven {manifest['maven']['version']}" not in version.stdout:
         raise ValueError("Unexpected Maven executable version")
-    java = subprocess.run(["java", "-version"], check=True, text=True, capture_output=True, env=environment)
+    if not re.search(r"Java version:\s*" + re.escape(manifest["build_jdk"]["java_version"]) + r"(?:,|\s)", version.stdout):
+        raise ValueError("Maven did not select the pinned Spark Java 17 compiler")
     command = maven_command(maven, source, repository, manifest)
     build_command = command + ["clean", "package"]
     subprocess.run(build_command, cwd=source, env=environment, check=True)
@@ -186,6 +276,7 @@ def build(work: Path, output: Path, baseline: Path, repository: Path,
     dependencies = verify_dependency_tree(json.loads(tree_path.read_text()), manifest)
     target = source / f"core/target/spark-core_2.13-{manifest['spark_version']}.jar"
     verification = verify_runtime(target, baseline, manifest["jetty_version"], manifest["spark_version"])
+    verification["protobuf_builder_probe"] = run_protobuf_probe(jdk, target, work, environment)
     artifact = output / f"spark-core_2.13-{manifest['spark_version']}-d2c-jetty{manifest['jetty_version']}.jar"
     shutil.copyfile(target, artifact)
     for document in ("LICENSE", "NOTICE"):
@@ -199,7 +290,8 @@ def build(work: Path, output: Path, baseline: Path, repository: Path,
         "build_strategy": "standalone original core POM, published same-release Spark dependencies",
         "build_command": build_command, "dependency_overrides": manifest["overrides"],
         "maven_version_output": version.stdout.strip(),
-        "java_version_output": (java.stderr or java.stdout).strip(),
+        "java_version_output": jdk_evidence["java_version_output"],
+        "build_java": jdk_evidence,
         "selected_dependencies": dependencies,
         "artifact": {"filename": artifact.name, "sha256": digest_file(artifact)},
         "verification": verification,

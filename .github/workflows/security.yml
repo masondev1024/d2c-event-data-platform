@@ -628,6 +628,75 @@ jobs:
               "scope": "Final-image Hadoop local profile only; no remote Hadoop service was exercised"
           }, indent=2) + "\n")
           PYTHON
+      - name: Prove Spark protobuf compatibility on the actual Java 21 final runtime
+        id: spark-protobuf
+        if: ${{ !cancelled() && steps.storage.outcome == 'success' && steps.build.outcome == 'success' }}
+        run: |
+          actualIID="$(cat "$RUNNER_TEMP/lakehouse.iid")"
+          [[ "$actualIID" =~ ^sha256:[0-9a-f]{64}$ ]]
+          name="d2c-spark-protobuf-$ARCH-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          owner="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+          python3 scripts/container_security_guard.py \
+            --kind test --minimum-free-gib 8 --reserve-free-gib 6 --timeout-seconds 180 \
+            --storage-path "$GITHUB_WORKSPACE" --storage-path /var/lib/docker \
+            --container-name "$name" --owner-token "$owner" \
+            --evidence-dir "$RUNNER_TEMP/d2c-lakehouse-runtime-$ARCH/spark-protobuf" -- \
+            docker run --rm --pull never --name "$name" --label "d2c.security.owner=$owner" \
+            --platform "linux/$ARCH" --network none --memory 1g --cpus 2 --read-only \
+            --tmpfs /tmp:rw,nosuid,nodev,size=128m --entrypoint /bin/sh "$actualIID" -ec '
+              mkdir -m 700 /tmp/d2c-spark-protobuf
+              javac --release 17 -cp /opt/spark/jars/spark-core_2.13-4.2.1.jar \
+                -d /tmp/d2c-spark-protobuf \
+                /usr/share/d2c-security/recipe-source/container-build/lakehouse/spark/VerifySparkProtobuf.java
+              java -cp /tmp/d2c-spark-protobuf:/opt/spark/jars/spark-core_2.13-4.2.1.jar \
+                VerifySparkProtobuf 21 /opt/spark/jars/spark-core_2.13-4.2.1.jar
+            '
+          python3 - <<'PYTHON'
+          import hashlib, json, os, re
+          from pathlib import Path
+          temporary = Path(os.environ["RUNNER_TEMP"])
+          evidence = temporary / ("d2c-lakehouse-runtime-" + os.environ["ARCH"]) / "spark-protobuf"
+          guard = json.loads((evidence / "summary.json").read_text())
+          if (guard.get("outcome") != "completed" or type(guard.get("child_exit")) is not int or guard["child_exit"] != 0
+                  or type(guard.get("exit")) is not int or guard["exit"] != 0
+                  or guard.get("abort", "missing") is not None or guard.get("cleanup_errors") != []):
+              raise SystemExit("Spark protobuf guard or owned cleanup is incomplete")
+          prefix = "D2C_SPARK_PROTOBUF_PROOF="
+          records = [json.loads(line[len(prefix):]) for line in (evidence / "command.log").read_text().splitlines()
+                     if line.startswith(prefix)]
+          if len(records) != 1 or not isinstance(records[0], dict):
+              raise SystemExit("Spark protobuf exact success proof is missing or ambiguous")
+          proof = records[0]
+          expected_jar = "/opt/spark/jars/spark-core_2.13-4.2.1.jar"
+          source_jar = temporary / "d2c-artifacts/spark/spark-core_2.13-4.2.1-d2c-jetty12.1.14.jar"
+          with source_jar.open("rb") as source:
+              source_sha256 = hashlib.file_digest(source, "sha256").hexdigest()
+          expected_classes = {"org.apache.spark.status.protobuf.StoreTypes",
+                              "org.apache.spark.status.protobuf.StoreTypes$SparkPlanGraphNodeWrapper",
+                              "org.apache.spark.status.protobuf.StoreTypes$SparkPlanGraphNodeWrapper$Builder",
+                              "org.apache.spark.status.protobuf.StoreTypes$SparkPlanGraphNodeWrapper$WrapperCase",
+                              "org.apache.spark.status.protobuf.StoreTypes$SparkPlanGraphNode",
+                              "org.apache.spark.status.protobuf.StoreTypes$SparkPlanGraphClusterWrapper"}
+          if (type(proof.get("schema_version")) is not int or proof["schema_version"] != 1 or proof.get("status") != "passed"
+                  or type(proof.get("actual_java_major")) is not int or proof["actual_java_major"] != 21
+                  or type(proof.get("expected_java_major")) is not int or proof["expected_java_major"] != 21
+                  or not isinstance(proof.get("java_runtime_version"), str) or not proof["java_runtime_version"]
+                  or not isinstance(proof.get("java_vendor"), str) or not proof["java_vendor"]
+                  or proof.get("expected_core_jar") != expected_jar or proof.get("actual_core_jar") != expected_jar
+                  or proof.get("core_jar_sha256") != source_sha256
+                  or proof.get("class_code_sources") != {name: expected_jar for name in expected_classes}
+                  or proof.get("cases") != ["NODE", "CLUSTER", "WRAPPER_NOT_SET"]
+                  or type(proof.get("merge_cases_verified")) is not int or proof["merge_cases_verified"] != 3
+                  or type(proof.get("wire_roundtrips_verified")) is not int or proof["wire_roundtrips_verified"] != 3
+                  or proof.get("unset_merge_preserves_existing") is not True):
+              raise SystemExit("Spark protobuf Java 21, rebuilt core origin, merge or wire proof is incomplete")
+          image_id = (temporary / "lakehouse.iid").read_text().strip()
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+              raise SystemExit("Spark protobuf target is not the immutable final image ID")
+          proof.update({"image_id": image_id, "platform": "linux/" + os.environ["ARCH"],
+                        "verified_source_core_jar_sha256": source_sha256, "remote_operations": "NONE"})
+          (evidence / "runtime-proof.json").write_text(json.dumps(proof, indent=2) + "\n")
+          PYTHON
       - name: Pull the pinned Kafka index and record its actual native image ID
         id: broker
         if: ${{ !cancelled() && steps.storage.outcome == 'success' && steps.build.outcome == 'success' }}

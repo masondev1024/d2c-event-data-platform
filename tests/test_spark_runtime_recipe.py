@@ -86,6 +86,20 @@ def dependency_tree():
     }
 
 
+def protobuf_proof(target: Path):
+    path = str(target.resolve())
+    return {
+        "schema_version": 1, "status": "passed", "actual_java_major": 17,
+        "expected_java_major": 17, "java_runtime_version": "17.0.21+9",
+        "java_vendor": "Eclipse Adoptium", "expected_core_jar": path,
+        "actual_core_jar": path, "core_jar_sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+        "class_code_sources": {name: path for name in build.PROTOBUF_CLASSES},
+        "cases": ["NODE", "CLUSTER", "WRAPPER_NOT_SET"],
+        "merge_cases_verified": 3, "wire_roundtrips_verified": 3,
+        "unset_merge_preserves_existing": True,
+    }
+
+
 def docker_stages():
     text = (RECIPE.parents[2] / "lakehouse/Dockerfile").read_text()
     matches = list(re.finditer(r"^FROM (?:--platform=\$BUILDPLATFORM )?(\S+) AS (\S+)\s*$", text, re.M))
@@ -131,6 +145,16 @@ class SparkRuntimeRecipeTests(unittest.TestCase):
 
     def test_rejects_changed_classfile_version(self):
         self.assert_rejected_jar({"major": 65}, "structural ABI changed")
+
+    def test_missing_compiler_generated_class_still_fails_exact_class_set(self):
+        baseline, rebuilt = self.root / "baseline.jar", self.root / "rebuilt.jar"
+        jar_fixture(baseline)
+        jar_fixture(rebuilt)
+        name = "org/apache/spark/status/protobuf/StoreTypes$1.class"
+        with zipfile.ZipFile(baseline, "a") as jar:
+            jar.writestr(name, class_file(name[:-6]))
+        with self.assertRaisesRegex(ValueError, r"Spark class set changed:.*StoreTypes\$1"):
+            verify.verify_runtime(rebuilt, baseline)
 
     def test_rejects_unrelocated_jetty_and_missing_implementation(self):
         baseline, rebuilt = self.root / "baseline.jar", self.root / "rebuilt.jar"
@@ -215,6 +239,135 @@ class SparkRuntimeRecipeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unexpected Spark source version"):
             build.verify_source(source, manifest)
 
+    def build_jdk_fixture(self, **changes):
+        home = self.root / "jdk"
+        (home / "bin").mkdir(parents=True, exist_ok=True)
+        for name in ("java", "javac"):
+            (home / "bin" / name).write_text("Fixture executable; never run")
+        values = {"JAVA_VERSION": "17.0.21", "JAVA_RUNTIME_VERSION": "17.0.21+9", "IMPLEMENTOR": "Eclipse Adoptium"}
+        values.update(changes)
+        (home / "release").write_text("".join(f'{name}="{value}"\n' for name, value in values.items()))
+        return home
+
+    def jdk_version_reports(self, *, javac="javac 17.0.21", java='openjdk version "17.0.21"\nOpenJDK Runtime Environment Temurin-17.0.21+9 (build 17.0.21+9)'):
+        return [subprocess.CompletedProcess([], 0, "", java), subprocess.CompletedProcess([], 0, javac, "")]
+
+    def test_build_jdk_requires_actual_pinned_release_and_absolute_executables(self):
+        home = self.build_jdk_fixture()
+        environment = {"JAVA_HOME": str(home), "PATH": "/unrelated/bin"}
+        with patch.object(build.subprocess, "run", side_effect=self.jdk_version_reports()) as run:
+            selected, evidence = build.verify_build_jdk(MANIFEST, environment)
+        self.assertEqual(selected, home.resolve())
+        self.assertEqual(run.call_args_list[0].args[0], [str(home.resolve() / "bin/java"), "-version"])
+        self.assertEqual(run.call_args_list[1].args[0], [str(home.resolve() / "bin/javac"), "-version"])
+        self.assertEqual(environment["PATH"].split(":")[0], str(home.resolve() / "bin"))
+        self.assertEqual(evidence["release_sha256"], hashlib.sha256((home / "release").read_bytes()).hexdigest())
+        self.assertEqual(evidence["expected_toolchain"]["major"], 17)
+
+    def test_build_jdk_rejects_wrong_major_patch_vendor_or_build_before_execution(self):
+        for values in ({"JAVA_VERSION": "21.0.13"}, {"JAVA_VERSION": "17.0.20.1"},
+                       {"IMPLEMENTOR": "Unknown vendor"}, {"JAVA_RUNTIME_VERSION": "17.0.21+90"}):
+            with self.subTest(values=values):
+                home = self.build_jdk_fixture(**values)
+                with patch.object(build.subprocess, "run") as run:
+                    with self.assertRaisesRegex(ValueError, "Unexpected Spark build JDK"):
+                        build.verify_build_jdk(MANIFEST, {"JAVA_HOME": str(home)})
+                run.assert_not_called()
+
+    def test_build_jdk_rejects_executable_release_mismatch(self):
+        home = self.build_jdk_fixture()
+        for reports in (self.jdk_version_reports(java='openjdk version "21.0.13"'),
+                        self.jdk_version_reports(javac="javac 21.0.13")):
+            with self.subTest(reports=reports):
+                with patch.object(build.subprocess, "run", side_effect=reports):
+                    with self.assertRaisesRegex(ValueError, "Actual (Java|javac) executable"):
+                        build.verify_build_jdk(MANIFEST, {"JAVA_HOME": str(home)})
+
+    def test_wrong_build_jdk_fails_before_source_download(self):
+        baseline = self.root / "baseline.jar"
+        jar_fixture(baseline)
+        home = self.build_jdk_fixture(JAVA_VERSION="21.0.13")
+        with patch.dict(build.os.environ, {"JAVA_HOME": str(home)}):
+            with patch.object(build, "download_verified") as download:
+                with self.assertRaisesRegex(ValueError, "Unexpected Spark build JDK"):
+                    build.build(self.root / "work", self.root / "output", baseline, self.root / "repository")
+        download.assert_not_called()
+
+    def test_actual_protobuf_probe_proof_requires_jar_identity_and_complete_cases(self):
+        target = self.root / "core.jar"
+        target.write_bytes(b"Fixture JAR bytes; never loaded")
+        proof = protobuf_proof(target)
+        self.assertEqual(build.validate_protobuf_proof(build.PROTOBUF_PROOF_MARKER + json.dumps(proof), target, 17), proof)
+        corruptions = (
+            {"schema_version": True}, {"actual_java_major": 17.0},
+            {"actual_java_major": 21}, {"expected_java_major": 21}, {"status": "skipped"},
+            {"actual_core_jar": "/other/core.jar"}, {"expected_core_jar": "/other/core.jar"},
+            {"core_jar_sha256": "0" * 64}, {"class_code_sources": {}},
+            {"class_code_sources": {name: "/baseline/core.jar" for name in build.PROTOBUF_CLASSES}},
+            {"cases": ["NODE", "CLUSTER"]}, {"merge_cases_verified": 2},
+            {"wire_roundtrips_verified": 2}, {"unset_merge_preserves_existing": False},
+            {"java_runtime_version": ""}, {"java_vendor": ""}, {"java_vendor": True},
+            {"unset_merge_preserves_existing": 1}, {"merge_cases_verified": 3.0},
+        )
+        for corruption in corruptions:
+            with self.subTest(corruption=corruption):
+                bad = {**proof, **corruption}
+                with self.assertRaises(ValueError):
+                    build.validate_protobuf_proof(build.PROTOBUF_PROOF_MARKER + json.dumps(bad), target, 17)
+        with self.assertRaisesRegex(ValueError, "not an object"):
+            build.validate_protobuf_proof(build.PROTOBUF_PROOF_MARKER + "[]", target, 17)
+
+    def test_protobuf_probe_rejects_missing_or_ambiguous_execution_marker(self):
+        target = self.root / "core.jar"
+        target.write_bytes(b"fixture")
+        marker = build.PROTOBUF_PROOF_MARKER + json.dumps(protobuf_proof(target))
+        for stdout in ("", "BUILD SUCCESS", marker + "\n" + marker, "unexpected\n" + marker):
+            with self.subTest(stdout=stdout):
+                with self.assertRaisesRegex(ValueError, "Missing or ambiguous"):
+                    build.validate_protobuf_proof(stdout, target, 17)
+
+    def test_protobuf_probe_runner_uses_only_rebuilt_jar_and_records_actual_commands(self):
+        target = self.root / "core.jar"
+        target.write_bytes(b"fixture")
+        work = self.root / "work"
+        work.mkdir()
+        jdk = self.root / "jdk"
+        reports = [subprocess.CompletedProcess([], 0, "", ""),
+                   subprocess.CompletedProcess([], 0, build.PROTOBUF_PROOF_MARKER + json.dumps(protobuf_proof(target)), "")]
+        with patch.object(build.subprocess, "run", side_effect=reports) as run:
+            report = build.run_protobuf_probe(jdk, target, work, {})
+        compilation = run.call_args_list[0].args[0]
+        execution = run.call_args_list[1].args[0]
+        self.assertEqual(compilation[:4], [str(jdk / "bin/javac"), "-J-Xmx256m", "--release", "17"])
+        self.assertEqual(compilation[compilation.index("-classpath") + 1], str(target))
+        self.assertEqual(execution[0], str(jdk / "bin/java"))
+        self.assertEqual(execution[execution.index("-classpath") + 1], str(work / "protobuf-probe-classes") + ":" + str(target))
+        self.assertEqual(execution[-3:], ["VerifySparkProtobuf", "17", str(target)])
+        self.assertEqual(report["result"]["core_jar_sha256"], hashlib.sha256(target.read_bytes()).hexdigest())
+        self.assertEqual(report["probe_source_sha256"], hashlib.sha256((RECIPE / "VerifySparkProtobuf.java").read_bytes()).hexdigest())
+
+    def test_protobuf_probe_cannot_run_after_compilation_failure(self):
+        work = self.root / "work"
+        work.mkdir()
+        with patch.object(build.subprocess, "run", side_effect=subprocess.CalledProcessError(1, ["javac"])) as run:
+            with self.assertRaises(subprocess.CalledProcessError):
+                build.run_protobuf_probe(self.root / "jdk", self.root / "core.jar", work, {})
+        self.assertEqual(run.call_count, 1)
+
+    def test_portable_probe_exercises_original_enum_switch_and_checks_loaded_origins(self):
+        source = (RECIPE / "VerifySparkProtobuf.java").read_text()
+        for value in (".mergeFrom(input)", ".parseFrom(merged.toByteArray())", "getCodeSource()",
+                      "expectedJar.equals(actualJar)", "actualJava == expectedJava", "getWrapperCase()",
+                      "checkCase(node, WrapperCase.NODE, cluster)",
+                      "checkCase(cluster, WrapperCase.CLUSTER, node)",
+                      "checkCase(unset, WrapperCase.WRAPPER_NOT_SET, unset)",
+                      "checkCase(unset, WrapperCase.WRAPPER_NOT_SET, node)",
+                      "checkCase(unset, WrapperCase.WRAPPER_NOT_SET, cluster)",
+                      "D2C_SPARK_PROTOBUF_PROOF=", "MessageDigest.getInstance(\"SHA-256\")"):
+            self.assertIn(value, source)
+        self.assertNotRegex(source, r"\bassert\s+")
+        self.assertNotIn("java.net.", source)
+
     def assert_scratch_export(self, stage, builder, source, destination):
         _, stages = docker_stages()
         self.assertEqual(stages[stage][0], "scratch")
@@ -246,6 +399,22 @@ class SparkRuntimeRecipeTests(unittest.TestCase):
         self.assertIn('JAVA_VERSION="21.0.13"', stages["runtime"][1])
         self.assertIn("spark-sql-kafka-0-10_2.13:4.2.1", text)
         self.assertIn(MANIFEST["maven"]["sha512"], stages["source-build-base"][1])
+
+    def test_pinned_java17_compiler_is_confined_to_spark_builder(self):
+        text, stages = docker_stages()
+        self.assertEqual(stages["spark-build-jdk"][0], MANIFEST["build_jdk"]["image"])
+        self.assertRegex(MANIFEST["build_jdk"]["image"], r"^eclipse-temurin:17\.0\.21_9-jdk-jammy@sha256:[a-f0-9]{64}$")
+        spark = stages["spark-runtime-builder"][1]
+        self.assertIn("COPY --from=spark-build-jdk /opt/java/openjdk/ /opt/spark-build-jdk/", spark)
+        self.assertIn("JAVA_HOME=/opt/spark-build-jdk", spark)
+        self.assertIn("PATH=/opt/spark-build-jdk/bin:$PATH", spark)
+        self.assertIn('JAVA_VERSION="17.0.21"', spark)
+        for name, (_, body) in stages.items():
+            if name != "spark-runtime-builder":
+                self.assertNotIn("/opt/spark-build-jdk", body, name)
+        self.assertIn('JAVA_VERSION="21.0.13"', stages["runtime"][1])
+        self.assertIn("sh /build/spark/rebuild.sh", spark)
+        self.assertIn("--maven-home /opt/apache-maven-3.9.15", spark)
 
     def test_artifact_selection_seals_and_verifies_before_jar_installation(self):
         text, stages = docker_stages()

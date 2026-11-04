@@ -57,7 +57,18 @@ RUN --mount=type=cache,id=d2c-iceberg-security-gradle,target=/root/.gradle,shari
 FROM scratch AS iceberg-artifacts
 COPY --from=iceberg-runtime-builder /artifacts/ /iceberg/
 
+# Match the official core's Java 17 compiler, including its synthetic protobuf
+# enum-switch classes. This complete vendor JDK is confined to Spark's builder.
+FROM --platform=$BUILDPLATFORM eclipse-temurin:17.0.21_9-jdk-jammy@sha256:057a0daec60e87c96571bf5c9c7792065bcb19e804d584cd37d4144038a35717 AS spark-build-jdk
+
 FROM source-build-base AS spark-runtime-builder
+COPY --from=spark-build-jdk /opt/java/openjdk/ /opt/spark-build-jdk/
+ENV JAVA_HOME=/opt/spark-build-jdk \
+    JAVA_VERSION=jdk-17.0.21+9 \
+    PATH=/opt/spark-build-jdk/bin:$PATH
+RUN java -version \
+    && javac -version \
+    && grep --fixed-strings --line-regexp 'JAVA_VERSION="17.0.21"' "$JAVA_HOME/release"
 COPY container-build/lakehouse/spark/ /build/spark/
 RUN --mount=type=cache,id=d2c-security-maven-20261022,target=/root/.m2,sharing=locked \
     python3 /recipe-source/scripts/lakehouse_artifacts.py component \

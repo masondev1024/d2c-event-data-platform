@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -140,8 +141,8 @@ class SecurityRuntimeWorkflowTest(unittest.TestCase):
                          '--platform "linux/$ARCH"', "--phase-timeout-seconds 300 --total-timeout-seconds 1200",
                          "--guard-script scripts/container_security_guard.py"):
             self.assertIn(required, harness)
-        # 30m build + 75m scan + 20m pull + 20m harness + 3m Hadoop + 15m setup/upload.
-        self.assertGreaterEqual(int(self.runtime["timeout-minutes"]), 163)
+        # 30m build + 75m scan + 20m pull + 20m harness + 6m Java checks + 15m setup/upload.
+        self.assertGreaterEqual(int(self.runtime["timeout-minutes"]), 166)
 
     def test_six_non_lakehouse_native_images_have_owned_python_probe_after_the_scan(self):
         job = self.jobs["image-scan"]
@@ -316,6 +317,104 @@ class SecurityRuntimeWorkflowTest(unittest.TestCase):
                         self.assertEqual(proof["image_id"], "sha256:" + "1" * 64)
                         self.assertEqual(proof["marker"], marker)
                         self.assertEqual(proof["remote_operations"], "NONE")
+
+    def test_spark_protobuf_probe_is_a_separate_guarded_final_image_check(self):
+        step = self.steps["spark-protobuf"]
+        steps = self.runtime["steps"]
+        self.assertLess(steps.index(self.steps["hadoop-local"]), steps.index(step))
+        self.assertLess(steps.index(step), steps.index(self.steps["broker"]))
+        self.assertNotIn("continue-on-error", step)
+        self.assertTrue(expression(step["if"], scan="failure", **{"hadoop-local": "failure"}))
+        for outcome in ("failure", "skipped", "cancelled"):
+            self.assertFalse(expression(step["if"], build=outcome))
+            self.assertFalse(expression(step["if"], storage=outcome))
+        for name in ("broker", "streaming"):
+            self.assertTrue(expression(self.steps[name]["if"], **{"spark-protobuf": "failure"}))
+        for required in ('actualIID="$(cat "$RUNNER_TEMP/lakehouse.iid")"',
+                         '[[ "$actualIID" =~ ^sha256:[0-9a-f]{64}$ ]]',
+                         "--kind test --minimum-free-gib 8 --reserve-free-gib 6 --timeout-seconds 180",
+                         '--container-name "$name" --owner-token "$owner"',
+                         'docker run --rm --pull never --name "$name" --label "d2c.security.owner=$owner"',
+                         '--platform "linux/$ARCH" --network none --memory 1g --cpus 2 --read-only',
+                         '--tmpfs /tmp:rw,nosuid,nodev,size=128m --entrypoint /bin/sh "$actualIID"',
+                         "javac --release 17 -cp /opt/spark/jars/spark-core_2.13-4.2.1.jar",
+                         "/usr/share/d2c-security/recipe-source/container-build/lakehouse/spark/VerifySparkProtobuf.java",
+                         "VerifySparkProtobuf 21 /opt/spark/jars/spark-core_2.13-4.2.1.jar"):
+            self.assertIn(required, step["run"])
+        self.assertNotIn("--volume", step["run"])
+        self.assertNotIn("--publish", step["run"])
+        upload = next(item for item in steps if "container-security/" in item.get("with", {}).get("path", ""))
+        self.assertEqual(upload["if"], "always()")
+        self.assertIn("d2c-lakehouse-runtime-${{ matrix.arch }}", upload["with"]["path"])
+
+    def test_spark_proof_requires_runtime21_rebuilt_jar_all_cases_guard_cleanup_and_same_iid(self):
+        code = compile(heredoc(self.steps["spark-protobuf"]), "spark-protobuf-workflow-proof", "exec")
+        expected_jar = "/opt/spark/jars/spark-core_2.13-4.2.1.jar"
+        classes = ("StoreTypes", "StoreTypes$SparkPlanGraphNodeWrapper", "StoreTypes$SparkPlanGraphNodeWrapper$Builder",
+                   "StoreTypes$SparkPlanGraphNodeWrapper$WrapperCase", "StoreTypes$SparkPlanGraphNode",
+                   "StoreTypes$SparkPlanGraphClusterWrapper")
+        source = b"fixture representing a verified rebuilt core artifact"
+        source_hash = hashlib.sha256(source).hexdigest()
+        valid = {"schema_version": 1, "status": "passed", "actual_java_major": 21, "expected_java_major": 21,
+                 "java_runtime_version": "21.0.13+fixture", "java_vendor": "fixture vendor",
+                 "expected_core_jar": expected_jar, "actual_core_jar": expected_jar, "core_jar_sha256": source_hash,
+                 "class_code_sources": {"org.apache.spark.status.protobuf." + name: expected_jar for name in classes},
+                 "cases": ["NODE", "CLUSTER", "WRAPPER_NOT_SET"], "merge_cases_verified": 3,
+                 "wire_roundtrips_verified": 3, "unset_merge_preserves_existing": True}
+        guard_ok = {"outcome": "completed", "child_exit": 0, "exit": 0, "abort": None, "cleanup_errors": []}
+        prefix = "D2C_SPARK_PROTOBUF_PROOF="
+        corruptions = (None, "java17", "expected17", "schema-bool", "runtime-missing", "vendor-missing", "status",
+                       "core-hash", "core-origin", "foreign-class", "missing-class", "missing-case", "wrong-unset-case",
+                       "merge-count", "wire-count", "unset-merge", "missing-marker", "duplicate", "child-exit",
+                       "boolean-exit", "cleanup", "abort", "missing-abort", "mutable-id", "source-changed")
+        for arch in ("amd64", "arm64"):
+            for corruption in corruptions:
+                with self.subTest(arch=arch, corruption=corruption), TemporaryDirectory() as scratch:
+                    root = Path(scratch)
+                    evidence = root / ("d2c-lakehouse-runtime-" + arch) / "spark-protobuf"
+                    evidence.mkdir(parents=True)
+                    source_jar = root / "d2c-artifacts/spark/spark-core_2.13-4.2.1-d2c-jetty12.1.14.jar"
+                    source_jar.parent.mkdir(parents=True)
+                    source_jar.write_bytes(source + b"changed" if corruption == "source-changed" else source)
+                    (root / "lakehouse.iid").write_text("tag:latest" if corruption == "mutable-id" else "sha256:" + "1" * 64)
+                    proof, guard = copy.deepcopy(valid), copy.deepcopy(guard_ok)
+                    if corruption == "java17": proof["actual_java_major"] = 17
+                    if corruption == "expected17": proof["expected_java_major"] = 17
+                    if corruption == "schema-bool": proof["schema_version"] = True
+                    if corruption == "runtime-missing": proof["java_runtime_version"] = ""
+                    if corruption == "vendor-missing": proof["java_vendor"] = ""
+                    if corruption == "status": proof["status"] = "PASS"
+                    if corruption == "core-hash": proof["core_jar_sha256"] = "0" * 64
+                    if corruption == "core-origin": proof["actual_core_jar"] = "/vendor/original-spark-core.jar"
+                    if corruption == "foreign-class": proof["class_code_sources"]["org.apache.spark.status.protobuf.StoreTypes"] = "/vendor/original-spark-core.jar"
+                    if corruption == "missing-class": proof["class_code_sources"].pop("org.apache.spark.status.protobuf.StoreTypes$SparkPlanGraphNodeWrapper$WrapperCase")
+                    if corruption == "missing-case": proof["cases"].remove("CLUSTER")
+                    if corruption == "wrong-unset-case": proof["cases"][-1] = "NOT_SET"
+                    if corruption == "merge-count": proof["merge_cases_verified"] = 2
+                    if corruption == "wire-count": proof["wire_roundtrips_verified"] = 2
+                    if corruption == "unset-merge": proof["unset_merge_preserves_existing"] = False
+                    if corruption == "child-exit": guard["child_exit"] = 1
+                    if corruption == "boolean-exit": guard["exit"] = False
+                    if corruption == "cleanup": guard["cleanup_errors"] = ["uncertain"]
+                    if corruption == "abort": guard["abort"] = "reserve reached"
+                    if corruption == "missing-abort": guard.pop("abort")
+                    marker = prefix + json.dumps(proof) + "\n"
+                    log = "bootstrap log\n" + marker
+                    if corruption == "missing-marker": log = "prefix:" + marker
+                    if corruption == "duplicate": log = marker + marker
+                    (evidence / "summary.json").write_text(json.dumps(guard))
+                    (evidence / "command.log").write_text(log)
+                    with patch.dict(os.environ, {"RUNNER_TEMP": str(root), "ARCH": arch}):
+                        if corruption:
+                            with self.assertRaises(SystemExit): exec(code, {})
+                            self.assertFalse((evidence / "runtime-proof.json").exists())
+                        else:
+                            exec(code, {})
+                            actual = json.loads((evidence / "runtime-proof.json").read_text())
+                            self.assertEqual(actual["image_id"], "sha256:" + "1" * 64)
+                            self.assertEqual(actual["platform"], "linux/" + arch)
+                            self.assertEqual(actual["verified_source_core_jar_sha256"], source_hash)
+                            self.assertEqual(actual["actual_java_major"], 21)
 
     def test_shell_steps_parse_without_dispatching_any_commands(self):
         for job in self.jobs.values():

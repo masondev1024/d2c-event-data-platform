@@ -399,6 +399,9 @@ Lakehouse는
 고정된 Spark **4.2.1** 배포와 Temurin **21.0.13**을 사용하며, 같은 Spark source의 원래 core
 shade 조립을 Jetty **12.1.14**로 재빌드합니다. Iceberg **1.12.0**의 공식 Spark 4.2 source module과
 Parquet **1.17.0/1.17.1** 조립에는 Jackson **2.21.7**을 적용합니다.
+Spark source 빌드는 공식 배포본과 같은 Java 17 컴파일러(Temurin **17.0.21+9**)로 고정합니다.
+최종 실행 환경은 Java 21이며, 양쪽 플랫폼에서 실제 protobuf merge·wire 동작과 재빌드 JAR 출처를
+확인합니다. 빌드 컴파일러와 실행 JVM을 구분하여 원래 클래스 집합·ABI 검증을 유지합니다.
 
 Hadoop **3.5.0-d2c-local1** API/runtime은 공식 source assembly에서 로컬 동작에 필요한
 `hadoop-yarn-client`와 `YarnClientUtils`를 유지합니다. 원격 MapReduce jobclient와 사용하지
