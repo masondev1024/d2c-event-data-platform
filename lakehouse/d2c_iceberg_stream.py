@@ -292,10 +292,15 @@ def canonical_source_ranges(
 def create_spark_session(settings: LakehouseSettings) -> Any:
     """Build a UTC Spark session with the only Iceberg catalog used locally."""
 
+    from pyspark import SparkConf
     from pyspark.sql import SparkSession
 
+    master = SparkConf().get("spark.master", "local[*]")
+    if not re.fullmatch(r"local(?:\[(?:\*|[1-9][0-9]*)(?:,[1-9][0-9]*)?\])?", master):
+        raise ValueError("the D2C lakehouse profile requires a local Spark master")
     return (
         SparkSession.builder.appName(settings.stream_id)
+        .master(master)
         .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
         .config(f"spark.sql.catalog.{settings.catalog}", "org.apache.iceberg.spark.SparkCatalog")
         .config(f"spark.sql.catalog.{settings.catalog}.type", "hadoop")

@@ -1,0 +1,18 @@
+[
+  {
+    "version": "1.17.0",
+    "commit": "fac0c746532e133beb928a7f6a7e57b510b477a1",
+    "archive": "apache-parquet-1.17.0.tar.gz",
+    "url": "https://archive.apache.org/dist/parquet/apache-parquet-1.17.0/apache-parquet-1.17.0.tar.gz",
+    "algorithm": "sha512",
+    "digest": "c671ee191d0a7cda7b112bec4cef7ae304e5ebc8c300dc934eb8c77add609aa9bef06060e9f36c5b9b48b676a0e149f34168dcebfc83d8602e995936b30cc056"
+  },
+  {
+    "version": "1.17.1",
+    "commit": "78a8d3230eb4769db93de5f2f2e18363c04cae81",
+    "archive": "parquet-1.17.1.tar.gz",
+    "url": "https://codeload.github.com/apache/parquet-java/tar.gz/78a8d3230eb4769db93de5f2f2e18363c04cae81",
+    "algorithm": "sha256",
+    "digest": "42bdfec66c2e84e67df32b3a3ba9755e41e60bc552b68a97d0c6aba111a3eb45"
+  }
+]

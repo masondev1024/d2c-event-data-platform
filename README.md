@@ -176,8 +176,15 @@ docker compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh \
 ### Spark + Iceberg analytics boundary
 
 `lakehouse` profile은 외부 AWS catalog나 object storage를 만들지 않는 로컬 검증용입니다.
-Spark 4.1.3(Scala 2.13)와 Iceberg 1.11.0 runtime dependency를 이미지 build 시 고정해 실행 중 Maven
-다운로드에 의존하지 않습니다. approval fact는 `days(occurred_at)`으로 partition하고, 계약
+Spark 4.1.3(Scala 2.13)와 Iceberg 1.12.0의 보안 재빌드 runtime을 이미지 build 시 고정해 실행 중 Maven
+다운로드에 의존하지 않습니다. Hadoop/Parquet/Iceberg의 공식 조립 절차에 Jackson 2.21.7과
+JLine 3.30.15를 적용하며, 원본 소스 해시·클래스·라이선스와 실제 패치된 구현을 확인합니다.
+개발 헤더·컴파일러는 최종 runtime에서 제외하고 JVM/Python/JNI runtime 라이브러리는 유지합니다.
+기본 Spark 이미지의 Temurin 21.0.11은 10월 PSU가 공개된 glibc용 SAP SapMachine 21.0.13으로
+교체합니다. 아키텍처별 공급자 SHA-256을 확인하고, 기존 JVM을 제거하여 한 개의 Java 21
+runtime과 해당 공급자 메타데이터를 유지합니다. JVM 공급자 변경은 두 플랫폼의 회귀시험으로
+검증하며, 컨테이너 스캔이 tarball JDK의 모든 CVE를 탐지한다고 가정하지 않습니다.
+approval fact는 `days(occurred_at)`으로 partition하고, 계약
 위반 원문은 Kafka `topic/partition/offset`을 key로 quarantine합니다.
 
 ```bash
@@ -373,15 +380,59 @@ python3 -m unittest discover -s tests -v
 GitHub Actions는 push/PR마다 root/app 의존성 설치, Python compile·unit test, D2C JSON
 Schema·catalog 검증, Iceberg runtime image build 및 local catalog smoke test, Kustomize render,
 Terraform `fmt -check`·`validate`를 실행합니다. 별도 security workflow는 dependency audit,
-Bandit, Trivy, worker/API/catalog/lakehouse 이미지 SBOM을 수행합니다. Lakehouse 이미지는 사용하지
-않는 Spark Connect·Hive Thrift·Derby·ZooKeeper 구성요소와 이전 direct runtime JAR를 제거하고,
-Kafka/Netty/Jackson/HTTP direct runtime을 고정된 patched dependency로 보강합니다. 남은 upstream
-nested JAR finding은 `security/lakehouse.trivyignore.yaml`에서 **정확한 JAR 경로와 45일 이내
-만료일**로만 제한하며, `scripts/validate_lakehouse_trivy_exceptions.py`가 무기한·와일드카드 예외를
-먼저 거부합니다. 경로가 달라지거나 만료되거나 새로 고정 가능한 HIGH/CRITICAL finding이 생기면
-release gate는 실패합니다. Upstream이 아직 수정하지 않은 HIGH/CRITICAL finding은 차단 대상과
-구분해 `d2c-lakehouse-trivy.json` artifact로 남기므로, release 통과를 취약점 부재 주장으로 사용하지
-않습니다.
+Bandit, repository 검사와 worker/API/catalog/lakehouse × amd64/arm64 검사를 수행합니다.
+이미지 검사는 `fail-fast: false`로 독립 실행하며, 실패한 이미지가 있어도 다른 이미지의 원본
+HIGH/CRITICAL 결과·gate 결과·SPDX·실제 이미지 ID·Trivy/DB 시점을 수집합니다.
+누락·오래된 결과·다른 이미지의 결과·인프라 실패는 0건으로 간주하지 않습니다.
+기존 `container-scan` check는 모든 matrix 결과를 집계해 실패를 유지합니다.
+
+Python 이미지는 공개 Wolfi 패키지의 Python **3.12.16-r3**와 별도 build stage의 가상 환경을
+사용합니다. Python 3.12 계열과 수정 버전 하한을 유지하며 같은 계열의 보안 revision은
+공식 APK 저장소에서 받습니다. 실제 설치 버전은 이미지별 SBOM에 기록합니다.
+APK 데이터베이스와 Python 패키지 metadata를 그대로 보존합니다. Lakehouse는
+고정된 Spark **4.2.1** 배포와 Temurin **21.0.13**을 사용하며, 같은 Spark source의 원래 core
+shade 조립을 Jetty **12.1.14**로 재빌드합니다. Iceberg **1.12.0**의 공식 Spark 4.2 source module과
+Parquet **1.17.0/1.17.1** 조립에는 Jackson **2.21.7**을 적용합니다.
+
+Hadoop **3.5.0-d2c-local1** API/runtime은 공식 source assembly에서
+`hadoop-yarn-client`와 `hadoop-mapreduce-client-jobclient` 모듈을 선택하지 않는 로컬 프로파일입니다.
+LocalFileSystem·MapReduce core/common을 유지하고, 서비스 제공자와 API를 검증합니다.
+이 프로파일은 YARN 배포·NodeManager 대화형 shell·YARN timeline token 갱신/취소를 지원하지
+않으며, 애플리케이션도 원격 Spark master를 거부합니다. 기존 문서의 `local[...]`와 `file://`
+warehouse/checkpoint 범위에서 사용해야 합니다. 클래스나 scanner metadata를 사후 삭제하는
+방법으로 취약점 검사를 통과시키지 않습니다.
+
+`container-build/lakehouse/`의 helper는 공식 source/tool checksum, dependency graph,
+API·실제 구현·라이선스와 결과 SHA를 검증합니다. `scripts/lakehouse_artifacts.py`의 manifest는
+실제로 0으로 종료한 component, 실행 전후 source SHA 및 생성한 artifact SHA를 결합합니다.
+외부 artifact를 사용할 때도 같은 현재 recipe와 정확한 파일 목록의 검증을 통과해야 합니다.
+source compile·이미지 검사·회귀의 성공 여부는 해당 실행의 artifact에서 확인해야 하며,
+recipe/unit test의 통과만으로 이미지 보안이나 실행 호환성이 입증되는 것은 아닙니다.
+
+임시 예외는 모두 폐기하여 `security/lakehouse.trivyignore.yaml`은 **억제 0건**입니다.
+빈 목록은 만료일 없이 유효하지만, validator는 비어 있지 않은 예외의 무기한·와일드카드·45일
+초과와 만료일 당일 사용을 계속 거부합니다. 기존 gate의 `--ignore-unfixed` 결과와 수정 버전이
+없는 항목까지 포함한 원본 결과를 모두 보존하므로, gate 통과를 취약점 부재로 해석하면 안 됩니다.
+
+`scripts/container_security_guard.py`는 실제 저장 filesystem의 시작 여유·실행 중 6GiB 하한,
+시간 제한·단일 실행 lock·소유 작업의 종료를 검사합니다. 전용 BuildKit의 병렬도는 1입니다.
+complete build의 기본 시작 조건은 20GiB이며, 소스를 component별로 export하고 이번 실행의
+새 임시 builder만 정리하는 phased build는 16GiB가 필요합니다. 원래 이미지·컨테이너·볼륨을
+prune하거나 여유 공간이 부족한 상태에서 빌드를 강행하지 않습니다.
+
+GitHub CI는 새로 할당된 GitHub-hosted Linux VM에서 먼저 **32GiB** 이상의 실제 여유를
+확인합니다. 자동 CI는 공간이 부족할 때만 미사용 Android·.NET·GHC SDK의 고정 경로
+`/usr/local/lib/android`, `/usr/share/dotnet`, `/opt/ghc`를 선택 정리합니다.
+전용 helper는 호스트·소유권·쓰기 권한·symlink·mount·inode를 확인하며, 개발자 컴퓨터와
+self-hosted runner에서는 거부합니다. 수동 실행의 정리는 기본 비활성화이고 별도 입력이
+필요합니다. 이 범위로도 공간이 부족하면 작업을 중단하며 Docker prune이나 유료 runner로
+자동 전환하지 않습니다.
+
+`scripts/test_lakehouse_streaming.py`는 새 broker/network/state volume에서 실제 LZ4 Kafka 입력,
+별도 Spark 프로세스의 checkpoint 재시작, sink commit 뒤 checkpoint commit 전 장애와 replay,
+Iceberg/Parquet 재독출을 검증합니다. 기존 서비스나 데이터 volume은 재사용하지 않습니다.
+release는 검사한 attested OCI graph를 다시 빌드하지 않고 동일 digest 그대로 게시하도록
+`scripts/oci_release.py`에서 연결하며, 실제 게시와 로컬 검증은 구분합니다.
 CI에서는 AWS `apply`나 `destroy`를 실행하지 않아 credential과 비용을 분리합니다.
 
 DLQ 경로를 강제로 확인하려면 별도 터미널에서 다음처럼 invalid event 비율을 높여 실행합니다.

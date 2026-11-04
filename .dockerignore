@@ -1,5 +1,6 @@
 .git
 .gitignore
+.ouroboros
 .env
 sensor_logs
 runtime
@@ -7,7 +8,9 @@ data
 __pycache__
 *.pyc
 tests
-scripts
+scripts/*
+!scripts/lakehouse_artifacts.py
+!scripts/container_security_guard.py
 schemas/*
 !schemas/d2c.application.approved.v1.schema.json
 examples

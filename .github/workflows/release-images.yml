@@ -3,7 +3,18 @@ name: release-images
 on:
   push:
     tags: ["v*.*.*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      allow_ephemeral_sdk_cleanup:
+        description: "Allow selective cleanup of preinstalled SDKs on this ephemeral GitHub-hosted runner"
+        type: boolean
+        required: false
+        default: false
 
+# Approval-pending proposal: automatic jobs explicitly prepare only new hosted VMs.
+# This configuration takes effect after the user approves remote publication;
+# it does not authorize cleanup on a developer or self-hosted machine.
 permissions:
   contents: read
   packages: write
@@ -13,59 +24,402 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  source_artifacts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    outputs:
+      artifact_name: ${{ steps.source.outputs.artifact_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare native source build storage
+        env:
+          ALLOW_EPHEMERAL_SDK_CLEANUP: ${{ github.event_name != 'workflow_dispatch' || inputs.allow_ephemeral_sdk_cleanup }}
+        run: |
+          arguments=(--minimum-free-gib 32
+            --evidence-dir "$RUNNER_TEMP/d2c-storage-release-source-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT")
+          if [[ "$ALLOW_EPHEMERAL_SDK_CLEANUP" == "true" ]]; then
+            arguments+=(--allow-ephemeral-sdk-cleanup)
+          fi
+          python3 -B scripts/prepare_ci_storage.py "${arguments[@]}"
+      - name: Preserve source storage admission evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-source-storage-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/d2c-storage-release-source-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 14
+          if-no-files-found: error
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile and seal source artifacts once on native amd64
+        id: source
+        run: |
+          python3 -B scripts/lakehouse_artifacts.py build --source-root . \
+            --artifacts "$RUNNER_TEMP/d2c-artifacts" \
+            --work-dir "$RUNNER_TEMP/d2c-source-build" \
+            --storage-path "$RUNNER_TEMP" --native-platform linux/amd64 \
+            --discard-created-builder-cache \
+            > "$RUNNER_TEMP/d2c-source-build-driver.log" 2>&1
+          printf 'artifact_name=%s\n' "release-lakehouse-artifacts-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+      - name: Prepare bounded source receipt without engine inventory
+        if: ${{ always() }}
+        run: |
+          python3 -B - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          temp = Path(os.environ["RUNNER_TEMP"])
+          source = temp / "d2c-source-build/state.json"
+          receipt = temp / "d2c-source-receipts"
+          receipt.mkdir(exist_ok=True)
+          state = {"outcome": "state_not_created"}
+          if source.is_file():
+              try:
+                  state = json.loads(source.read_text())
+                  before = state.pop("before", {})
+                  state["pre_existing_inventory_receipt"] = {
+                      "sha256": hashlib.sha256(json.dumps(before, sort_keys=True).encode()).hexdigest(),
+                      "counts": {key: len(values) for key, values in before.items()}}
+                  state.pop("engine_endpoint_candidates", None)
+                  for phase in state.get("phases", []):
+                      phase.pop("engine_endpoint_candidates", None)
+              except (ValueError, TypeError, AttributeError) as error:
+                  state = {"outcome": "state_unreadable", "error_type": type(error).__name__}
+          (receipt / "state.json").write_text(json.dumps(state, indent=2) + "\n")
+          PY
+      - name: Preserve bounded source receipts after success or failure
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-source-receipts-${{ github.run_id }}-${{ github.run_attempt }}
+          # Exclude original inventory, builder registrations, private contexts and caches.
+          path: |
+            ${{ runner.temp }}/d2c-source-build-driver.log
+            ${{ runner.temp }}/d2c-source-receipts/state.json
+            ${{ runner.temp }}/d2c-source-build/*/guard-driver.log
+            ${{ runner.temp }}/d2c-source-build/*/guard/*.json
+            ${{ runner.temp }}/d2c-source-build/*/guard/*.log
+            ${{ runner.temp }}/d2c-source-build/*/builder-state/discard-plan.json
+            ${{ runner.temp }}/d2c-artifacts/manifest.json
+            ${{ runner.temp }}/d2c-artifacts/*/build-status.json
+          retention-days: 14
+          if-no-files-found: error
+      - name: Share only the sealed source artifact tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.source.outputs.artifact_name }}
+          path: ${{ runner.temp }}/d2c-artifacts
+          include-hidden-files: true
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
   publish:
-    runs-on: ubuntu-latest
+    needs: [source_artifacts]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      REGISTRY_OWNER: ${{ github.repository_owner }}
+      # Official Ubuntu noble security package; fail rather than silently change tools.
+      # https://packages.ubuntu.com/noble/skopeo
+      SKOPEO_DEB_VERSION: 1.13.3+ds1-2ubuntu0.24.04.3
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Prepare ephemeral CI storage
+        id: storage
+        if: ${{ !cancelled() && needs.source_artifacts.result != 'cancelled' }}
+        env:
+          ALLOW_EPHEMERAL_SDK_CLEANUP: ${{ github.event_name != 'workflow_dispatch' || inputs.allow_ephemeral_sdk_cleanup }}
+        run: |
+          arguments=(--minimum-free-gib 32
+            --evidence-dir "$RUNNER_TEMP/d2c-storage-release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT")
+          if [[ "$ALLOW_EPHEMERAL_SDK_CLEANUP" == "true" ]]; then
+            arguments+=(--allow-ephemeral-sdk-cleanup)
+          fi
+          python3 scripts/prepare_ci_storage.py "${arguments[@]}"
 
-      - name: Log in to GHCR
+      - name: Preserve CI storage preparation evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-storage-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/d2c-storage-release-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install policy parser
+        run: python -m pip install PyYAML==6.0.3
+
+      - name: Prepare fresh release directories
+        run: |
+          evidence="$RUNNER_TEMP/d2c-release-evidence-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          private="$RUNNER_TEMP/d2c-release-artifacts-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          test ! -e "$evidence"
+          test ! -e "$private"
+          mkdir --parents "$evidence" "$private"
+          printf 'RELEASE_EVIDENCE=%s\nRELEASE_PRIVATE=%s\n' "$evidence" "$private" >> "$GITHUB_ENV"
+
+      - name: Download the exact successful source job artifact
+        id: source_download
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.storage.outcome == 'success' && needs.source_artifacts.result == 'success' && needs.source_artifacts.outputs.artifact_name != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.source_artifacts.outputs.artifact_name }}
+          path: ${{ runner.temp }}/d2c-artifacts
+
+      - name: Verify transferred source payload and recipe identity
+        id: source_verify
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.source_download.outcome == 'success' }}
+        run: |
+          python3 -B scripts/lakehouse_artifacts.py verify \
+            --artifacts "$RUNNER_TEMP/d2c-artifacts" --source-root . \
+            > "$RELEASE_EVIDENCE/source-artifact-verification.json" \
+            2> "$RELEASE_EVIDENCE/source-artifact-verification.log"
+
+      # The guard uses its isolated, bounded Buildx builder. OCI output retains
+      # the original index, provenance and SBOM without a pre-gate registry push.
+      - name: Build original attested worker OCI layout
+        id: worker
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.storage.outcome == 'success' }}
+        run: >-
+          python scripts/container_security_guard.py
+          --kind build --minimum-free-gib 20 --reserve-free-gib 6
+          --timeout-seconds 1800 --storage-path "$GITHUB_WORKSPACE"
+          --storage-path /var/lib/docker
+          --evidence-dir "$RELEASE_EVIDENCE/worker-build-guard"
+          --build-state-dir "$RELEASE_PRIVATE/build-state" --
+          docker build --platform linux/amd64 --target worker
+          --provenance=mode=min --sbom=true
+          --output "type=oci,dest=$RELEASE_PRIVATE/worker,tar=false,compression=gzip"
+          --metadata-file "$RELEASE_EVIDENCE/worker-build-metadata.json" .
+
+      - name: Build original attested D2C API OCI layout
+        id: api
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.storage.outcome == 'success' }}
+        run: >-
+          python scripts/container_security_guard.py
+          --kind build --minimum-free-gib 20 --reserve-free-gib 6
+          --timeout-seconds 1800 --storage-path "$GITHUB_WORKSPACE"
+          --storage-path /var/lib/docker
+          --evidence-dir "$RELEASE_EVIDENCE/api-build-guard"
+          --build-state-dir "$RELEASE_PRIVATE/build-state" --
+          docker build --platform linux/amd64 --file app/Dockerfile
+          --provenance=mode=min --sbom=true
+          --output "type=oci,dest=$RELEASE_PRIVATE/api,tar=false,compression=gzip"
+          --metadata-file "$RELEASE_EVIDENCE/api-build-metadata.json" .
+
+      - name: Build original attested catalog OCI layout
+        id: catalog
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.storage.outcome == 'success' }}
+        run: >-
+          python scripts/container_security_guard.py
+          --kind build --minimum-free-gib 20 --reserve-free-gib 6
+          --timeout-seconds 1800 --storage-path "$GITHUB_WORKSPACE"
+          --storage-path /var/lib/docker
+          --evidence-dir "$RELEASE_EVIDENCE/catalog-build-guard"
+          --build-state-dir "$RELEASE_PRIVATE/build-state" --
+          docker build --platform linux/amd64 --target catalog-portal
+          --provenance=mode=min --sbom=true
+          --output "type=oci,dest=$RELEASE_PRIVATE/catalog,tar=false,compression=gzip"
+          --metadata-file "$RELEASE_EVIDENCE/catalog-build-metadata.json" .
+
+      - name: Build original attested lakehouse OCI layout
+        id: lakehouse
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.storage.outcome == 'success' && needs.source_artifacts.result == 'success' && steps.source_verify.outcome == 'success' }}
+        run: >-
+          python scripts/container_security_guard.py
+          --kind build --minimum-free-gib 20 --reserve-free-gib 6
+          --timeout-seconds 1800 --storage-path "$GITHUB_WORKSPACE"
+          --storage-path /var/lib/docker
+          --evidence-dir "$RELEASE_EVIDENCE/lakehouse-build-guard"
+          --build-state-dir "$RELEASE_PRIVATE/build-state" --
+          docker build --platform linux/amd64 --file lakehouse/Dockerfile
+          --build-context "d2c_artifacts=$RUNNER_TEMP/d2c-artifacts"
+          --build-arg D2C_ARTIFACT_STAGE=d2c_artifacts
+          --provenance=mode=min --sbom=true
+          --output "type=oci,dest=$RELEASE_PRIVATE/lakehouse,tar=false,compression=gzip"
+          --metadata-file "$RELEASE_EVIDENCE/lakehouse-build-metadata.json" .
+
+      - name: Set up Trivy
+        if: ${{ !cancelled() && steps.storage.outcome == 'success' }}
+        uses: aquasecurity/setup-trivy@e07451d2e059ed86c2870430ea286b3a9e0bf241
+        with:
+          version: v0.76.1
+
+      - name: Scan every original OCI runtime before publishing
+        id: scan
+        if: ${{ !cancelled() && steps.storage.outcome == 'success' }}
+        run: |
+          python scripts/scan_container_images.py \
+            --oci-layout "worker=$RELEASE_PRIVATE/worker" \
+            --oci-layout "api=$RELEASE_PRIVATE/api" \
+            --oci-layout "catalog=$RELEASE_PRIVATE/catalog" \
+            --oci-layout "lakehouse=$RELEASE_PRIVATE/lakehouse" \
+            --platform linux/amd64 --expected-trivy-version 0.76.1 \
+            --total-timeout 5400 \
+            --output-dir "$RELEASE_EVIDENCE/scan" --trivy trivy \
+            --guard-script scripts/container_security_guard.py \
+            --guard-storage-path "$GITHUB_WORKSPACE" \
+            --guard-storage-path /var/lib/docker \
+            --guard-minimum-free-gib 10
+
+      - name: Upload security evidence even when a gate fails
+        id: evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-security-${{ github.sha }}-${{ github.run_attempt }}
+          # Deliberately omit OCI blobs, scan-view blob symlinks and builder cache.
+          path: |
+            ${{ env.RELEASE_EVIDENCE }}/source-artifact-verification.json
+            ${{ env.RELEASE_EVIDENCE }}/source-artifact-verification.log
+            ${{ env.RELEASE_EVIDENCE }}/*-build-metadata.json
+            ${{ env.RELEASE_EVIDENCE }}/*-build-guard/*.json
+            ${{ env.RELEASE_EVIDENCE }}/*-build-guard/*.log
+            ${{ env.RELEASE_EVIDENCE }}/scan/*.json
+            ${{ env.RELEASE_EVIDENCE }}/scan/*.log
+            ${{ env.RELEASE_EVIDENCE }}/scan/guard/*/*.json
+            ${{ env.RELEASE_EVIDENCE }}/scan/guard/*/*.log
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Require successful transferred source artifacts
+        if: ${{ always() }}
+        env:
+          SOURCE_RESULT: ${{ needs.source_artifacts.result }}
+          DOWNLOAD_RESULT: ${{ steps.source_download.outcome }}
+          VERIFY_RESULT: ${{ steps.source_verify.outcome }}
+        run: |
+          if [[ "$SOURCE_RESULT" != "success" || "$DOWNLOAD_RESULT" != "success" || "$VERIFY_RESULT" != "success" ]]; then
+            printf '%s\n' 'Source artifact build, transfer or verification did not pass; release remains failed.'
+            exit 1
+          fi
+
+      - name: Install and verify the official Skopeo package
+        if: >-
+          ${{ needs.source_artifacts.result == 'success' && steps.source_verify.outcome == 'success' &&
+              success() && steps.worker.outcome == 'success' && steps.api.outcome == 'success' &&
+              steps.catalog.outcome == 'success' && steps.lakehouse.outcome == 'success' &&
+              steps.scan.outcome == 'success' && steps.evidence.outcome == 'success' }}
+        # Upstream recommends official distro packages, not unsupported static binaries:
+        # https://github.com/containers/skopeo/blob/main/install.md#ubuntu
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends "skopeo=$SKOPEO_DEB_VERSION"
+          test "$(dpkg-query --show --showformat='${Version}' skopeo)" = "$SKOPEO_DEB_VERSION"
+          python - <<'PY'
+          import json, os, re, subprocess
+          from pathlib import Path
+          version = subprocess.check_output(["skopeo", "--version"], text=True).strip()
+          if not re.fullmatch(r"skopeo version 1\.13\.3(?:\s.*)?", version):
+              raise SystemExit("unexpected Skopeo binary version")
+          help_text = subprocess.check_output(["skopeo", "copy", "--help"], text=True)
+          if not all(flag in help_text for flag in ("--all", "--preserve-digests", "--digestfile")):
+              raise SystemExit("required digest-preserving copy options unavailable")
+          Path(os.environ["RELEASE_EVIDENCE"], "skopeo-package.json").write_text(json.dumps({
+              "ubuntu_package_version": os.environ["SKOPEO_DEB_VERSION"], "binary_version": version,
+              "package_source": "https://packages.ubuntu.com/noble/skopeo",
+              "upstream_installation": "https://github.com/containers/skopeo/blob/main/install.md#ubuntu"
+          }, indent=2) + "\n")
+          print(version)
+          PY
+
+      - name: Verify Skopeo compatibility with fresh local OCI copies
+        id: local_copy
+        if: >-
+          ${{ needs.source_artifacts.result == 'success' && steps.source_verify.outcome == 'success' &&
+              success() && steps.worker.outcome == 'success' && steps.api.outcome == 'success' &&
+              steps.catalog.outcome == 'success' && steps.lakehouse.outcome == 'success' &&
+              steps.scan.outcome == 'success' && steps.evidence.outcome == 'success' }}
+        run: |
+          python scripts/oci_release.py --mode local-copy \
+            --scan-summary "$RELEASE_EVIDENCE/scan/summary.json" \
+            --oci-layout "worker=$RELEASE_PRIVATE/worker" \
+            --oci-layout "api=$RELEASE_PRIVATE/api" \
+            --oci-layout "catalog=$RELEASE_PRIVATE/catalog" \
+            --oci-layout "lakehouse=$RELEASE_PRIVATE/lakehouse" \
+            --platform linux/amd64 --expected-skopeo-version 1.13.3 \
+            --evidence-dir "$RELEASE_EVIDENCE/local-copy" \
+            --local-copy-dir "$RELEASE_PRIVATE/local-copy" \
+            --publish-state-dir "$RELEASE_PRIVATE/local-copy-state" \
+            --guard-script scripts/container_security_guard.py \
+            --storage-path "$GITHUB_WORKSPACE" --storage-path /var/lib/docker \
+            --storage-path "$RUNNER_TEMP"
+
+      - name: Preserve local copy metadata after success or failure
+        id: local_copy_evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-local-copy-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.RELEASE_EVIDENCE }}/local-copy
+            ${{ env.RELEASE_EVIDENCE }}/skopeo-package.json
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Log in to GHCR after every gate passes
+        if: >-
+          ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') &&
+              steps.local_copy.outcome == 'success' && steps.local_copy_evidence.outcome == 'success' &&
+              needs.source_artifacts.result == 'success' && steps.source_verify.outcome == 'success' &&
+              success() && steps.worker.outcome == 'success' && steps.api.outcome == 'success' &&
+              steps.catalog.outcome == 'success' && steps.lakehouse.outcome == 'success' &&
+              steps.scan.outcome == 'success' && steps.evidence.outcome == 'success' }}
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and publish worker image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          push: true
-          tags: ghcr.io/${{ github.repository_owner }}/d2c-event-data-platform:${{ github.ref_name }}
-          provenance: true
-          sbom: true
+      - name: Publish the same verified OCI graphs with their attestations
+        id: publish
+        if: >-
+          ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') &&
+              steps.local_copy.outcome == 'success' && steps.local_copy_evidence.outcome == 'success' &&
+              needs.source_artifacts.result == 'success' && steps.source_verify.outcome == 'success' &&
+              success() && steps.worker.outcome == 'success' && steps.api.outcome == 'success' &&
+              steps.catalog.outcome == 'success' && steps.lakehouse.outcome == 'success' &&
+              steps.scan.outcome == 'success' && steps.evidence.outcome == 'success' }}
+        run: |
+          python scripts/oci_release.py \
+            --scan-summary "$RELEASE_EVIDENCE/scan/summary.json" \
+            --oci-layout "worker=$RELEASE_PRIVATE/worker" \
+            --oci-layout "api=$RELEASE_PRIVATE/api" \
+            --oci-layout "catalog=$RELEASE_PRIVATE/catalog" \
+            --oci-layout "lakehouse=$RELEASE_PRIVATE/lakehouse" \
+            --platform linux/amd64 --registry-owner "$REGISTRY_OWNER" --tag "$RELEASE_TAG" \
+            --evidence-dir "$RELEASE_EVIDENCE/publication" \
+            --publish-state-dir "$RELEASE_PRIVATE/publish-state" \
+            --local-copy-dir "$RELEASE_PRIVATE/local-copy" \
+            --local-copy-proof "$RELEASE_EVIDENCE/local-copy/local-copy.json" \
+            --expected-skopeo-version 1.13.3 \
+            --authfile "${DOCKER_CONFIG:-$HOME/.docker}/config.json" \
+            --guard-script scripts/container_security_guard.py \
+            --storage-path "$GITHUB_WORKSPACE" --storage-path /var/lib/docker
 
-      - name: Build and publish D2C API image
-        uses: docker/build-push-action@v6
+      - name: Preserve publication outcomes including partial-copy failures
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
         with:
-          context: .
-          file: app/Dockerfile
-          push: true
-          tags: ghcr.io/${{ github.repository_owner }}/d2c-event-data-platform-api:${{ github.ref_name }}
-          provenance: true
-          sbom: true
-
-      - name: Build and publish catalog portal image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          target: catalog-portal
-          push: true
-          tags: ghcr.io/${{ github.repository_owner }}/d2c-event-data-platform-catalog:${{ github.ref_name }}
-          provenance: true
-          sbom: true
-
-      - name: Build and publish D2C lakehouse image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: lakehouse/Dockerfile
-          push: true
-          tags: ghcr.io/${{ github.repository_owner }}/d2c-event-data-platform-lakehouse:${{ github.ref_name }}
-          provenance: true
-          sbom: true
+          name: release-publication-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.RELEASE_EVIDENCE }}/publication
+            ${{ env.RELEASE_EVIDENCE }}/skopeo-package.json
+          retention-days: 14
+          if-no-files-found: ignore

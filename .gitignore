@@ -229,3 +229,6 @@ crash.log
 
 # Local-only design notes and environment-specific validation snapshots
 /docs/
+
+# Local automation sessions can contain prompts and machine-specific context.
+/.ouroboros/

@@ -6,6 +6,13 @@ on:
   pull_request:
   schedule:
     - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      allow_ephemeral_sdk_cleanup:
+        description: "Allow selective cleanup of preinstalled SDKs on this ephemeral GitHub-hosted runner"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -15,6 +22,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Proposed automatic provisioning activates only after user-approved workflow
+  # publication on fresh hosted CI runners; this does not authorize local cleanup.
   dependency-and-code-scan:
     runs-on: ubuntu-latest
     steps:
@@ -42,135 +51,479 @@ jobs:
       - name: Scan Python source
         run: bandit --recursive app services scripts lakehouse --severity-level medium --confidence-level medium
 
-  container-scan:
+  repository-scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Set up pinned Trivy
+        uses: aquasecurity/setup-trivy@e07451d2e059ed86c2870430ea286b3a9e0bf241
+        with:
+          version: v0.76.1
+      - name: Scan repository independently of the image jobs
+        run: |
+          mkdir -p repository-security
+          printf '{}\n' > repository-security/trivy-config.yaml
+          python scripts/container_security_guard.py \
+            --kind scan --minimum-free-gib 10 --reserve-free-gib 6 \
+            --timeout-seconds 1200 \
+            --storage-path "$GITHUB_WORKSPACE" --storage-path /var/lib/docker \
+            --evidence-dir repository-security/guard -- \
+            trivy --config repository-security/trivy-config.yaml fs . --scanners vuln,secret,misconfig \
+            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 \
+            --ignorefile /dev/null --ignore-policy '' --secret-config '' --skip-dirs .git \
+            --skip-dirs repository-security \
+            --skip-dirs infra/terraform/.terraform \
+            --format json --output repository-security/trivy.json
+      - name: Preserve repository evidence even when the gate fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          retention-days: 14
+          name: repository-security-${{ github.sha }}
+          path: repository-security/
+          if-no-files-found: error
 
-      - name: Set up Python for exception policy
-        uses: actions/setup-python@v5
+  image-scan:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        role: [worker, api, catalog]
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare ephemeral CI storage
+        id: storage
+        env:
+          ROLE: ${{ matrix.role }}
+          ARCH: ${{ matrix.arch }}
+          ALLOW_EPHEMERAL_SDK_CLEANUP: ${{ github.event_name != 'workflow_dispatch' || inputs.allow_ephemeral_sdk_cleanup }}
+        run: |
+          arguments=(--minimum-free-gib 32
+            --evidence-dir "$RUNNER_TEMP/d2c-storage-security-$ROLE-$ARCH-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT")
+          if [[ "$ALLOW_EPHEMERAL_SDK_CLEANUP" == "true" ]]; then
+            arguments+=(--allow-ephemeral-sdk-cleanup)
+          fi
+          python3 scripts/prepare_ci_storage.py "${arguments[@]}"
+      - name: Preserve CI storage preparation evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          retention-days: 14
+          name: security-storage-${{ matrix.role }}-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/d2c-storage-security-${{ matrix.role }}-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-
-      - name: Validate bounded lakehouse exception policy
-        run: |
-          python -m pip install --requirement requirements-dev.txt
-          python scripts/validate_lakehouse_trivy_exceptions.py \
-            --policy security/lakehouse.trivyignore.yaml
-
-      - name: Build non-root worker image
-        run: docker build --tag factory-sensor:${{ github.sha }} .
-
-      - name: Build non-root D2C API image
-        run: docker build --file app/Dockerfile --tag d2c-api:${{ github.sha }} .
-
-      - name: Build non-root catalog portal image
-        run: docker build --target catalog-portal --tag d2c-catalog-portal:${{ github.sha }} .
-
-      - name: Build non-root D2C lakehouse image
-        run: docker build --file lakehouse/Dockerfile --tag d2c-iceberg-stream:${{ github.sha }} .
-
-      - name: Set up Trivy
+      - name: Install policy validation dependencies
+        run: python -m pip install --requirement requirements-dev.txt
+      - name: Set up pinned Trivy
         uses: aquasecurity/setup-trivy@e07451d2e059ed86c2870430ea286b3a9e0bf241
         with:
-          version: v0.72.0
-
-      - name: Scan repository configuration and dependencies
-        run: >-
-          trivy fs .
-          --scanners vuln,secret,misconfig
-          --severity HIGH,CRITICAL
-          --ignore-unfixed
-          --exit-code 1
-          --skip-dirs .git
-          --skip-dirs infra/terraform/.terraform
-
-      - name: Scan worker image
-        run: >-
-          trivy image factory-sensor:${{ github.sha }}
-          --scanners vuln,secret,misconfig
-          --severity HIGH,CRITICAL
-          --ignore-unfixed
-          --exit-code 1
-
-      - name: Scan D2C API image
-        run: >-
-          trivy image d2c-api:${{ github.sha }}
-          --scanners vuln,secret,misconfig
-          --severity HIGH,CRITICAL
-          --ignore-unfixed
-          --exit-code 1
-
-      - name: Scan catalog portal image
-        run: >-
-          trivy image d2c-catalog-portal:${{ github.sha }}
-          --scanners vuln,secret,misconfig
-          --severity HIGH,CRITICAL
-          --ignore-unfixed
-          --exit-code 1
-
-      - name: Scan D2C lakehouse image with bounded exceptions
-        run: >-
-          trivy image d2c-iceberg-stream:${{ github.sha }}
-          --scanners vuln,secret,misconfig
-          --severity HIGH,CRITICAL
-          --ignore-unfixed
-          --ignorefile security/lakehouse.trivyignore.yaml
-          --show-suppressed
-          --exit-code 1
-
-      - name: Capture all D2C lakehouse vulnerability statuses
-        run: >-
-          trivy image d2c-iceberg-stream:${{ github.sha }}
-          --scanners vuln
-          --severity HIGH,CRITICAL
-          --ignorefile security/lakehouse.trivyignore.yaml
-          --show-suppressed
-          --format json
-          --output d2c-lakehouse-trivy.json
-
-      - name: Generate SPDX image SBOM
-        uses: anchore/sbom-action@v0.24.0
-        with:
-          image: factory-sensor:${{ github.sha }}
-          format: spdx-json
-          output-file: sbom.spdx.json
-          artifact-name: sbom.spdx.json
-
-      - name: Generate SPDX D2C API SBOM
-        uses: anchore/sbom-action@v0.24.0
-        with:
-          image: d2c-api:${{ github.sha }}
-          format: spdx-json
-          output-file: d2c-api.sbom.spdx.json
-          artifact-name: d2c-api.sbom.spdx.json
-
-      - name: Generate SPDX catalog portal SBOM
-        uses: anchore/sbom-action@v0.24.0
-        with:
-          image: d2c-catalog-portal:${{ github.sha }}
-          format: spdx-json
-          output-file: d2c-catalog-portal.sbom.spdx.json
-          artifact-name: d2c-catalog-portal.sbom.spdx.json
-
-      - name: Generate SPDX D2C lakehouse SBOM
-        uses: anchore/sbom-action@v0.24.0
-        with:
-          image: d2c-iceberg-stream:${{ github.sha }}
-          format: spdx-json
-          output-file: d2c-iceberg-stream.sbom.spdx.json
-          artifact-name: d2c-iceberg-stream.sbom.spdx.json
-
-      - name: Upload SBOM and lakehouse vulnerability evidence
+          version: v0.76.1
+      - name: Build exactly one isolated role and platform
+        id: build
+        continue-on-error: true
+        env:
+          ROLE: ${{ matrix.role }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          arguments=(docker build --platform "linux/$ARCH"
+            --iidfile "$RUNNER_TEMP/$ROLE.iid"
+            --tag "d2c-$ROLE:${GITHUB_SHA}-$ARCH")
+          case "$ROLE" in
+            api) arguments+=(--file app/Dockerfile) ;;
+            catalog) arguments+=(--target catalog-portal --file Dockerfile) ;;
+            worker) arguments+=(--target worker --file Dockerfile) ;;
+            *) exit 2 ;;
+          esac
+          python scripts/container_security_guard.py \
+            --kind build --minimum-free-gib 20 --reserve-free-gib 6 \
+            --timeout-seconds 1800 \
+            --storage-path "$GITHUB_WORKSPACE" --storage-path /var/lib/docker \
+            --build-state-dir "$RUNNER_TEMP/d2c-build-state" \
+            --evidence-dir "container-security-build/$ROLE-$ARCH" -- \
+            "${arguments[@]}" .
+      - name: Collect raw, gate, SBOM and immutable target evidence
+        if: ${{ !cancelled() && steps.storage.outcome == 'success' }}
+        env:
+          ROLE: ${{ matrix.role }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          image="missing-$ROLE:${GITHUB_SHA}-$ARCH"
+          if test -s "$RUNNER_TEMP/$ROLE.iid"; then
+            image="$(cat "$RUNNER_TEMP/$ROLE.iid")"
+          fi
+          python scripts/scan_container_images.py \
+            --required-role "$ROLE" --image "$ROLE=$image" \
+            --platform "linux/$ARCH" --expected-trivy-version 0.76.1 \
+            --total-timeout 4500 \
+            --cache-dir "$RUNNER_TEMP/trivy-cache" \
+            --guard-script scripts/container_security_guard.py \
+            --guard-storage-path "$GITHUB_WORKSPACE" --guard-storage-path /var/lib/docker \
+            --output-dir "container-security/$ROLE-$ARCH"
+      - name: Prove native Python ABI and normal role startup despite a failed security gate
+        id: python-runtime
+        if: ${{ !cancelled() && steps.storage.outcome == 'success' && steps.build.outcome == 'success' }}
+        env:
+          ROLE: ${{ matrix.role }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          image="$(cat "$RUNNER_TEMP/$ROLE.iid")"
+          name="d2c-python-runtime-$ROLE-$ARCH-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          owner="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+          python3 scripts/container_security_guard.py \
+            --kind test --minimum-free-gib 8 --reserve-free-gib 6 --timeout-seconds 90 \
+            --storage-path "$GITHUB_WORKSPACE" --storage-path /var/lib/docker \
+            --container-name "$name" --owner-token "$owner" \
+            --evidence-dir "$RUNNER_TEMP/d2c-python-runtime-$ROLE-$ARCH" -- \
+            docker run --rm -i --network none --platform "linux/$ARCH" \
+            --name "$name" --label "d2c.security.owner=$owner" --memory 512m --cpus 1 \
+            --entrypoint python "$image" - "$ROLE" --timeout-seconds 45 \
+            < scripts/check_python_runtime.py
+          python3 - <<'PYTHON'
+          import json, os, re
+          from pathlib import Path
+          role, arch = os.environ["ROLE"], os.environ["ARCH"]
+          temporary = Path(os.environ["RUNNER_TEMP"])
+          evidence = temporary / ("d2c-python-runtime-" + role + "-" + arch)
+          guard = json.loads((evidence / "summary.json").read_text())
+          if (guard.get("outcome") != "completed" or guard.get("child_exit") != 0 or guard.get("exit") != 0
+                  or guard.get("abort") is not None or guard.get("cleanup_errors") != []):
+              raise SystemExit("Python runtime guard or owned cleanup is incomplete")
+          prefix = "D2C_PYTHON_RUNTIME_PROOF="
+          records = [json.loads(line[len(prefix):]) for line in (evidence / "command.log").read_text().splitlines()
+                     if line.startswith(prefix)]
+          if len(records) != 1:
+              raise SystemExit("Python runtime proof is missing or ambiguous")
+          proof = records[0]
+          machines = {"amd64": {"x86_64", "amd64"}, "arm64": {"aarch64", "arm64"}}
+          elapsed = proof.get("elapsed_seconds")
+          if (type(proof.get("schema_version")) is not int or proof["schema_version"] != 1
+                  or proof.get("status") != "PASS" or proof.get("role") != role
+                  or type(proof.get("uid")) is not int or proof["uid"] != 10001
+                  or not re.fullmatch(r"3\.12\.\d+", str(proof.get("python", "")))
+                  or proof.get("python_implementation") != "cpython" or proof.get("virtual_environment") != "/opt/venv"
+                  or proof.get("os_id") != "wolfi" or proof.get("machine") not in machines[arch]
+                  or not isinstance(proof.get("openssl"), str) or not proof["openssl"]
+                  or not isinstance(proof.get("checks"), dict) or not proof["checks"]
+                  or not isinstance(proof.get("limits"), str) or not proof["limits"]
+                  or type(elapsed) not in (int, float) or not 0 <= elapsed <= 45):
+              raise SystemExit("Python runtime identity, ABI proof or deadline is incomplete")
+          server = "normal_gunicorn" if role == "api" else "normal_catalog_server" if role == "catalog" else None
+          if server and proof["checks"].get(server, {}).get("owned_child_reaped") is not True:
+              raise SystemExit("normal role server child cleanup is unconfirmed")
+          proof["image_id"] = (temporary / (role + ".iid")).read_text().strip()
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", proof["image_id"]):
+              raise SystemExit("Python runtime target is not the immutable final image ID")
+          (evidence / "runtime-proof.json").write_text(json.dumps(proof, indent=2) + "\n")
+          PYTHON
+      - name: Keep an earlier build failure as a failing result
+        if: ${{ !cancelled() && steps.build.outcome != 'success' }}
+        run: exit 1
+      - name: Preserve every attempted image and build result
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sbom-${{ github.sha }}
+          retention-days: 14
+          name: container-security-${{ matrix.role }}-${{ matrix.arch }}-${{ github.sha }}-${{ github.run_attempt }}
           path: |
-            sbom.spdx.json
-            d2c-api.sbom.spdx.json
-            d2c-catalog-portal.sbom.spdx.json
-            d2c-iceberg-stream.sbom.spdx.json
-            d2c-lakehouse-trivy.json
+            container-security/
+            container-security-build/
+            ${{ runner.temp }}/d2c-python-runtime-${{ matrix.role }}-${{ matrix.arch }}
           if-no-files-found: error
+
+  # Compile the architecture-neutral Java payload once, on a native host. The
+  # source helper retains receipts and discards only its proven new phase cache.
+  lakehouse-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    outputs:
+      artifact_name: ${{ steps.source.outputs.artifact_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare ephemeral CI storage
+        id: storage
+        env:
+          ALLOW_EPHEMERAL_SDK_CLEANUP: ${{ github.event_name != 'workflow_dispatch' || inputs.allow_ephemeral_sdk_cleanup }}
+        run: |
+          arguments=(--minimum-free-gib 32
+            --evidence-dir "$RUNNER_TEMP/d2c-storage-security-source-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT")
+          if [[ "$ALLOW_EPHEMERAL_SDK_CLEANUP" == "true" ]]; then
+            arguments+=(--allow-ephemeral-sdk-cleanup)
+          fi
+          python3 scripts/prepare_ci_storage.py "${arguments[@]}"
+      - name: Preserve source storage admission evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          retention-days: 14
+          name: security-source-storage-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/d2c-storage-security-source-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile and seal the five source components once
+        id: source
+        run: |
+          python3 -B scripts/lakehouse_artifacts.py build --source-root . \
+            --artifacts "$RUNNER_TEMP/d2c-artifacts" \
+            --work-dir "$RUNNER_TEMP/d2c-source-build" \
+            --storage-path "$RUNNER_TEMP" --native-platform linux/amd64 \
+            --discard-created-builder-cache \
+            > "$RUNNER_TEMP/d2c-source-build-driver.log" 2>&1
+          printf 'artifact_name=%s\n' "lakehouse-source-artifacts-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+      - name: Redact source receipt inventory without altering sealed artifacts
+        if: always()
+        run: |
+          python3 - <<'PYTHON'
+          import hashlib, json, os
+          from pathlib import Path
+          temporary = Path(os.environ["RUNNER_TEMP"])
+          output = temporary / "d2c-source-receipts"
+          output.mkdir(exist_ok=False)
+          def inventory(value):
+              canonical = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+              return {"counts": {key: len(value.get(key, [])) for key in ("images", "containers", "volumes")},
+                      "sha256": hashlib.sha256(canonical).hexdigest()}
+          def redact(value):
+              if isinstance(value, list):
+                  return [redact(item) for item in value]
+              if isinstance(value, dict):
+                  return {key: inventory(item) if key == "before" else redact(item)
+                          for key, item in value.items() if key != "engine_endpoint_candidates"}
+              return value
+          for name in ("state.json", "engine-before.json"):
+              path = temporary / "d2c-source-build" / name
+              if path.is_file() and not path.is_symlink():
+                  value = json.loads(path.read_text())
+                  safe = inventory(value) if name == "engine-before.json" else redact(value)
+                  (output / name).write_text(json.dumps(safe, indent=2) + "\n")
+          PYTHON
+      - name: Preserve bounded source receipts after success or failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          retention-days: 14
+          name: lakehouse-source-receipts-${{ github.run_id }}-${{ github.run_attempt }}
+          # Never upload export directories, builder registrations or cache blobs.
+          path: |
+            ${{ runner.temp }}/d2c-source-build-driver.log
+            ${{ runner.temp }}/d2c-source-receipts/*.json
+            ${{ runner.temp }}/d2c-source-build/*/guard-driver.log
+            ${{ runner.temp }}/d2c-source-build/*/guard/*.json
+            ${{ runner.temp }}/d2c-source-build/*/guard/*.log
+            ${{ runner.temp }}/d2c-source-build/*/builder-state/discard-plan.json
+            ${{ runner.temp }}/d2c-artifacts/manifest.json
+            ${{ runner.temp }}/d2c-artifacts/*/build-status.json
+          if-no-files-found: error
+      - name: Share only the sealed source artifact tree
+        uses: actions/upload-artifact@v4
+        with:
+          retention-days: 1
+          name: ${{ steps.source.outputs.artifact_name }}
+          path: ${{ runner.temp }}/d2c-artifacts
+          include-hidden-files: true
+          compression-level: 0
+          if-no-files-found: error
+
+  lakehouse-scan:
+    needs: [lakehouse-source]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            kafka_manifest: sha256:3e324d2bd331570676436b24f625e5dcf1facdfbd62efcffabc6b69b1abc13cc
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            kafka_manifest: sha256:4ee934b528014d9f9382c87f3349cfa11d8b4afa08ed0fcc9bee82d87126c43d
+    env:
+      ROLE: lakehouse
+      ARCH: ${{ matrix.arch }}
+      KAFKA_INDEX: apache/kafka:3.7.0@sha256:41c20d65b0a2180b9deca056d47540771752e69fe9225d5748dd65a25a9675d7
+      KAFKA_EXPECTED_LEAF: ${{ matrix.kafka_manifest }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare ephemeral CI storage
+        id: storage
+        env:
+          ALLOW_EPHEMERAL_SDK_CLEANUP: ${{ github.event_name != 'workflow_dispatch' || inputs.allow_ephemeral_sdk_cleanup }}
+        run: |
+          arguments=(--minimum-free-gib 32
+            --evidence-dir "$RUNNER_TEMP/d2c-storage-security-lakehouse-$ARCH-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT")
+          if [[ "$ALLOW_EPHEMERAL_SDK_CLEANUP" == "true" ]]; then
+            arguments+=(--allow-ephemeral-sdk-cleanup)
+          fi
+          python3 scripts/prepare_ci_storage.py "${arguments[@]}"
+      - name: Preserve lakehouse storage admission evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          retention-days: 14
+          name: security-lakehouse-storage-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/d2c-storage-security-lakehouse-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install policy validation dependencies
+        run: python -m pip install --requirement requirements-dev.txt
+      - name: Download the exact successful source job artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.lakehouse-source.outputs.artifact_name }}
+          path: ${{ runner.temp }}/d2c-artifacts
+      - name: Verify transferred payload and source recipe identity
+        run: >-
+          python3 -B scripts/lakehouse_artifacts.py verify
+          --artifacts "$RUNNER_TEMP/d2c-artifacts" --source-root .
+          > "$RUNNER_TEMP/d2c-lakehouse-artifact-verification-$ARCH.json"
+      - name: Set up pinned Trivy
+        uses: aquasecurity/setup-trivy@e07451d2e059ed86c2870430ea286b3a9e0bf241
+        with:
+          version: v0.76.1
+      - name: Build the native final runtime from verified artifacts
+        id: build
+        continue-on-error: true
+        run: |
+          python scripts/container_security_guard.py \
+            --kind build --minimum-free-gib 20 --reserve-free-gib 6 \
+            --timeout-seconds 1800 \
+            --storage-path "$GITHUB_WORKSPACE" --storage-path /var/lib/docker \
+            --build-state-dir "$RUNNER_TEMP/d2c-lakehouse-runtime-build-state" \
+            --evidence-dir "container-security-build/lakehouse-$ARCH" -- \
+            docker build --platform "linux/$ARCH" --file lakehouse/Dockerfile \
+            --build-context "d2c_artifacts=$RUNNER_TEMP/d2c-artifacts" \
+            --build-arg D2C_ARTIFACT_STAGE=d2c_artifacts \
+            --iidfile "$RUNNER_TEMP/lakehouse.iid" \
+            --tag "d2c-lakehouse:${GITHUB_SHA}-$ARCH" .
+      - name: Collect raw, gate and SBOM evidence for the final runtime
+        if: ${{ !cancelled() && steps.storage.outcome == 'success' }}
+        run: |
+          image="missing-lakehouse:${GITHUB_SHA}-$ARCH"
+          if test -s "$RUNNER_TEMP/lakehouse.iid"; then
+            image="$(cat "$RUNNER_TEMP/lakehouse.iid")"
+          fi
+          python scripts/scan_container_images.py \
+            --required-role lakehouse --image "lakehouse=$image" \
+            --platform "linux/$ARCH" --expected-trivy-version 0.76.1 \
+            --total-timeout 4500 --cache-dir "$RUNNER_TEMP/trivy-cache" \
+            --guard-script scripts/container_security_guard.py \
+            --guard-storage-path "$GITHUB_WORKSPACE" --guard-storage-path /var/lib/docker \
+            --output-dir "container-security/lakehouse-$ARCH"
+      - name: Pull the pinned Kafka index and record its actual native image ID
+        id: broker
+        if: ${{ !cancelled() && steps.storage.outcome == 'success' && steps.build.outcome == 'success' }}
+        run: |
+          python scripts/container_security_guard.py \
+            --kind scan --minimum-free-gib 10 --reserve-free-gib 6 --timeout-seconds 1200 \
+            --storage-path "$GITHUB_WORKSPACE" --storage-path /var/lib/docker \
+            --evidence-dir "$RUNNER_TEMP/d2c-lakehouse-runtime-$ARCH/broker-pull" -- \
+            docker pull --platform "linux/$ARCH" "$KAFKA_INDEX"
+          python3 - <<'PYTHON'
+          import json, os, re, subprocess
+          from pathlib import Path
+          reference = os.environ["KAFKA_INDEX"]
+          inspected = json.loads(subprocess.check_output(["docker", "image", "inspect", reference], text=True, timeout=30))
+          if not isinstance(inspected, list) or len(inspected) != 1:
+              raise SystemExit("broker inspection must identify exactly one image")
+          image = inspected[0]
+          if (not re.fullmatch(r"sha256:[0-9a-f]{64}", image.get("Id", ""))
+                  or image.get("Os") != "linux" or image.get("Architecture") != os.environ["ARCH"]):
+              raise SystemExit("broker immutable ID or native platform mismatch")
+          allowed = {reference.rsplit("@", 1)[-1], os.environ["KAFKA_EXPECTED_LEAF"]}
+          if not any(value.rsplit("@", 1)[-1] in allowed for value in image.get("RepoDigests", [])):
+              raise SystemExit("broker metadata does not retain the pinned index or verified native manifest digest")
+          evidence = Path(os.environ["RUNNER_TEMP"]) / ("d2c-lakehouse-runtime-" + os.environ["ARCH"])
+          metadata = {key: image.get(key) for key in ("Id", "Os", "Architecture", "RepoDigests", "Created")}
+          metadata.update({"source_index": reference, "expected_platform_manifest": os.environ["KAFKA_EXPECTED_LEAF"],
+                           "identity_scope": "actual local Docker ID and native platform; RepoDigests matches the pinned index or verified platform manifest"})
+          (evidence / "broker-image.json").write_text(json.dumps(metadata, indent=2) + "\n")
+          (evidence / "broker.iid").write_text(image["Id"] + "\n")
+          PYTHON
+      - name: Prove real Kafka checkpoint recovery despite a failed security gate
+        id: streaming
+        if: ${{ !cancelled() && steps.storage.outcome == 'success' && steps.build.outcome == 'success' && steps.broker.outcome == 'success' }}
+        run: |
+          image="$(cat "$RUNNER_TEMP/lakehouse.iid")"
+          broker="$(cat "$RUNNER_TEMP/d2c-lakehouse-runtime-$ARCH/broker.iid")"
+          python3 scripts/test_lakehouse_streaming.py \
+            --image "$image" --broker-image "$broker" --platform "linux/$ARCH" \
+            --output-dir "$RUNNER_TEMP/d2c-lakehouse-runtime-$ARCH/streaming" \
+            --guard-script scripts/container_security_guard.py \
+            --storage-path "$GITHUB_WORKSPACE" --storage-path /var/lib/docker \
+            --phase-timeout-seconds 300 --total-timeout-seconds 1200
+          python3 - <<'PYTHON'
+          import json, os
+          from pathlib import Path
+          temporary = Path(os.environ["RUNNER_TEMP"])
+          runtime = temporary / ("d2c-lakehouse-runtime-" + os.environ["ARCH"])
+          proof = json.loads((runtime / "streaming/summary.json").read_text())
+          phases = proof.get("phases", {})
+          expected_ids = {"lakehouse": (temporary / "lakehouse.iid").read_text().strip(),
+                          "broker": (runtime / "broker.iid").read_text().strip()}
+          if (proof.get("outcome") != "PASS" or proof.get("failures") != []
+                  or set(phases) != {"initial", "resume", "crash", "recover"}
+                  or any(value.get("status") != "PASS" for value in phases.values())
+                  or proof.get("cleanup", {}).get("errors") != []
+                  or proof.get("platform") != "linux/" + os.environ["ARCH"]
+                  or any(proof.get("images", {}).get(role, {}).get("Id") != iid for role, iid in expected_ids.items())):
+              raise SystemExit("real Kafka/checkpoint proof or owned cleanup is incomplete")
+          PYTHON
+      - name: Keep an earlier final runtime build failure as a failing result
+        if: ${{ !cancelled() && steps.build.outcome != 'success' }}
+        run: exit 1
+      - name: Preserve final scans and real streaming outcomes even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          retention-days: 14
+          name: container-security-lakehouse-${{ matrix.arch }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            container-security/
+            container-security-build/
+            ${{ runner.temp }}/d2c-lakehouse-artifact-verification-${{ matrix.arch }}.json
+            ${{ runner.temp }}/lakehouse.iid
+            ${{ runner.temp }}/d2c-lakehouse-runtime-${{ matrix.arch }}
+          if-no-files-found: error
+
+  # Retain the existing aggregate check name for repositories that already
+  # require container-scan in branch protection.
+  container-scan:
+    if: always()
+    needs: [dependency-and-code-scan, repository-scan, image-scan, lakehouse-source, lakehouse-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every security job to succeed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python - <<'PYTHON'
+          import json
+          import os
+          import sys
+          results = json.loads(os.environ["RESULTS"])
+          failed = {name: value["result"] for name, value in results.items()
+                    if value["result"] != "success"}
+          if failed:
+              print("Security gate failed:", failed)
+              sys.exit(1)
+          PYTHON

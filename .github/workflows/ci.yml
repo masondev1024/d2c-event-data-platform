@@ -4,7 +4,17 @@ on:
   push:
     branches: ["main", "dev", "poc/**", "feat/**"]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      allow_ephemeral_sdk_cleanup:
+        description: "Allow selective cleanup of preinstalled SDKs on this ephemeral GitHub-hosted runner"
+        type: boolean
+        required: false
+        default: false
 
+# Approval-pending proposal: automatic jobs explicitly prepare only new hosted VMs.
+# This configuration takes effect after the user approves remote publication;
+# it does not authorize cleanup on a developer or self-hosted machine.
 permissions:
   contents: read
 
@@ -13,11 +23,131 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lakehouse-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    outputs:
+      artifact_name: ${{ steps.source.outputs.artifact_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare ephemeral CI storage
+        id: storage
+        env:
+          ALLOW_EPHEMERAL_SDK_CLEANUP: ${{ github.event_name != 'workflow_dispatch' || inputs.allow_ephemeral_sdk_cleanup }}
+        run: |
+          arguments=(--minimum-free-gib 32
+            --evidence-dir "$RUNNER_TEMP/d2c-storage-ci-source-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT")
+          if [[ "$ALLOW_EPHEMERAL_SDK_CLEANUP" == "true" ]]; then
+            arguments+=(--allow-ephemeral-sdk-cleanup)
+          fi
+          python3 scripts/prepare_ci_storage.py "${arguments[@]}"
+      - name: Preserve source storage admission evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          retention-days: 14
+          name: ci-source-storage-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/d2c-storage-ci-source-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile and seal the five source components once
+        id: source
+        run: |
+          python3 -B scripts/lakehouse_artifacts.py build --source-root . \
+            --artifacts "$RUNNER_TEMP/d2c-artifacts" \
+            --work-dir "$RUNNER_TEMP/d2c-source-build" \
+            --storage-path "$RUNNER_TEMP" --native-platform linux/amd64 \
+            --discard-created-builder-cache \
+            > "$RUNNER_TEMP/d2c-source-build-driver.log" 2>&1
+          printf 'artifact_name=%s\n' "ci-lakehouse-source-artifacts-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+      - name: Redact source receipt inventory without altering sealed artifacts
+        if: always()
+        run: |
+          python3 - <<'PYTHON'
+          import hashlib, json, os
+          from pathlib import Path
+          temporary = Path(os.environ["RUNNER_TEMP"])
+          output = temporary / "d2c-source-receipts"
+          output.mkdir(exist_ok=False)
+          def inventory(value):
+              canonical = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+              return {"counts": {key: len(value.get(key, [])) for key in ("images", "containers", "volumes")},
+                      "sha256": hashlib.sha256(canonical).hexdigest()}
+          def redact(value):
+              if isinstance(value, list):
+                  return [redact(item) for item in value]
+              if isinstance(value, dict):
+                  return {key: inventory(item) if key == "before" else redact(item)
+                          for key, item in value.items() if key != "engine_endpoint_candidates"}
+              return value
+          for name in ("state.json", "engine-before.json"):
+              path = temporary / "d2c-source-build" / name
+              if path.is_file() and not path.is_symlink():
+                  value = json.loads(path.read_text())
+                  safe = inventory(value) if name == "engine-before.json" else redact(value)
+                  (output / name).write_text(json.dumps(safe, indent=2) + "\n")
+          PYTHON
+      - name: Preserve bounded source receipts after success or failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          retention-days: 14
+          name: ci-lakehouse-source-receipts-${{ github.run_id }}-${{ github.run_attempt }}
+          # Never upload export directories, builder registrations or cache blobs.
+          path: |
+            ${{ runner.temp }}/d2c-source-build-driver.log
+            ${{ runner.temp }}/d2c-source-receipts/*.json
+            ${{ runner.temp }}/d2c-source-build/*/guard-driver.log
+            ${{ runner.temp }}/d2c-source-build/*/guard/*.json
+            ${{ runner.temp }}/d2c-source-build/*/guard/*.log
+            ${{ runner.temp }}/d2c-source-build/*/builder-state/discard-plan.json
+            ${{ runner.temp }}/d2c-artifacts/manifest.json
+            ${{ runner.temp }}/d2c-artifacts/*/build-status.json
+          if-no-files-found: error
+      - name: Share only the sealed source artifact tree
+        uses: actions/upload-artifact@v4
+        with:
+          retention-days: 1
+          name: ${{ steps.source.outputs.artifact_name }}
+          path: ${{ runner.temp }}/d2c-artifacts
+          include-hidden-files: true
+          compression-level: 0
+          if-no-files-found: error
+
   python:
+    if: always()
+    needs: [lakehouse-source]
     runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      CI_CONTAINER_EVIDENCE: d2c-ci-container-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Prepare ephemeral CI storage
+        id: storage
+        if: ${{ !cancelled() && needs.lakehouse-source.result != 'cancelled' }}
+        env:
+          ALLOW_EPHEMERAL_SDK_CLEANUP: ${{ github.event_name != 'workflow_dispatch' || inputs.allow_ephemeral_sdk_cleanup }}
+        run: |
+          arguments=(--minimum-free-gib 32
+            --evidence-dir "$RUNNER_TEMP/d2c-storage-ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT")
+          if [[ "$ALLOW_EPHEMERAL_SDK_CLEANUP" == "true" ]]; then
+            arguments+=(--allow-ephemeral-sdk-cleanup)
+          fi
+          python3 scripts/prepare_ci_storage.py "${arguments[@]}"
+
+      - name: Preserve CI storage preparation evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          retention-days: 14
+          name: ci-storage-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/d2c-storage-ci-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -48,17 +178,34 @@ jobs:
       - name: Validate data product catalog evidence
         run: python scripts/validate_catalog.py --catalog-dir catalog/data-products --repository-root .
 
+      - name: Prepare fresh guarded container evidence
+        run: |
+          test ! -e "$RUNNER_TEMP/$CI_CONTAINER_EVIDENCE"
+          mkdir --parents "$RUNNER_TEMP/$CI_CONTAINER_EVIDENCE"
+
       - name: Build catalog portal target
-        run: docker build --target catalog-portal --tag d2c-catalog-portal:${{ github.sha }} .
+        run: >-
+          python scripts/container_security_guard.py
+          --kind build --minimum-free-gib 20 --reserve-free-gib 6
+          --timeout-seconds 1800
+          --storage-path "$GITHUB_WORKSPACE" --storage-path /var/lib/docker
+          --build-state-dir "$RUNNER_TEMP/d2c-ci-build-state-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          --evidence-dir "$RUNNER_TEMP/$CI_CONTAINER_EVIDENCE/catalog-build" --
+          docker build --target catalog-portal
+          --iidfile "$RUNNER_TEMP/$CI_CONTAINER_EVIDENCE/catalog.iid"
+          --tag "d2c-catalog-portal:$GITHUB_SHA" .
 
       - name: Smoke test catalog portal target
         run: |
-          container_id="$(docker run --detach --env CATALOG_BIND_HOST=0.0.0.0 --publish 127.0.0.1::8082 d2c-catalog-portal:${{ github.sha }})"
-          cleanup() {
-            docker logs "$container_id" || true
-            docker rm --force "$container_id" || true
-          }
-          trap cleanup EXIT
+          name="d2c-ci-catalog-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          owner="$(python -c 'import uuid; print(uuid.uuid4().hex)')"
+          image="$(cat "$RUNNER_TEMP/$CI_CONTAINER_EVIDENCE/catalog.iid")"
+          smoke="$RUNNER_TEMP/$CI_CONTAINER_EVIDENCE/catalog-smoke.sh"
+          cat > "$smoke" <<'BASH'
+          set -euo pipefail
+          container_id="$(docker run --rm --detach --name "$1" --label "d2c.security.owner=$2" --env CATALOG_BIND_HOST=0.0.0.0 --publish 127.0.0.1::8082 "$3")"
+          # The guard stops only this labelled container after the child exits.
+          trap 'docker logs "$container_id" || true' EXIT
           port="$(docker port "$container_id" 8082/tcp | sed -E 's/.*:([0-9]+)$/\1/')"
           for attempt in $(seq 1 15); do
             if curl --fail --silent --show-error "http://127.0.0.1:${port}/healthz"; then
@@ -68,21 +215,78 @@ jobs:
             sleep 1
           done
           exit 1
+          BASH
+          python scripts/container_security_guard.py \
+            --kind test --minimum-free-gib 8 --reserve-free-gib 6 --timeout-seconds 180 \
+            --storage-path "$GITHUB_WORKSPACE" --storage-path /var/lib/docker \
+            --container-name "$name" --owner-token "$owner" \
+            --evidence-dir "$RUNNER_TEMP/$CI_CONTAINER_EVIDENCE/catalog-smoke" -- \
+            bash "$smoke" "$name" "$owner" "$image"
 
       - name: Validate local lakehouse Compose profile
         run: docker compose --profile lakehouse config >/dev/null
 
+      - name: Require a successful verified source export
+        if: ${{ !cancelled() }}
+        env:
+          SOURCE_RESULT: ${{ needs.lakehouse-source.result }}
+          SOURCE_ARTIFACT: ${{ needs.lakehouse-source.outputs.artifact_name }}
+        run: |
+          test "$SOURCE_RESULT" = success
+          test -n "$SOURCE_ARTIFACT"
+
+      - name: Download sealed source artifacts without recompilation
+        if: ${{ !cancelled() && needs.lakehouse-source.result == 'success' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.lakehouse-source.outputs.artifact_name }}
+          path: ${{ runner.temp }}/d2c-artifacts
+
+      - name: Verify exact source recipe and exported payloads
+        run: |
+          python3 -B scripts/lakehouse_artifacts.py verify \
+            --artifacts "$RUNNER_TEMP/d2c-artifacts" --source-root . \
+            > "$RUNNER_TEMP/$CI_CONTAINER_EVIDENCE/source-artifact-verification.json"
+
       - name: Build Iceberg streaming image
-        run: docker build --file lakehouse/Dockerfile --tag d2c-iceberg-stream:${{ github.sha }} .
+        run: >-
+          python scripts/container_security_guard.py
+          --kind build --minimum-free-gib 20 --reserve-free-gib 6
+          --timeout-seconds 1800
+          --storage-path "$GITHUB_WORKSPACE" --storage-path /var/lib/docker
+          --build-state-dir "$RUNNER_TEMP/d2c-ci-build-state-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          --evidence-dir "$RUNNER_TEMP/$CI_CONTAINER_EVIDENCE/lakehouse-build" --
+          docker build --file lakehouse/Dockerfile
+          --build-context "d2c_artifacts=$RUNNER_TEMP/d2c-artifacts"
+          --build-arg D2C_ARTIFACT_STAGE=d2c_artifacts
+          --iidfile "$RUNNER_TEMP/$CI_CONTAINER_EVIDENCE/lakehouse.iid"
+          --tag "d2c-iceberg-stream:$GITHUB_SHA" .
 
       - name: Smoke test local Iceberg catalog
-        run: >-
-          docker run --rm
-          d2c-iceberg-stream:${{ github.sha }}
-          /opt/spark/bin/spark-submit
-          --master 'local[1]'
-          --conf spark.driver.memory=1g
-          /opt/d2c-lakehouse/lakehouse/validate_d2c_iceberg.py
+        # This retains the empty/local catalog smoke. The isolated Kafka and
+        # checkpoint harness is a separate integration proof.
+        run: |
+          name="d2c-ci-lakehouse-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          owner="$(python -c 'import uuid; print(uuid.uuid4().hex)')"
+          image="$(cat "$RUNNER_TEMP/$CI_CONTAINER_EVIDENCE/lakehouse.iid")"
+          python scripts/container_security_guard.py \
+            --kind test --minimum-free-gib 8 --reserve-free-gib 6 --timeout-seconds 600 \
+            --storage-path "$GITHUB_WORKSPACE" --storage-path /var/lib/docker \
+            --container-name "$name" --owner-token "$owner" \
+            --evidence-dir "$RUNNER_TEMP/$CI_CONTAINER_EVIDENCE/lakehouse-smoke" -- \
+            docker run --rm --name "$name" --label "d2c.security.owner=$owner" "$image" \
+            /opt/spark/bin/spark-submit --master 'local[1]' \
+            --conf spark.driver.memory=1g \
+            /opt/d2c-lakehouse/lakehouse/validate_d2c_iceberg.py
+
+      - name: Preserve guarded build and smoke outcomes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          retention-days: 14
+          name: ci-container-evidence-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/${{ env.CI_CONTAINER_EVIDENCE }}
+          if-no-files-found: error
 
       - name: Enforce local-only docs policy
         run: test -z "$(git ls-files -- docs)"

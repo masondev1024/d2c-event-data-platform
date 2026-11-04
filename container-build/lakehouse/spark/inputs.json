@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "spark_version": "4.2.1",
+  "jetty_version": "12.1.14",
+  "scala_binary_version": "2.13",
+  "source": {
+    "filename": "spark-4.2.1.tgz",
+    "directory": "spark-4.2.1",
+    "url": "https://archive.apache.org/dist/spark/spark-4.2.1/spark-4.2.1.tgz",
+    "checksum_url": "https://archive.apache.org/dist/spark/spark-4.2.1/spark-4.2.1.tgz.sha512",
+    "sha512": "a31bb2c65fd7aa5217c5353809b2dfa80ff119171b3b1ae3eb7f7d1a9bbe2d187edb9de7e9498994db54d3ed6d0ac9b40a5616ac72942f6233ff9f18645b1814",
+    "tag_url": "https://github.com/apache/spark/tree/v4.2.1",
+    "pom_sha256": {
+      "pom.xml": "2685bfc815d4075c25deb3500f797d35d8790c0d988c335e9cd348389c37380b",
+      "core/pom.xml": "21f59b60e1497bed036de67a21f3d2c057899491280c0b69b214f2058a18511f"
+    }
+  },
+  "maven": {
+    "version": "3.9.15",
+    "filename": "apache-maven-3.9.15-bin.tar.gz",
+    "directory": "apache-maven-3.9.15",
+    "url": "https://archive.apache.org/dist/maven/maven-3/3.9.15/binaries/apache-maven-3.9.15-bin.tar.gz",
+    "checksum_url": "https://archive.apache.org/dist/maven/maven-3/3.9.15/binaries/apache-maven-3.9.15-bin.tar.gz.sha512",
+    "sha512": "33d81e0ec785f0207e3e5e3ffb61863e1dca5784c15ac3fb5ff105f69cffbea484eb8d473ea60467a63f7b0570eef8622f2fed8eee96acbe668aa313391cddb3"
+  },
+  "upstream_properties": {
+    "java.version": "17",
+    "java.minimum.version": "17.0.11",
+    "maven.version": "3.9.15",
+    "jetty.version": "12.1.8",
+    "scala.version": "2.13.18",
+    "scala.binary.version": "2.13",
+    "hadoop.version": "3.5.0",
+    "kafka.version": "3.9.2",
+    "netty.version": "4.2.13.Final",
+    "fasterxml.jackson.version": "2.21.2",
+    "jersey.version": "3.1.11",
+    "jakartaservlet.version": "6.0.0"
+  },
+  "overrides": {
+    "jetty.version": "12.1.14"
+  },
+  "reviewed_on": "2026-11-04",
+  "compatibility_scope": "A rebuilt core for a coherent Spark 4.2.1 distribution; never a core replacement in Spark 4.1.x."
+}
