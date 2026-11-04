@@ -3,8 +3,8 @@
 This recipe selects whole artifacts in the official Hadoop 3.5.0 source-free
 `hadoop-client-api` and `hadoop-client-runtime` assemblies. It produces the
 distinct coordinates `3.5.0-d2c-local1`; every selected upstream Hadoop module
-remains 3.5.0. It does not edit an upstream binary, remove class files, discard
-Maven metadata or change the upstream shade profiles.
+remains 3.5.0. It does not edit an upstream binary, remove class files or strip
+metadata after packaging. The upstream shade profiles remain unchanged.
 
 The supported application boundary is Spark `local[...]`, a local `file://`
 Iceberg warehouse and absolute local checkpoints. Hadoop configuration, local
@@ -52,6 +52,20 @@ and outputs are `/out/hadoop/hadoop-client-{api,runtime}-3.5.0-d2c-local1.jar`,
 two complete JSON dependency trees and `provenance.json`. Original small source
 inputs are fetched over HTTPS with SHA-256 checks and saved unchanged; generated
 POMs have separate hashes. Input sources are build-stage data.
+
+The official runtime shade profile filters all entries of `org.apache.hadoop:*`
+using `**/*` and `*`. This also omits the runtime project's own `pom.properties`
+and `pom.xml`; the recipe does not create, delete or relabel these inside the
+JAR. The identity verifier accepts only that exact absence, bound to the pinned
+original runtime POM and its recorded filter hash. It requires the generated
+source POM, actual installed local-repository POM and resolved tree root to
+name the same custom GAV, and the exported JAR SHA-256 to match the actual Maven
+target JAR. The installed POM must also match Maven's generated dependency-reduced
+POM byte for byte. Both exported POMs and their hashes are retained. The API's project descriptor,
+original retained Hadoop module descriptors, and every required patched-library
+descriptor remain mandatory and unique, with exact GAV/version checks. There is
+no general metadata-absence fallback. The small original runtime POM in
+`fixtures/` is a hash-verified, licensed test input, not a replacement build input.
 
 The build performs static graph/JAR checks only. Generated provenance marks
 dynamic boot, D2C functional regression and vulnerability scans `NOT_RUN`.

@@ -66,7 +66,6 @@ def mock_http(*, return_value=None, side_effect=None):
 
 class RuntimeDispatchTest(unittest.TestCase):
     def test_gunicorn_worker_directory_is_private_and_removed_after_child_cleanup(self):
-        native = SimpleNamespace(pq=SimpleNamespace(__impl__="binary", version=lambda: 170009))
         application = Mock()
         client = application.app.test_client.return_value.__enter__ = Mock()
         application.app.test_client.return_value.__exit__ = Mock(return_value=False)
@@ -79,13 +78,76 @@ class RuntimeDispatchTest(unittest.TestCase):
             temporary.append(path)
             return {"owned_child_reaped": True}
         with patch.object(probe, "import_versions", return_value={}), \
-             patch.object(probe.importlib, "import_module", side_effect=lambda name: native if name == "psycopg" else application), \
+             patch.object(probe, "native_psycopg_probe", return_value={"implementation": "c"}), \
+             patch.object(probe.importlib, "import_module", return_value=application), \
              patch.object(probe, "local_port", return_value=8765), \
              patch.object(probe, "server_probe", side_effect=server), patch.dict(probe.os.environ, {}):
             result = probe.api_probe(100)
         self.assertTrue(result["normal_gunicorn"]["owned_child_reaped"])
         self.assertEqual(len(temporary), 1)
         self.assertFalse(temporary[0].exists())
+
+    def test_libpq_known_fixed_branch_floors_reject_the_observed_binary_version(self):
+        for version, expected in ((170005, False), (170009, False), (170010, True),
+                                  (180003, False), (180004, True), (190000, False)):
+            with self.subTest(version=version):
+                self.assertEqual(probe.fixed_libpq(version), expected)
+
+    def test_native_c_provider_requires_system_libraries_and_libpq_ssl_dependencies(self):
+        native = SimpleNamespace(pq=SimpleNamespace(__impl__="c", version=lambda: 180004))
+        maps = "\n".join("1000-2000 r-xp 00000000 00:00 1 /usr/lib/" + name
+                         for name in ("libpq.so.5.18", "libssl.so.3", "libcrypto.so.3"))
+        library = Mock()
+        library.PQlibVersion.return_value = 180004
+        library.TLS_client_method.return_value = 1
+        library.OpenSSL_version.return_value = b"OpenSSL fixture dependency"
+        with patch.object(probe.importlib, "import_module", return_value=native), \
+             patch.object(probe.metadata, "version", side_effect=probe.metadata.PackageNotFoundError), \
+             patch.object(probe.Path, "read_text", return_value=maps), \
+             patch.object(probe.ctypes, "CDLL", return_value=library) as load:
+            result = probe.native_psycopg_probe()
+        self.assertEqual(result["implementation"], "c")
+        self.assertTrue(result["libpq_dependency_tls_method"])
+        self.assertTrue(result["binary_wheel_distribution_absent"])
+        load.assert_called_once_with("/usr/lib/libpq.so.5.18")
+
+    def test_binary_distribution_or_vendored_library_is_rejected(self):
+        native = SimpleNamespace(pq=SimpleNamespace(__impl__="c", version=lambda: 180004))
+        with patch.object(probe.importlib, "import_module", return_value=native), \
+             patch.object(probe.metadata, "version", return_value="3.2.10"):
+            with self.assertRaisesRegex(probe.ProbeError, "binary wheel"):
+                probe.native_psycopg_probe()
+        maps = "1000-2000 r-xp 00000000 00:00 1 /opt/venv/psycopg_binary.libs/libpq.so.5"
+        with patch.object(probe.importlib, "import_module", return_value=native), \
+             patch.object(probe.metadata, "version", side_effect=probe.metadata.PackageNotFoundError), \
+             patch.object(probe.Path, "read_text", return_value=maps), \
+             patch.object(probe.ctypes, "CDLL") as load:
+            with self.assertRaisesRegex(probe.ProbeError, "vendored"):
+                probe.native_psycopg_probe()
+        load.assert_not_called()
+
+    def test_database_driver_uses_parameters_commits_and_rolls_back_without_logging_values(self):
+        native = Mock()
+        connection = native.connect.return_value
+        connection.info.server_version = 160014
+        connection.cursor.return_value.__enter__ = Mock()
+        connection.cursor.return_value.__exit__ = Mock(return_value=False)
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchall.return_value = [(1, "검증-π-事务", {"message": "재현-λ", "value": 7})]
+        configuration = {"host": "database", "port": 5432, "dbname": "d2c_probe", "user": "d2c_probe", "password": "sensitive-memory-only-credential"}
+        json_types = SimpleNamespace(Jsonb=lambda value: value)
+        with patch.object(probe, "import_versions", return_value={}), \
+             patch.object(probe, "native_psycopg_probe", return_value={"implementation": "c"}), \
+             patch.object(probe.importlib, "import_module", side_effect=lambda name: json_types if name == "psycopg.types.json" else native), \
+             patch.object(probe.time, "monotonic", return_value=10):
+            result = probe.database_probe(configuration, 100)
+        self.assertEqual(result["database_roundtrip"]["server_version_num"], 160014)
+        self.assertTrue(result["database_roundtrip"]["unicode_jsonb_roundtrip"])
+        self.assertEqual(connection.commit.call_count, 2)
+        connection.rollback.assert_called_once()
+        connection.close.assert_called_once()
+        self.assertEqual(len(cursor.execute.call_args_list[1].args), 2)
+        self.assertNotIn(configuration["password"], json.dumps(result))
 
     def test_each_role_dispatches_only_its_own_checks_and_restores_alarm(self):
         for role in probe.ROLES:

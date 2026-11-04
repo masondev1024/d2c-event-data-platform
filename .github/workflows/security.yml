@@ -38,8 +38,14 @@ jobs:
 
       - name: Install runtime and audit tools
         run: |
+          # Host dependency audits use the same Psycopg C implementation;
+          # the production library floor belongs to the final image proof.
+          python3 -c 'import os; from scripts.prepare_ci_storage import validate_host; validate_host(dict(os.environ))'
+          sudo -n apt-get update
+          sudo -n apt-get install --yes --no-install-recommends build-essential libpq-dev
           python -m pip install --requirement requirements-dev.txt
-          python -m pip install --requirement app/requirements.txt
+          python -m pip install --no-binary=psycopg-c --requirement app/requirements.txt
+          python -c 'from psycopg import pq; assert pq.__impl__ == "c"; print("host_test_libpq_version=" + str(pq.version()))'
           python -m pip install pip-audit==2.9.0 bandit==1.8.6
 
       - name: Audit Python dependencies
@@ -279,6 +285,98 @@ jobs:
               raise SystemExit("Python runtime target is not the immutable final image ID")
           (evidence / "runtime-proof.json").write_text(json.dumps(proof, indent=2) + "\n")
           PYTHON
+      # Prepared API remediation: these steps may be published/run only after
+      # the separately requested native-libpq remediation approval.
+      - name: Prepare the isolated API database fixture by exact version and native image ID
+        id: api-database-image
+        if: ${{ !cancelled() && matrix.role == 'api' && steps.storage.outcome == 'success' && steps.build.outcome == 'success' }}
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          reference="postgres:16.14-alpine"
+          python3 scripts/container_security_guard.py \
+            --kind scan --minimum-free-gib 10 --reserve-free-gib 6 --timeout-seconds 300 \
+            --storage-path "$GITHUB_WORKSPACE" --storage-path /var/lib/docker \
+            --evidence-dir "$RUNNER_TEMP/d2c-api-database-$ARCH/fixture-pull" -- \
+            docker pull --platform "linux/$ARCH" "$reference"
+          python3 - <<'PYTHON'
+          import json, os, re, subprocess
+          from pathlib import Path
+          reference = "postgres:16.14-alpine"
+          inspected = json.loads(subprocess.check_output(["docker", "image", "inspect", reference], text=True, timeout=30))
+          if not isinstance(inspected, list) or len(inspected) != 1:
+              raise SystemExit("database fixture must resolve to exactly one native image")
+          image = inspected[0]
+          digests = image.get("RepoDigests", [])
+          if (not re.fullmatch(r"sha256:[0-9a-f]{64}", image.get("Id", ""))
+                  or image.get("Os") != "linux" or image.get("Architecture") != os.environ["ARCH"]
+                  or not isinstance(digests, list) or not digests
+                  or not all(isinstance(value, str) and re.fullmatch(r"(?:docker\.io/library/)?postgres@sha256:[0-9a-f]{64}", value)
+                             for value in digests)):
+              raise SystemExit("database fixture immutable ID, native platform or repository digest is incomplete")
+          evidence = Path(os.environ["RUNNER_TEMP"]) / ("d2c-api-database-" + os.environ["ARCH"])
+          metadata = {key: image.get(key) for key in ("Id", "Os", "Architecture", "RepoDigests", "Created")}
+          metadata.update({"source_reference": reference, "expected_server_version_num": 160014,
+                           "identity_scope": "caller prepared official exact-version fixture; runtime proof must confirm server version 16.14"})
+          (evidence / "fixture-image.json").write_text(json.dumps(metadata, indent=2) + "\n")
+          (evidence / "fixture.iid").write_text(image["Id"] + "\n")
+          PYTHON
+      - name: Prove the API native libpq against a fresh isolated PostgreSQL database
+        id: api-database-runtime
+        if: ${{ !cancelled() && matrix.role == 'api' && steps.storage.outcome == 'success' && steps.build.outcome == 'success' && steps.api-database-image.outcome == 'success' }}
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          image="$(cat "$RUNNER_TEMP/api.iid")"
+          database="$(cat "$RUNNER_TEMP/d2c-api-database-$ARCH/fixture.iid")"
+          python3 scripts/test_api_database.py \
+            --api-image "$image" --database-image "$database" --platform "linux/$ARCH" \
+            --output-dir "$RUNNER_TEMP/d2c-api-database-$ARCH/roundtrip" \
+            --guard-script scripts/container_security_guard.py \
+            --storage-path "$GITHUB_WORKSPACE" --storage-path /var/lib/docker
+          python3 - <<'PYTHON'
+          import json, os, re
+          from pathlib import Path
+          temporary = Path(os.environ["RUNNER_TEMP"])
+          directory = temporary / ("d2c-api-database-" + os.environ["ARCH"])
+          requirement_lines = (Path(os.environ["GITHUB_WORKSPACE"]) / "app/requirements.txt").read_text(encoding="utf-8").splitlines()
+          psycopg_lines = [line for line in requirement_lines
+                          if re.match(r"^\s*psycopg(?=\[|[=<>!~@\s;]|$)", line, flags=re.IGNORECASE)]
+          pinned = re.fullmatch(r"psycopg\[c\]==([0-9]+\.[0-9]+\.[0-9]+)", psycopg_lines[0]) if len(psycopg_lines) == 1 else None
+          if pinned is None:
+              raise SystemExit("app/requirements.txt must contain exactly one plain psycopg[c]==X.Y.Z pin")
+          expected_imports = {"psycopg": pinned[1], "psycopg-c": pinned[1]}
+          result = json.loads((directory / "roundtrip/summary.json").read_text())
+          expected_ids = {"api": (temporary / "api.iid").read_text().strip(),
+                          "database": (directory / "fixture.iid").read_text().strip()}
+          proof = result.get("proof", {})
+          checks = proof.get("checks", {})
+          native = checks.get("native_psycopg", {})
+          database = checks.get("database_roundtrip", {})
+          version = native.get("libpq_version")
+          mappings = native.get("system_library_mappings", {})
+          expected_database = {"server_version_num": 160014, "committed_rows": 1,
+                               "rolled_back_rows": 0, "unicode_jsonb_roundtrip": True,
+                               "parameterized_statements": True, "fixture_sslmode": "disable"}
+          if (result.get("outcome") != "PASS" or result.get("failures") != []
+                  or result.get("cleanup", {}).get("errors") != []
+                  or result.get("platform") != "linux/" + os.environ["ARCH"]
+                  or any(result.get("images", {}).get(role, {}).get("Id") != iid for role, iid in expected_ids.items())
+                  or proof.get("status") != "PASS" or proof.get("role") != "api" or proof.get("mode") != "database"
+                  or native.get("implementation") != "c" or type(version) is not int or not 180004 <= version < 190000
+                  or native.get("binary_wheel_distribution_absent") is not True
+                  or native.get("libpq_dependency_tls_method") is not True
+                  or not isinstance(native.get("libpq_dependency_openssl_version"), str)
+                  or not native["libpq_dependency_openssl_version"].startswith("OpenSSL ")
+                  or not isinstance(mappings, dict) or set(mappings) != {"libpq", "libssl", "libcrypto"}
+                  or any(not isinstance(paths, list) or not paths
+                         or any(not isinstance(path, str) or not path.startswith(("/usr/lib/", "/lib/")) or ".libs/" in path for path in paths)
+                         for paths in mappings.values())
+                  or checks.get("imports") != expected_imports
+                  or any(database.get(key) != value or type(database.get(key)) is not type(value)
+                         for key, value in expected_database.items())):
+              raise SystemExit("API immutable target, native libpq 18.4+, real SQL/JSONB proof or owned cleanup is incomplete")
+          PYTHON
       - name: Keep an earlier build failure as a failing result
         if: ${{ !cancelled() && steps.build.outcome != 'success' }}
         run: exit 1
@@ -292,6 +390,7 @@ jobs:
             container-security/
             container-security-build/
             ${{ runner.temp }}/d2c-python-runtime-${{ matrix.role }}-${{ matrix.arch }}
+            ${{ runner.temp }}/d2c-api-database-${{ matrix.arch }}
           if-no-files-found: error
 
   # Compile the architecture-neutral Java payload once, on a native host. The

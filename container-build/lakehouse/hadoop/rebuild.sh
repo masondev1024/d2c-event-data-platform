@@ -33,6 +33,9 @@ for module in hadoop-client-api hadoop-client-runtime; do
     run_maven org.apache.maven.plugins:maven-dependency-plugin:3.8.1:tree \
         -DoutputType=json -DoutputFile="$output_dir/$module-dependency-tree.json"
     cp "target/$module-$variant.jar" "$output_dir/"
+    cp pom.xml "$output_dir/$module-$variant-source-pom.xml"
+    cp "/root/.m2/repository/org/apache/hadoop/$module/$variant/$module-$variant.pom" \
+        "$output_dir/$module-$variant-installed-pom.xml"
 done
 python3 "$helper_dir/verify_bundle.py" "$source_root" "$output_dir"
 # provenance records static checks only. The final image must separately execute

@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import struct
 from zipfile import ZipFile
+import xml.etree.ElementTree as ET
 
 from patch_pom import patch_source
 from runtime_profile import (
@@ -103,7 +104,8 @@ def validate_class_references(binary_name: str, refs: set[str]) -> list[str]:
 
 
 def validate_graph(graph: dict, module: str) -> dict:
-    require(graph.get("artifactId") == module and graph.get("version") == VARIANT_VERSION,
+    require(graph.get("groupId") == "org.apache.hadoop" and graph.get("artifactId") == module
+            and graph.get("version") == VARIANT_VERSION,
             f"incorrect graph root: {module}")
     coordinates = set()
     edges = []
@@ -163,6 +165,102 @@ def properties(content: bytes) -> dict[str, str]:
     return result
 
 
+def required_jar_entry(jar: ZipFile, name: str) -> bytes:
+    require(jar.namelist().count(name) == 1, f"required unique JAR metadata absent/duplicated: {name}")
+    return jar.read(name)
+
+
+def verify_maven_properties(content: bytes, group: str, artifact: str, version: str) -> dict:
+    actual = properties(content)
+    expected = {"groupId": group, "artifactId": artifact, "version": version}
+    require(all(actual.get(key) == value for key, value in expected.items()),
+            f"incorrect Maven metadata: {group}:{artifact}:{version}")
+    return expected
+
+
+def validate_retained_dependency_metadata(jar: ZipFile) -> dict:
+    paths = {coordinate: f"META-INF/maven/{coordinate}/pom.properties" for coordinate in DEPENDENCY_VERSIONS}
+    invalid = [name for name in paths.values() if jar.namelist().count(name) != 1]
+    require(not invalid, f"retained dependency Maven metadata missing/duplicated: {invalid}")
+    return {coordinate: verify_maven_properties(jar.read(paths[coordinate]), *coordinate.split("/"), version)
+            for coordinate, version in DEPENDENCY_VERSIONS.items()}
+
+
+def generated_pom_gav(content: bytes) -> tuple[str, str, str]:
+    root = ET.fromstring(content)
+    namespace = {"m": "http://maven.apache.org/POM/4.0.0"}
+    group = root.findtext("m:groupId", namespaces=namespace) or root.findtext("m:parent/m:groupId", namespaces=namespace)
+    artifact = root.findtext("m:artifactId", namespaces=namespace)
+    version = root.findtext("m:version", namespaces=namespace)
+    require((root.findtext("m:packaging", namespaces=namespace) or "jar") == "jar", "generated artifact POM must describe a JAR")
+    return group, artifact, version
+
+
+def runtime_descriptor_filter_contract(original: bytes) -> dict:
+    relative = "hadoop-client-modules/hadoop-client-runtime/pom.xml"
+    digest = hashlib.sha256(original).hexdigest()
+    require(digest == SOURCE_INPUTS[relative], "runtime identity requires the exact pinned upstream POM hash")
+    namespace = {"m": "http://maven.apache.org/POM/4.0.0"}
+    root = ET.fromstring(original)
+    filters = []
+    for profile in root.findall("m:profiles/m:profile", namespace):
+        if profile.findtext("m:id", namespaces=namespace) != "shade":
+            continue
+        for plugin in profile.findall("m:build/m:plugins/m:plugin", namespace):
+            if plugin.findtext("m:artifactId", namespaces=namespace) == "maven-shade-plugin":
+                filters.extend(plugin.findall("m:executions/m:execution/m:configuration/m:filters/m:filter", namespace))
+    matches = [item for item in filters if item.findtext("m:artifact", namespaces=namespace) == "org.apache.hadoop:*"]
+    require(len(matches) == 1, "upstream runtime Hadoop artifact filter changed")
+    item = matches[0]
+    excludes = [node.text for node in item.findall("m:excludes/m:exclude", namespace)]
+    require(excludes == ["**/*", "*"] and item.find("m:includes", namespace) is None,
+            "upstream runtime descriptor-absence contract changed")
+    contract = {"artifact": "org.apache.hadoop:*", "excludes": excludes}
+    return {"upstream_pom_sha256": digest,
+            "filter": contract,
+            "filter_sha256": hashlib.sha256(json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+            "filter_hash_format": "SHA-256 of canonical JSON for the exact artifact/excludes filter",
+            "behavior": "The unchanged upstream runtime filter removes all entries of Hadoop artifacts, including its own Maven descriptor. Retained third-party Maven descriptors remain mandatory."}
+
+
+def validate_artifact_identity(module: str, jar: ZipFile, *, original_pom: bytes,
+                               exported_source_pom: bytes, installed_pom: bytes,
+                               generated_dependency_reduced_pom: bytes, resolved_graph: dict,
+                               artifact_sha256: str, built_artifact_sha256: str) -> dict:
+    require(module in MODULES, "unknown Hadoop assembly identity")
+    require(re.fullmatch(r"[a-f0-9]{64}", artifact_sha256) is not None
+            and artifact_sha256 == built_artifact_sha256,
+            f"exported JAR differs from the actual Maven target artifact: {module}")
+    expected_source = patch_source(original_pom.decode("utf-8"), module).encode("utf-8")
+    require(exported_source_pom == expected_source, f"exported generated source POM differs from the reviewed recipe: {module}")
+    require(installed_pom == generated_dependency_reduced_pom,
+            f"actual installed POM differs from Maven's generated dependency-reduced POM: {module}")
+    gav = ("org.apache.hadoop", module, VARIANT_VERSION)
+    require(generated_pom_gav(exported_source_pom) == gav, f"generated source POM has the wrong root GAV: {module}")
+    require(generated_pom_gav(installed_pom) == gav, f"Maven installed POM has the wrong root GAV: {module}")
+    validate_graph(resolved_graph, module)
+    descriptor_root = f"META-INF/maven/org.apache.hadoop/{module}/"
+    if module == "hadoop-client-runtime":
+        contract = runtime_descriptor_filter_contract(original_pom)
+        expected_absent = [descriptor_root + name for name in ("pom.properties", "pom.xml")]
+        require(all(name not in jar.namelist() for name in expected_absent),
+                "runtime own descriptor unexpectedly present; review the upstream assembly contract")
+        method = "exact upstream descriptor absence; generated/installed POM and resolved root GAV plus matching Maven-target/exported JAR SHA-256"
+        descriptors = {"expected_absent": expected_absent, "unchanged_upstream_filter": contract}
+    else:
+        verify_maven_properties(required_jar_entry(jar, descriptor_root + "pom.properties"), *gav)
+        method = "required embedded project Maven properties plus generated/installed POM, resolved root GAV and matching Maven-target/exported JAR SHA-256"
+        descriptors = {"required_embedded_properties": descriptor_root + "pom.properties"}
+    return {"method": method, "gav": ":".join(gav), "artifact_sha256": artifact_sha256,
+            "maven_target_artifact_sha256": built_artifact_sha256,
+            "generated_source_pom_sha256": hashlib.sha256(exported_source_pom).hexdigest(),
+            "maven_installed_pom_sha256": hashlib.sha256(installed_pom).hexdigest(),
+            "generated_dependency_reduced_pom_sha256": hashlib.sha256(generated_dependency_reduced_pom).hexdigest(),
+            "installed_pom_matches_generated_dependency_reduced_pom": True,
+            "resolved_root_gav": ":".join((resolved_graph["groupId"], resolved_graph["artifactId"], resolved_graph["version"])),
+            "project_descriptor_contract": descriptors}
+
+
 def verify(source_root: Path, output: Path) -> dict:
     version_report = (output / "maven-version.txt").read_bytes()
     maven_version = validate_maven_version(version_report.decode())
@@ -174,7 +272,7 @@ def verify(source_root: Path, output: Path) -> dict:
         content = path.read_bytes()
         require(hashlib.sha256(content).hexdigest() == expected, f"source hash mismatch: {relative}")
         sources.append({"url": SOURCE_ROOT_URL + relative, "sha256": expected})
-    graphs, recipes = {}, {}
+    graphs, recipes, assembly_inputs = {}, {}, {}
     for module in MODULES:
         directory = source_root / "hadoop-client-modules" / module
         original = (directory / "upstream.pom.xml").read_text()
@@ -182,20 +280,29 @@ def verify(source_root: Path, output: Path) -> dict:
         require(patched == patch_source(original, module), f"unexpected source recipe edit: {module}")
         recipes[module] = hashlib.sha256(patched.encode()).hexdigest()
         graph_file = output / f"{module}-dependency-tree.json"
-        graphs[module] = validate_graph(json.loads(graph_file.read_text()), module)
+        graph = json.loads(graph_file.read_text())
+        graphs[module] = validate_graph(graph, module)
+        assembly_inputs[module] = {"original_pom": (directory / "upstream.pom.xml").read_bytes(),
+            "exported_source_pom": (output / f"{module}-{VARIANT_VERSION}-source-pom.xml").read_bytes(),
+            "installed_pom": (output / f"{module}-{VARIANT_VERSION}-installed-pom.xml").read_bytes(),
+            "generated_dependency_reduced_pom": (directory / "dependency-reduced-pom.xml").read_bytes(),
+            "resolved_graph": graph,
+            "built_artifact_sha256": hashlib.sha256((directory / "target" / f"{module}-{VARIANT_VERSION}.jar").read_bytes()).hexdigest()}
 
     classes, services, artifacts, jetty_modules = set(), {}, [], set()
-    yarn_references, jetty_references, transport_references = {}, {}, {}
+    yarn_references, jetty_references, transport_references, identities = {}, {}, {}, {}
     for module in MODULES:
         path = output / f"{module}-{VARIANT_VERSION}.jar"
+        artifact_hash = hashlib.sha256(path.read_bytes()).hexdigest()
         with ZipFile(path) as jar:
-            metadata = properties(jar.read(f"META-INF/maven/org.apache.hadoop/{module}/pom.properties"))
-            require(metadata.get("version") == VARIANT_VERSION, f"incorrect local artifact metadata: {module}")
+            identities[module] = validate_artifact_identity(module, jar, artifact_sha256=artifact_hash,
+                                                            **assembly_inputs[module])
+            identities[module]["resolved_tree_json_sha256"] = hashlib.sha256(
+                (output / f"{module}-dependency-tree.json").read_bytes()).hexdigest()
             if module == "hadoop-client-api":
                 for original in ("hadoop-mapreduce-client-core", "hadoop-yarn-client"):
-                    metadata = properties(jar.read(f"META-INF/maven/org.apache.hadoop/{original}/pom.properties"))
-                    require(metadata.get("version") == UPSTREAM_VERSION,
-                            f"required original Hadoop module metadata missing/changed: {original}")
+                    verify_maven_properties(required_jar_entry(jar, f"META-INF/maven/org.apache.hadoop/{original}/pom.properties"),
+                                            "org.apache.hadoop", original, UPSTREAM_VERSION)
             for name in jar.namelist():
                 if name.startswith("META-INF/services/") and not name.endswith("/"):
                     services.setdefault(name.removeprefix("META-INF/services/"), set()).update(service_providers(jar.read(name)))
@@ -225,9 +332,7 @@ def verify(source_root: Path, output: Path) -> dict:
                     if jetty:
                         jetty_references[binary_name] = jetty
             if module == "hadoop-client-runtime":
-                for coordinate, version in DEPENDENCY_VERSIONS.items():
-                    value = properties(jar.read(f"META-INF/maven/{coordinate}/pom.properties"))
-                    require(value.get("version") == version, f"incorrect patched library: {coordinate}")
+                validate_retained_dependency_metadata(jar)
                 for package in ("core/json", "databind/cfg"):
                     name = f"org/apache/hadoop/shaded/com/fasterxml/jackson/{package}/PackageVersion.class"
                     require(b"2.21.7" in jar.read(name), f"incorrect actual Jackson implementation: {name}")
@@ -237,7 +342,7 @@ def verify(source_root: Path, output: Path) -> dict:
                     f"upstream license/notice missing: {module}")
         artifacts.append({"upstream": f"org.apache.hadoop:{module}:{UPSTREAM_VERSION}",
                           "coordinate": f"org.apache.hadoop:{module}:{VARIANT_VERSION}",
-                          "file": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+                          "file": path.name, "sha256": artifact_hash})
     require(set(REQUIRED_CLASSES) <= classes, "required local filesystem/MapReduce API classes missing")
     require("org/apache/hadoop/yarn/client/util/YarnClientUtils" in yarn_references.get("org/apache/hadoop/mapred/Master", []),
             "Master's actual required utility reference changed; review upstream behavior")
@@ -255,6 +360,7 @@ def verify(source_root: Path, output: Path) -> dict:
         "excluded_artifacts": [f"{group}:{artifact}" for group, artifact in EXCLUDED_ARTIFACTS],
         "profile_selection_note": "WebSocket transport is an upstream compile dependency, not optional=true. Omitting that complete artifact is a D2C local capability choice; no upstream Java class or JAR metadata is edited.",
         "sources": sources, "patched_recipe_sha256": recipes, "artifacts": artifacts,
+        "artifact_identity": identities,
         "tools": {"maven": maven_version, "maven-shade-plugin": "3.6.1", "maven-dependency-plugin": "3.8.1",
                   "maven_version_report_sha256": hashlib.sha256(version_report).hexdigest()},
         "verified_dependency_versions": DEPENDENCY_VERSIONS, "resolved_graphs": graphs,

@@ -6,6 +6,7 @@ Only a directly owned local server subprocess is started and stopped.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import errno
 from datetime import datetime, timezone
 import importlib
@@ -71,6 +72,53 @@ def duckdb_probe():
         return {"query_result": value, "engine_version": version, "database": ":memory:"}
     finally:
         connection.close()
+
+
+def fixed_libpq(version):
+    major = version // 10_000
+    return (major == 17 and version >= 170010) or (major == 18 and version >= 180004)
+
+
+def native_psycopg_probe():
+    psycopg = importlib.import_module("psycopg")
+    require(psycopg.pq.__impl__ == "c", "the locally compiled psycopg C implementation is required")
+    try:
+        metadata.version("psycopg-binary")
+    except metadata.PackageNotFoundError:
+        pass
+    else:
+        raise ProbeError("the binary wheel distribution must not be installed")
+    version = psycopg.pq.version()
+    require(fixed_libpq(version), "libpq is below a supported fixed branch floor (17.10 or 18.4)")
+    mapped = {name: set() for name in ("libpq", "libssl", "libcrypto")}
+    for line in Path("/proc/self/maps").read_text().splitlines():
+        fields = line.split(maxsplit=5)
+        if len(fields) != 6 or not fields[5].startswith("/"):
+            continue
+        path = Path(fields[5])
+        if any(path.name.startswith(name) for name in mapped):
+            require(not any(part.endswith(".libs") for part in path.parts), "vendored native library mappings are forbidden")
+            require(path.is_relative_to(Path("/usr/lib")) or path.is_relative_to(Path("/lib")),
+                    "libpq and SSL must be mapped from system library directories")
+        for name in mapped:
+            if path.name.startswith(name + ".so"):
+                mapped[name].add(str(path))
+    require(all(mapped.values()) and len(mapped["libpq"]) == 1, "actual system libpq/libssl/libcrypto mappings are required")
+    # dlsym through the actual libpq handle searches its dependency graph. This
+    # exercises libpq's SSL dependency rather than relying on Python ssl alone.
+    library = ctypes.CDLL(next(iter(mapped["libpq"])))
+    library.PQlibVersion.restype = ctypes.c_int
+    require(library.PQlibVersion() == version, "psycopg and the mapped system libpq disagree")
+    library.TLS_client_method.restype = ctypes.c_void_p
+    require(bool(library.TLS_client_method()), "libpq's TLS dependency could not be exercised")
+    library.OpenSSL_version.argtypes = [ctypes.c_int]
+    library.OpenSSL_version.restype = ctypes.c_char_p
+    openssl = library.OpenSSL_version(0).decode("ascii")
+    require(openssl.startswith("OpenSSL "), "libpq's OpenSSL dependency version is unavailable")
+    return {"implementation": "c", "libpq_version": version,
+            "system_library_mappings": {name: sorted(paths) for name, paths in mapped.items()},
+            "libpq_dependency_openssl_version": openssl, "libpq_dependency_tls_method": True,
+            "binary_wheel_distribution_absent": True}
 
 
 def worker_probe():
@@ -149,10 +197,9 @@ def server_probe(command, endpoints, deadline, environment=None):
 
 
 def api_probe(deadline):
-    versions = import_versions({"psycopg": "psycopg", "psycopg-binary": "psycopg_binary",
+    versions = import_versions({"psycopg": "psycopg", "psycopg-c": "psycopg_c",
                                 "Flask": "flask", "gunicorn": "gunicorn", "kafka-python": "kafka"})
-    psycopg = importlib.import_module("psycopg")
-    require(psycopg.pq.__impl__ == "binary" and psycopg.pq.version() > 0, "the native psycopg binary/libpq implementation is required")
+    native = native_psycopg_probe()
     os.environ.update({"D2C_ENV": "production", "TRUSTED_HOSTS": "localhost,127.0.0.1"})
     application = importlib.import_module("app")
     importlib.import_module("outbox_publisher")
@@ -166,8 +213,51 @@ def api_probe(deadline):
                    "--graceful-timeout", "3", "--access-logfile", "/dev/null", "--error-logfile", "/dev/null", "app:app"]
         server = server_probe(command, {f"http://127.0.0.1:{port}/healthz": lambda payload: payload == {"status": "ok"}},
                               deadline, environment=os.environ.copy())
-    return {"imports": versions, "native_psycopg": {"implementation": psycopg.pq.__impl__, "libpq_version": psycopg.pq.version()},
+    return {"imports": versions, "native_psycopg": native,
             "flask_test_client_healthz": True, "normal_gunicorn": server}
+
+
+def database_probe(configuration, deadline):
+    require(set(configuration) == {"host", "port", "dbname", "user", "password"}, "unexpected database fixture configuration")
+    require(configuration["host"] == "database" and configuration["port"] == 5432
+            and configuration["dbname"] == "d2c_probe" and configuration["user"] == "d2c_probe"
+            and isinstance(configuration["password"], str) and 20 <= len(configuration["password"]) <= 256,
+            "only the dedicated temporary database fixture is supported")
+    versions = import_versions({"psycopg": "psycopg", "psycopg-c": "psycopg_c"})
+    native = native_psycopg_probe()
+    psycopg = importlib.import_module("psycopg")
+    json_types = importlib.import_module("psycopg.types.json")
+    connection = None
+    try:
+        while connection is None:
+            require(deadline - time.monotonic() > 5, "database fixture readiness deadline exceeded")
+            try:
+                connection = psycopg.connect(**configuration, connect_timeout=2, sslmode="disable",
+                                             options="-c statement_timeout=10000 -c lock_timeout=2000")
+            except psycopg.OperationalError as error:
+                if getattr(error, "sqlstate", None) or any(text in str(error).lower() for text in ("permission denied", "operation not permitted")):
+                    raise ProbeError("database connection was rejected; no retry") from None
+                time.sleep(0.2)
+        server_version = connection.info.server_version
+        require(server_version == 160014, "the fixture must be the caller-selected PostgreSQL 16.14 image")
+        text = "검증-π-事务"
+        document = {"message": "재현-λ", "value": 7}
+        with connection.cursor() as cursor:
+            cursor.execute("CREATE TABLE d2c_driver_probe (id INTEGER PRIMARY KEY, message TEXT NOT NULL, document JSONB NOT NULL)")
+            connection.commit()
+            cursor.execute("INSERT INTO d2c_driver_probe VALUES (%s, %s, %s)", (1, text, json_types.Jsonb(document)))
+            connection.commit()
+            cursor.execute("INSERT INTO d2c_driver_probe VALUES (%s, %s, %s)", (2, "rollback", json_types.Jsonb({"rollback": True})))
+            connection.rollback()
+            cursor.execute("SELECT id, message, document FROM d2c_driver_probe ORDER BY id")
+            rows = cursor.fetchall()
+            require(rows == [(1, text, document)], "parameterized Unicode/JSONB commit or rollback roundtrip differs")
+        return {"imports": versions, "native_psycopg": native, "database_roundtrip": {
+            "server_version_num": server_version, "committed_rows": 1, "rolled_back_rows": 0,
+            "unicode_jsonb_roundtrip": True, "parameterized_statements": True, "fixture_sslmode": "disable"}}
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 def catalog_probe(deadline):
@@ -185,8 +275,9 @@ def catalog_probe(deadline):
     return {"imports": versions, "native_duckdb": duckdb_probe(), "validated_catalog_product_ids": ids, "normal_catalog_server": server}
 
 
-def run(role, timeout_seconds=45):
-    require(role in ROLES and 10 <= timeout_seconds <= 90, "role or probe timeout is invalid")
+def run(role, timeout_seconds=45, database_configuration=None):
+    require(role in ROLES and 10 <= timeout_seconds <= 120, "role or probe timeout is invalid")
+    require(database_configuration is None or role == "api", "only API may run the database fixture proof")
     started = time.monotonic()
     deadline = started + timeout_seconds
     def expired(_signal, _frame):
@@ -195,15 +286,20 @@ def run(role, timeout_seconds=45):
     signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
     try:
         identity = runtime_identity(role)
-        checks = worker_probe() if role == "worker" else api_probe(deadline) if role == "api" else catalog_probe(deadline)
+        checks = (database_probe(database_configuration, deadline) if database_configuration is not None else
+                  worker_probe() if role == "worker" else api_probe(deadline) if role == "api" else catalog_probe(deadline))
         require(time.monotonic() <= deadline, "in-container runtime probe deadline exceeded")
-        return {"schema_version": 1, "status": "PASS", **identity, "checks": checks,
+        proof = {"schema_version": 1, "status": "PASS", **identity, "checks": checks,
                 "elapsed_seconds": round(time.monotonic() - started, 3),
                 "limits": {
                     "worker": "Worker imports, native DuckDB in-memory SQL and deterministic contract only; no Kafka broker/processor loop, PostgreSQL, persistent sink or end-to-end event delivery was tested",
                     "api": "API native psycopg/libpq/imports and Flask/Gunicorn loopback health startup only; no PostgreSQL connection/transaction, outbox delivery or Kafka broker was tested",
                     "catalog": "Catalog native DuckDB/imports, repository validation and loopback server endpoints only; no Kafka broker/worker loop, PostgreSQL, lakehouse pipeline or remote service was tested",
                 }[role]}
+        proof["mode"] = "database" if database_configuration is not None else "startup"
+        if database_configuration is not None:
+            proof["limits"] = "Temporary PostgreSQL driver commit/rollback and Unicode/JSONB roundtrip only; no API transaction/outbox, Kafka delivery, persistent database, server TLS handshake or deployment was tested"
+        return proof
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
@@ -213,9 +309,15 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("role", choices=ROLES)
     parser.add_argument("--timeout-seconds", type=int, default=45)
+    parser.add_argument("--database-stdin", action="store_true", help="API only: receive temporary fixture credentials via stdin; never logged")
     args = parser.parse_args(argv)
     try:
-        proof = run(args.role, args.timeout_seconds)
+        configuration = None
+        if args.database_stdin:
+            raw = sys.stdin.read(16_385)
+            require(len(raw) <= 16_384, "database fixture configuration is oversized")
+            configuration = json.loads(raw)
+        proof = run(args.role, args.timeout_seconds, configuration) if configuration is not None else run(args.role, args.timeout_seconds)
     except Exception as error:
         # Report fixed probe assertions or an exception type, never arbitrary
         # application/DB/child logs which might contain configuration secrets.

@@ -176,14 +176,13 @@ docker compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh \
 ### Spark + Iceberg analytics boundary
 
 `lakehouse` profile은 외부 AWS catalog나 object storage를 만들지 않는 로컬 검증용입니다.
-Spark 4.1.3(Scala 2.13)와 Iceberg 1.12.0의 보안 재빌드 runtime을 이미지 build 시 고정해 실행 중 Maven
+Spark 4.2.1(Scala 2.13)와 Iceberg 1.12.0의 보안 재빌드 runtime을 이미지 build 시 고정해 실행 중 Maven
 다운로드에 의존하지 않습니다. Hadoop/Parquet/Iceberg의 공식 조립 절차에 Jackson 2.21.7과
 JLine 3.30.15를 적용하며, 원본 소스 해시·클래스·라이선스와 실제 패치된 구현을 확인합니다.
 개발 헤더·컴파일러는 최종 runtime에서 제외하고 JVM/Python/JNI runtime 라이브러리는 유지합니다.
-기본 Spark 이미지의 Temurin 21.0.11은 10월 PSU가 공개된 glibc용 SAP SapMachine 21.0.13으로
-교체합니다. 아키텍처별 공급자 SHA-256을 확인하고, 기존 JVM을 제거하여 한 개의 Java 21
-runtime과 해당 공급자 메타데이터를 유지합니다. JVM 공급자 변경은 두 플랫폼의 회귀시험으로
-검증하며, 컨테이너 스캔이 tarball JDK의 모든 CVE를 탐지한다고 가정하지 않습니다.
+고정된 공식 Spark 이미지의 Temurin 21.0.13과 공급자 메타데이터를 유지합니다.
+JVM/Python/JNI 호환성은 두 플랫폼의 실제 최종 이미지로 검증하며, 컨테이너 스캔만으로
+JDK의 모든 CVE가 탐지된다고 가정하지 않습니다.
 approval fact는 `days(occurred_at)`으로 partition하고, 계약
 위반 원문은 Kafka `topic/partition/offset`을 key로 quarantine합니다.
 
@@ -389,7 +388,14 @@ HIGH/CRITICAL 결과·gate 결과·SPDX·실제 이미지 ID·Trivy/DB 시점을
 Python 이미지는 공개 Wolfi 패키지의 Python **3.12.16-r3**와 별도 build stage의 가상 환경을
 사용합니다. Python 3.12 계열과 수정 버전 하한을 유지하며 같은 계열의 보안 revision은
 공식 APK 저장소에서 받습니다. 실제 설치 버전은 이미지별 SBOM에 기록합니다.
-APK 데이터베이스와 Python 패키지 metadata를 그대로 보존합니다. Lakehouse는
+APK 데이터베이스와 Python 패키지 metadata를 그대로 보존합니다.
+API의 Psycopg는 requirements에 고정한 동일 버전의 C 구현을 소스에서 빌드하여 시스템
+`libpq-18>=18.4`에 연결합니다. 컴파일러·개발 헤더는 build stage에만 설치합니다.
+최종 이미지에서 실제 libpq·SSL 라이브러리 경로와 버전을 확인하고, 양쪽 아키텍처에서
+새 임시 PostgreSQL 16.14 fixture로 parameterized Unicode/JSONB·commit/rollback을 시험합니다.
+fixture는 전용 네트워크와 제한된 tmpfs만 사용합니다. 이 시험은 운영 DB·outbox·실제 TLS
+handshake를 검증하지 않으며, 검증 성공 여부는 해당 CI 실행의 증거로 판단해야 합니다.
+Lakehouse는
 고정된 Spark **4.2.1** 배포와 Temurin **21.0.13**을 사용하며, 같은 Spark source의 원래 core
 shade 조립을 Jetty **12.1.14**로 재빌드합니다. Iceberg **1.12.0**의 공식 Spark 4.2 source module과
 Parquet **1.17.0/1.17.1** 조립에는 Jackson **2.21.7**을 적용합니다.

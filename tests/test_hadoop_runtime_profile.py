@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
+import io
 from pathlib import Path
 import struct
 import sys
 import unittest
+import warnings
+from zipfile import ZipFile
 
 
 HELPERS = Path(__file__).parents[1] / "container-build" / "lakehouse" / "hadoop"
@@ -210,6 +214,120 @@ class HadoopProfileArtifactValidatorTest(unittest.TestCase):
     def test_dependency_version_requires_exact_metadata_value(self) -> None:
         self.assertEqual(verification.properties(b"# release\nversion=2.21.7\n")["version"], "2.21.7")
         self.assertNotEqual(verification.properties(b"version=2.21.7\n")["version"], "2.21")
+
+
+class HadoopAssemblyIdentityTest(unittest.TestCase):
+    """Descriptor/identity fixtures only; they are not executable Hadoop JARs."""
+
+    def retained_metadata(self):
+        return {f"META-INF/maven/{coordinate}/pom.properties":
+                f"groupId={coordinate.split('/')[0]}\nartifactId={coordinate.split('/')[1]}\nversion={version}\n".encode()
+                for coordinate, version in profile.DEPENDENCY_VERSIONS.items()}
+
+    def archive(self, entries):
+        stream = io.BytesIO()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            with ZipFile(stream, "w") as archive:
+                for name, content in entries:
+                    archive.writestr(name, content)
+        return stream.getvalue()
+
+    def identity_fixture(self, module="hadoop-client-runtime", extra=()):
+        original = (HELPERS / "fixtures/hadoop-client-runtime-3.5.0.upstream.pom.xml").read_bytes() \
+            if module == "hadoop-client-runtime" else source_fixture(module).encode()
+        generated = recipe.patch_source(original.decode(), module).encode()
+        installed = f"""<project xmlns="http://maven.apache.org/POM/4.0.0">
+          <modelVersion>4.0.0</modelVersion><groupId>org.apache.hadoop</groupId>
+          <artifactId>{module}</artifactId><version>{profile.VARIANT_VERSION}</version>
+        </project>""".encode()
+        data = self.archive([*self.retained_metadata().items(), *extra])
+        digest = hashlib.sha256(data).hexdigest()
+        return data, {"original_pom": original, "exported_source_pom": generated,
+            "installed_pom": installed, "generated_dependency_reduced_pom": installed,
+            "resolved_graph": graph_fixture(module),
+            "artifact_sha256": digest, "built_artifact_sha256": digest}
+
+    def test_expected_runtime_descriptor_absence_has_a_pinned_source_and_independent_identity(self) -> None:
+        data, arguments = self.identity_fixture()
+        with ZipFile(io.BytesIO(data)) as archive:
+            identity = verification.validate_artifact_identity("hadoop-client-runtime", archive, **arguments)
+            metadata = verification.validate_retained_dependency_metadata(archive)
+        contract = identity["project_descriptor_contract"]["unchanged_upstream_filter"]
+        self.assertEqual(contract["upstream_pom_sha256"], profile.SOURCE_INPUTS[
+            "hadoop-client-modules/hadoop-client-runtime/pom.xml"])
+        self.assertEqual(contract["filter"], {"artifact": "org.apache.hadoop:*", "excludes": ["**/*", "*"]})
+        self.assertEqual(identity["resolved_root_gav"], "org.apache.hadoop:hadoop-client-runtime:3.5.0-d2c-local1")
+        self.assertEqual(set(metadata), set(profile.DEPENDENCY_VERSIONS))
+
+    def test_wrong_resolved_group_or_version_is_not_an_identity(self) -> None:
+        for key, changed in (("groupId", "wrong.group"), ("version", "3.5.0")):
+            data, arguments = self.identity_fixture()
+            arguments["resolved_graph"][key] = changed
+            with self.subTest(key=key), ZipFile(io.BytesIO(data)) as archive:
+                with self.assertRaisesRegex(ValueError, "incorrect graph root"):
+                    verification.validate_artifact_identity("hadoop-client-runtime", archive, **arguments)
+
+    def test_wrong_maven_target_hash_or_generated_pom_is_rejected(self) -> None:
+        for changed in ("jar-hash", "source-pom", "installed-pom", "both-installed-poms-wrong-gav"):
+            data, arguments = self.identity_fixture()
+            if changed == "jar-hash":
+                arguments["built_artifact_sha256"] = "0" * 64
+            elif changed == "source-pom":
+                arguments["exported_source_pom"] += b"\n"
+            elif changed == "installed-pom":
+                arguments["installed_pom"] = arguments["installed_pom"].replace(b"3.5.0-d2c-local1", b"3.5.0-wrong")
+            else:
+                wrong = arguments["installed_pom"].replace(b"3.5.0-d2c-local1", b"3.5.0-wrong")
+                arguments["installed_pom"] = wrong
+                arguments["generated_dependency_reduced_pom"] = wrong
+            with self.subTest(changed=changed), ZipFile(io.BytesIO(data)) as archive:
+                with self.assertRaises(ValueError):
+                    verification.validate_artifact_identity("hadoop-client-runtime", archive, **arguments)
+
+    def test_runtime_absence_contract_does_not_accept_an_edited_upstream_filter(self) -> None:
+        data, arguments = self.identity_fixture()
+        changed = arguments["original_pom"].replace(b"<exclude>**/*</exclude>", b"<exclude>**/*.class</exclude>", 1)
+        with self.assertRaisesRegex(ValueError, "exact pinned upstream POM hash"):
+            verification.runtime_descriptor_filter_contract(changed)
+
+    def test_runtime_does_not_silently_ignore_an_unexpected_project_descriptor(self) -> None:
+        own = "META-INF/maven/org.apache.hadoop/hadoop-client-runtime/pom.properties"
+        data, arguments = self.identity_fixture(extra=[(own, b"version=3.5.0-d2c-local1\n")])
+        with ZipFile(io.BytesIO(data)) as archive:
+            with self.assertRaisesRegex(ValueError, "own descriptor unexpectedly present"):
+                verification.validate_artifact_identity("hadoop-client-runtime", archive, **arguments)
+
+    def test_api_project_metadata_remains_mandatory(self) -> None:
+        data, arguments = self.identity_fixture("hadoop-client-api")
+        with ZipFile(io.BytesIO(data)) as archive:
+            with self.assertRaisesRegex(ValueError, "required unique JAR metadata"):
+                verification.validate_artifact_identity("hadoop-client-api", archive, **arguments)
+
+    def test_multiple_missing_retained_descriptors_are_all_reported(self) -> None:
+        entries = self.retained_metadata()
+        removed = ("META-INF/maven/com.fasterxml.jackson.core/jackson-core/pom.properties",
+                   "META-INF/maven/org.jline/jline-remote-telnet/pom.properties")
+        data = self.archive([(name, content) for name, content in entries.items() if name not in removed])
+        with ZipFile(io.BytesIO(data)) as archive:
+            with self.assertRaisesRegex(ValueError, "retained dependency Maven metadata missing") as failure:
+                verification.validate_retained_dependency_metadata(archive)
+        for name in removed:
+            self.assertIn(name, str(failure.exception))
+
+    def test_duplicate_or_wrong_retained_dependency_metadata_is_rejected(self) -> None:
+        entries = self.retained_metadata()
+        name = "META-INF/maven/org.jline/jline/pom.properties"
+        for changed in ("duplicate", "wrong-version"):
+            modified = list(entries.items())
+            if changed == "duplicate":
+                modified.append((name, entries[name]))
+            else:
+                modified = [(key, value.replace(b"version=3.30.15", b"version=3.9.0") if key == name else value)
+                            for key, value in modified]
+            with self.subTest(changed=changed), ZipFile(io.BytesIO(self.archive(modified))) as archive:
+                with self.assertRaises(ValueError):
+                    verification.validate_retained_dependency_metadata(archive)
 
 
 if __name__ == "__main__":

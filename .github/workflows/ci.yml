@@ -157,8 +157,14 @@ jobs:
 
       - name: Install dependencies
         run: |
+          # This prepares the disposable runner's C-extension build only;
+          # final API libpq/OpenSSL identity is checked in its built image.
+          python3 -c 'import os; from scripts.prepare_ci_storage import validate_host; validate_host(dict(os.environ))'
+          sudo -n apt-get update
+          sudo -n apt-get install --yes --no-install-recommends build-essential libpq-dev
           python -m pip install --requirement requirements-dev.txt
-          python -m pip install --requirement app/requirements.txt
+          python -m pip install --no-binary=psycopg-c --requirement app/requirements.txt
+          python -c 'from psycopg import pq; assert pq.__impl__ == "c"; print("host_test_libpq_version=" + str(pq.version()))'
 
       - name: Compile Python modules
         run: python -m compileall -q app services scripts lakehouse d2c_contract.py log_gen.py
