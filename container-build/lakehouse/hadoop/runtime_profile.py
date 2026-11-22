@@ -28,6 +28,34 @@ CURATOR_REVIEWED_METADATA = {
     **{f"META-INF/maven/org.apache.curator/{module}/pom.xml": CURATOR_SOURCE_INPUTS[f"{module}/pom.xml"]
        for module in CURATOR_MODULES},
 }
+OUTER_CURATOR_VERSION = "5.9.0"
+OUTER_CURATOR_VARIANT_VERSION = "5.9.0-d2c-guava33.7.2-jre"
+OUTER_CURATOR_SOURCE_INPUTS = {
+    "pom.xml": "1d14be790cee05ea675a9405fd7d95913044b92810cdc87b7ccc726f5039f10d",
+    "curator-client/pom.xml": "33bfe4484b7065181aa267b8e2994d923d9743117b3abe1ecb0b2ae5eb962f1d",
+    "curator-framework/pom.xml": "355279afd470c9a151c08deb6428fdc9dc29c45b5dc0beb0bcc4a1c5b753e42d",
+    "curator-recipes/pom.xml": "d543a992c9c5d6af0a9b69b0125fa7b7f9d7d28cd61d66a462f3b5493cb4f404",
+}
+OUTER_CURATOR_REVIEWED_METADATA = {
+    "META-INF/maven/org.apache.curator/apache-curator/pom.xml": OUTER_CURATOR_SOURCE_INPUTS["pom.xml"],
+    **{f"META-INF/maven/org.apache.curator/{module}/pom.xml": OUTER_CURATOR_SOURCE_INPUTS[f"{module}/pom.xml"]
+       for module in CURATOR_MODULES},
+}
+
+
+def curator_assembly_profile(version):
+    """Two reviewed full-module assemblies; arbitrary upstream versions fail closed."""
+    if version == CURATOR_VERSION:
+        return {"version": version, "variant": CURATOR_VARIANT_VERSION,
+                "reviewed_metadata": CURATOR_REVIEWED_METADATA,
+                "zookeeper": "3.8.6", "receipt_prefix": "curator"}
+    if version == OUTER_CURATOR_VERSION:
+        return {"version": version, "variant": OUTER_CURATOR_VARIANT_VERSION,
+                "reviewed_metadata": OUTER_CURATOR_REVIEWED_METADATA,
+                "zookeeper": "3.9.3", "receipt_prefix": "outer-curator"}
+    raise ValueError("unreviewed Curator assembly version")
+
+
 THIRDPARTY_SOURCE_ROOT_URL = "https://raw.githubusercontent.com/apache/hadoop-thirdparty/rel/release-1.6.0/"
 THIRDPARTY_SOURCE_INPUTS = {
     "pom.xml": "bd32fedb74f7bed84b210f280e70205be54ab17bc4a964aa89e28770d6cb8ab1",

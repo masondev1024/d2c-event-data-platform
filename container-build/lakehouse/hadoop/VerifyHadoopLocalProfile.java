@@ -6,8 +6,10 @@ import java.io.ByteArrayOutputStream;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.lang.reflect.Method;
+import java.security.MessageDigest;
 import java.util.Collection;
 import java.util.HashSet;
+import java.util.HexFormat;
 import java.util.Map;
 import java.util.ServiceLoader;
 import java.util.Set;
@@ -120,10 +122,13 @@ public class VerifyHadoopLocalProfile {
     String runtime = "hadoop-client-runtime-3.5.0-d2c-local1.jar";
     for (String prefix : new String[] {"org.apache.hadoop.shaded.com.google.common.",
                                       "org.apache.hadoop.thirdparty.com.google.common.",
-                                      "org.apache.hadoop.shaded.org.apache.curator.shaded.com.google.common."}) {
+                                      "org.apache.hadoop.shaded.org.apache.curator.shaded.com.google.common.",
+                                      "org.apache.curator.shaded.com.google.common."}) {
+      String guavaJar = prefix.startsWith("org.apache.curator.")
+          ? "curator-client-5.9.0-d2c-guava33.7.2-jre.jar" : runtime;
       for (String collection : new String[] {"CompactHashMap", "CompactHashSet"}) {
         Class<?> type = Class.forName(prefix + "collect." + collection);
-        requireOrigin(type, runtime);
+        requireOrigin(type, guavaJar);
         Method create = type.getDeclaredMethod("create");
         create.setAccessible(true); // Guava's own compact implementations are package private.
         Object value = create.invoke(null);
@@ -138,19 +143,19 @@ public class VerifyHadoopLocalProfile {
         }
       }
       Class<?> maker = Class.forName(prefix + "collect.MapMaker");
-      requireOrigin(maker, runtime);
+      requireOrigin(maker, guavaJar);
       Object builder = maker.getConstructor().newInstance();
       // Force the custom implementation with strong keys/values: a weak-key
       // deserialization assertion would legitimately race garbage collection.
       Class<?> equivalence = Class.forName(prefix + "base.Equivalence");
-      requireOrigin(equivalence, runtime);
+      requireOrigin(equivalence, guavaJar);
       Method keyEquivalence = maker.getDeclaredMethod("keyEquivalence", equivalence);
       keyEquivalence.setAccessible(true);
       keyEquivalence.invoke(builder, equivalence.getMethod("equals").invoke(null));
       Map<Object, Object> map = (Map<Object, Object>) maker.getMethod("makeMap").invoke(builder);
       require(map.getClass().getName().startsWith(prefix + "collect.MapMakerInternalMap"),
               "Actual MapMakerInternalMap not selected");
-      requireOrigin(map.getClass(), runtime);
+      requireOrigin(map.getClass(), guavaJar);
       map.put("d2c", "fixed-guava");
       Map<?, ?> copy = (Map<?, ?>) roundTrip(map);
       require(copy.size() == 1 && copy.containsValue("fixed-guava"), "MapMaker serialization failed");
@@ -187,7 +192,63 @@ public class VerifyHadoopLocalProfile {
     Object filter = ofTypeAndPath.invoke(null, create, "/d2c-offline-probe");
     require(Boolean.TRUE.equals(predicate.getMethod("apply", Object.class).invoke(filter, result)),
             "Public Curator Predicate linkage/behavior failed");
-    System.out.println("guava_three_namespaces_small_serialization=PASS;curator_client_framework_recipes_init=PASS;curator_public_predicate_abi=PASS;zookeeper_network_calls=NONE");
+    System.out.println("guava_four_namespaces_small_serialization=PASS;hadoop_curator_client_framework_recipes_init=PASS;hadoop_curator_public_predicate_abi=PASS;zookeeper_network_calls=NONE");
+  }
+
+  private static void verifyOuterCurator() throws Exception {
+    // Bind actual loaded whole JARs to the sealed source payload, rather than
+    // accepting a file name, public version string or scan package record.
+    Class<?> mapperType = Class.forName("org.apache.hadoop.shaded.com.fasterxml.jackson.databind.ObjectMapper");
+    Object mapper = mapperType.getConstructor().newInstance();
+    Map<?, ?> manifest = (Map<?, ?>) mapperType.getMethod("readValue", String.class, Class.class)
+        .invoke(mapper, Files.readString(java.nio.file.Path.of(
+            "/usr/share/d2c-security/artifacts/manifest.json")), Map.class);
+    require("d2c-lakehouse-source-artifacts".equals(manifest.get("kind")), "Unexpected source manifest kind");
+    Map<?, ?> payload = (Map<?, ?>) manifest.get("payload_sha256");
+    String curator = "org.apache.curator.";
+    Class<?> policy = Class.forName(curator + "RetryPolicy");
+    Class<?> retry = Class.forName(curator + "retry.ExponentialBackoffRetry");
+    Class<?> factory = Class.forName(curator + "framework.CuratorFrameworkFactory");
+    Class<?> framework = Class.forName(curator + "framework.CuratorFramework");
+    Class<?> mutex = Class.forName(curator + "framework.recipes.locks.InterProcessMutex");
+    Class<?> predicate = Class.forName(curator + "shaded.com.google.common.base.Predicate");
+    Class<?>[][] modules = {{policy, retry, predicate}, {factory, framework}, {mutex}};
+    String[] names = {"curator-client", "curator-framework", "curator-recipes"};
+    for (int index = 0; index < names.length; index++) {
+      String filename = names[index] + "-5.9.0-d2c-guava33.7.2-jre.jar";
+      for (Class<?> type : modules[index]) requireOrigin(type, filename);
+      java.nio.file.Path loaded = java.nio.file.Path.of(
+          modules[index][0].getProtectionDomain().getCodeSource().getLocation().toURI());
+      require(Files.isRegularFile(loaded) && !Files.isSymbolicLink(loaded), "Outer Curator origin is not a regular JAR");
+      String expected = (String) payload.get("hadoop/" + filename);
+      String actual = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(loaded)));
+      require(expected != null && expected.matches("[0-9a-f]{64}") && expected.equals(actual),
+              "Actual outer Curator JAR differs from sealed source payload: " + filename);
+      System.out.println("outer_curator_jar=" + filename + ";sha256=" + actual + ";sealed_payload=PASS");
+    }
+    Object client = factory.getMethod("newClient", String.class, policy)
+        .invoke(null, "127.0.0.1:1", retry.getConstructor(int.class, int.class).newInstance(10, 1));
+    try {
+      require(framework.getMethod("getState").invoke(client).toString().equals("LATENT"),
+              "Outer Curator client must remain unstarted");
+      mutex.getConstructor(framework, String.class).newInstance(client, "/d2c-offline-probe");
+    } finally {
+      framework.getMethod("close").invoke(client);
+    }
+    Class<?> transaction = Class.forName(curator + "framework.api.transaction.CuratorTransactionResult");
+    Class<?> operation = Class.forName(curator + "framework.api.transaction.OperationType");
+    Class<?> stat = Class.forName("org.apache.zookeeper.data.Stat");
+    requireOrigin(transaction, "curator-framework-5.9.0-d2c-guava33.7.2-jre.jar");
+    requireOrigin(operation, "curator-framework-5.9.0-d2c-guava33.7.2-jre.jar");
+    Method ofTypeAndPath = transaction.getMethod("ofTypeAndPath", operation, String.class);
+    require(ofTypeAndPath.getReturnType().equals(predicate), "Outer Curator public Predicate descriptor changed");
+    Object create = Enum.valueOf((Class) operation, "CREATE");
+    Object result = transaction.getConstructor(operation, String.class, String.class, stat)
+        .newInstance(create, "/d2c-offline-probe", "/d2c-offline-probe", null);
+    Object filter = ofTypeAndPath.invoke(null, create, "/d2c-offline-probe");
+    require(Boolean.TRUE.equals(predicate.getMethod("apply", Object.class).invoke(filter, result)),
+            "Outer Curator public Predicate linkage/behavior failed");
+    System.out.println("outer_curator_5_9_whole_jar_payload=PASS;outer_curator_client_framework_recipes_init=PASS;outer_curator_public_predicate_abi=PASS;zookeeper_network_calls=NONE");
   }
 
   public static void main(String[] args) throws Exception {
@@ -219,6 +280,7 @@ public class VerifyHadoopLocalProfile {
     instantiateServices(TokenRenewer.class);
     verifyLocalMaster();
     verifyShadedJlineDumbProvider();
+    verifyOuterCurator();
     verifyFixedGuavaAndCurator();
 
     Configuration conf = new Configuration();

@@ -30,6 +30,7 @@ DIGEST = re.compile(r"sha256:[0-9a-f]{64}$")
 ROLES = ("worker", "api", "catalog", "lakehouse")
 IDENTITY_KEYS = ("root_digest", "runtime_leaf_digest", "config_digest", "metadata_sha256", "platform")
 MAX_METADATA_BYTES = 64 * 1024 * 1024
+MAX_SUBJECT_DIAGNOSTICS = 8
 LOCAL_COPY_TIMEOUT_SECONDS = 600
 REGISTRY_COPY_TIMEOUT_SECONDS = 1200
 
@@ -64,6 +65,34 @@ def _sha(data: bytes) -> str:
 def _regular(path: Path) -> None:
     if path.is_symlink() or not path.is_file():
         raise OCIError("OCI metadata/blob is missing or is a symlink: " + path.name)
+
+
+def _subject_mismatch_error(statement: dict, descriptor: dict, expected_leaf: str) -> OCIError:
+    """Report bounded identity facts, never arbitrary subject names or payloads."""
+    subjects = statement.get("subject")
+    observed = []
+    for subject in subjects[:MAX_SUBJECT_DIAGNOSTICS] if isinstance(subjects, list) else []:
+        values = subject.get("digest") if isinstance(subject, dict) else None
+        if not isinstance(values, dict):
+            observed.append(None)
+            continue
+        sha256 = values.get("sha256")
+        observed.append({
+            "sha256": sha256 if isinstance(sha256, str) and re.fullmatch(r"[0-9a-f]{64}", sha256) else None,
+            "extra_digest_fields": len(values) > (1 if "sha256" in values else 0),
+        })
+    predicate = statement.get("predicateType")
+    predicate_label = {SPDX: "SPDX", "https://slsa.dev/provenance/v0.2": "SLSA_PROVENANCE_V0_2",
+                       "https://slsa.dev/provenance/v1": "SLSA_PROVENANCE_V1"}
+    diagnostic = {
+        "predicate_type": predicate_label.get(predicate, "unsupported") if isinstance(predicate, str) else "unsupported",
+        "subject_count": len(subjects) if isinstance(subjects, list) else None,
+        "subject_digests": observed,
+        "subject_digests_truncated": isinstance(subjects, list) and len(subjects) > MAX_SUBJECT_DIAGNOSTICS,
+        "statement_blob_digest": descriptor["digest"],
+        "expected_runtime_leaf_digest": expected_leaf,
+    }
+    return OCIError("attestation statement subject mismatch: " + json.dumps(diagnostic, sort_keys=True))
 
 
 def validate_layout(original: Path, platform: str) -> dict[str, Any]:
@@ -221,8 +250,9 @@ def validate_layout(original: Path, platform: str) -> dict[str, Any]:
                 raise OCIError("invalid in-toto statement")
             subjects = statement.get("subject")
             if (not isinstance(subjects, list) or not subjects
-                    or any(value.get("digest") != {"sha256": leaf_digest[7:]} for value in subjects)):
-                raise OCIError("attestation statement subject mismatch")
+                    or any(not isinstance(value, dict) or value.get("digest") != {"sha256": leaf_digest[7:]}
+                           for value in subjects)):
+                raise _subject_mismatch_error(statement, statement_descriptor, leaf_digest)
             predicate_type = statement.get("predicateType")
             if predicate_type not in PROVENANCE | {SPDX} or not isinstance(statement.get("predicate"), dict) or not statement["predicate"]:
                 raise OCIError("missing or unsupported build attestation predicate")

@@ -27,6 +27,8 @@ RESOURCE_ID = re.compile(r"[0-9a-f]{64}\Z")
 OWNER_LABEL = "d2c.security.owner"
 PHASES = ("initial", "resume", "crash", "recover")
 PROOF_PREFIX = "D2C_STREAM_PROOF="
+RESOURCE_PREFIX = "D2C_STREAM_RESOURCES="
+PHASE_PIDS_LIMIT = 512
 GIB = 2**30
 BROKER_TMPFS_BYTES = {"/etc/kafka/secrets": 1_048_576, "/var/lib/kafka/data": 67_108_864,
                       "/mnt/shared/config": 4_194_304}
@@ -52,6 +54,95 @@ script.write_bytes(source)
 os.chown(script, 185, 0)
 script.chmod(0o640)
 print('D2C_STREAM_INIT=' + json.dumps({'source_sha256': payload['sha256']}))
+'''
+
+# Spark 4.2.1's block-manager ask and storage-async pools each have a
+# source-defined maximum of 100 threads, independently of local[1]/CPU quota.
+# Keep the normal Spark command and memory limit; measure its finite PID budget.
+PHASE_MONITOR_SOURCE = r'''
+import json, re, signal, subprocess, sys, time
+from pathlib import Path
+PREFIX = 'D2C_STREAM_RESOURCES='
+FILES = ('pids.current', 'pids.max', 'pids.events', 'memory.current',
+         'memory.max', 'memory.events', 'cpu.max')
+OPTIONAL = ('pids.peak', 'memory.peak')
+
+def read_metrics(root):
+    values, errors = {}, {}
+    for name in FILES + OPTIONAL:
+        try:
+            with (root / name).open('rb') as stream:
+                raw = stream.read(4097)
+            if len(raw) > 4096:
+                raise ValueError('oversized cgroup metric')
+            text = raw.decode('ascii').strip()
+            if name.endswith('.events'):
+                pairs = [line.split() for line in text.splitlines()]
+                if not pairs or any(len(pair) != 2 or not re.fullmatch('[a-z_]+', pair[0])
+                                    or not pair[1].isdigit() for pair in pairs):
+                    raise ValueError('invalid cgroup events')
+                values[name] = {key: int(value) for key, value in pairs}
+            elif name == 'cpu.max':
+                quota, period = text.split()
+                if (quota != 'max' and not quota.isdigit()) or not period.isdigit() or int(period) <= 0:
+                    raise ValueError('invalid CPU quota')
+                values[name] = {'quota': quota if quota == 'max' else int(quota), 'period': int(period)}
+            elif text == 'max' and name.endswith('.max'):
+                values[name] = text
+            elif text.isdigit():
+                values[name] = int(text)
+            else:
+                raise ValueError('invalid cgroup scalar')
+        except (OSError, ValueError, UnicodeError) as error:
+            if name in FILES:
+                errors[name] = type(error).__name__
+    return values, errors
+
+def event_deltas(first, last):
+    return {name: {key: value - first[name][key] if key in first.get(name, {}) else None
+                   for key, value in last[name].items()} if name in first and name in last else None
+            for name in ('pids.events', 'memory.events')}
+
+def monitor(command, root=Path('/sys/fs/cgroup')):
+    first, errors = read_metrics(root)
+    high_water = {}
+    samples = 0
+    def report(kind, values, child_exit=None):
+        print(PREFIX + json.dumps({'kind': kind, 'sample_count': samples,
+              'values': values, 'read_errors': errors, 'observed_high_water': high_water,
+              'events_delta': event_deltas(first, values), 'child_exit': child_exit}, sort_keys=True), flush=True)
+    def sample():
+        nonlocal samples
+        values, failures = read_metrics(root)
+        errors.update(failures)
+        samples += 1
+        for key in ('pids.current', 'memory.current', 'pids.peak', 'memory.peak'):
+            if key in values:
+                high_water[key] = max(high_water.get(key, 0), values[key])
+        return values
+    report('initial', sample())
+    child = subprocess.Popen(command)
+    def forward(number, _frame):
+        if child.poll() is None:
+            try:
+                child.send_signal(number)
+            except ProcessLookupError:
+                pass
+    for number in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(number, forward)
+    next_report = time.monotonic() + 30
+    while child.poll() is None:
+        time.sleep(0.5)
+        values = sample()
+        if time.monotonic() >= next_report:
+            report('periodic', values)
+            next_report = time.monotonic() + 30
+    result = child.wait()
+    report('final', sample(), result)
+    return result if result >= 0 else 128 - result
+
+if __name__ == '__main__':
+    raise SystemExit(monitor(sys.argv[1:]))
 '''
 
 
@@ -328,11 +419,11 @@ class StreamingTest:
             self.summary["container_create_attempts"].append(name)
         self.save()
 
-    def container_options(self, name, *, memory, cpus, network):
-        return ["docker", "run", "--rm", "--pull", "never", "--name", name,
+    def container_options(self, name, *, memory, cpus, network, phase=False):
+        return ["docker", "run", *([] if phase else ["--rm"]), "--pull", "never", "--name", name,
                 "--platform", self.options.platform, "--label", OWNER_LABEL + "=" + self.token,
                 "--memory", memory, "--memory-swap", memory, "--cpus", cpus,
-                "--pids-limit", "192", "--network", network,
+                "--pids-limit", str(PHASE_PIDS_LIMIT if phase else 192), "--network", network,
                 "--log-driver", "json-file",
                 "--log-opt", "max-size=5m", "--log-opt", "max-file=2"]
 
@@ -477,15 +568,28 @@ stat -c 'D2C_BROKER_MODE=%n:%u:%g:%a' /etc/kafka/secrets /var/lib/kafka/data /mn
         if timeout < 50:
             raise StreamingError("insufficient phase budget; no phase container dispatched")
         query_timeout = min(180, int(timeout - 40))
-        command = self.container_options(name, memory="2000m", cpus="2", network=self.names["network"])
+        command = self.container_options(name, memory="2000m", cpus="2", network=self.names["network"], phase=True)
         command += ["--user", "185:0", "--mount", f"type=volume,src={self.names['volume']},dst=/state",
                     "--env", "D2C_SECURITY_IMAGE_ID=" + image_id, "--env", "D2C_SECURITY_OWNER=" + self.token,
-                    "--entrypoint", "/opt/spark/bin/spark-submit", image_id,
+                    "--entrypoint", "python3", image_id, "-c", PHASE_MONITOR_SOURCE,
+                    "/opt/spark/bin/spark-submit",
                     "--master", "local[1]", "--driver-memory", "512m", "--conf", "spark.driver.bindAddress=0.0.0.0",
+                    "--conf", "spark.driver.extraJavaOptions=-XshowSettings:system",
                     "/state/lakehouse_kafka_roundtrip.py", "--phase", phase,
                     "--bootstrap-server", "broker:9092", "--state-dir", "/state",
                     "--query-timeout-seconds", str(query_timeout)]
-        output = self.guarded(phase, name, command, timeout=timeout)
+        primary_error = None
+        try:
+            output = self.guarded(phase, name, command, timeout=timeout)
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            try:
+                self.capture_phase_evidence(phase, image_id)
+            except Exception:
+                if primary_error is None:
+                    raise
         proofs = [json.loads(line[len(PROOF_PREFIX):]) for line in output.splitlines() if line.startswith(PROOF_PREFIX)]
         if (len(proofs) != 1 or proofs[0].get("phase") != phase or proofs[0].get("status") != "PASS"
                 or proofs[0].get("image_id") != image_id or proofs[0].get("owner") != self.token):
@@ -493,6 +597,73 @@ stat -c 'D2C_BROKER_MODE=%n:%u:%g:%a' /etc/kafka/secrets /var/lib/kafka/data /mn
         self.summary["phases"][phase] = proofs[0]
         write_json(self.output / (phase + ".json"), proofs[0])
         self.save()
+
+    def capture_phase_evidence(self, phase, image_id):
+        # Retained phase containers make kernel OOM/exit evidence available even
+        # when Spark or its sampler failed. Never serialize Env or full inspect.
+        evidence = {"image_id": image_id, "resource_samples": [], "errors": []}
+        self.summary.setdefault("phase_resources", {})[phase] = evidence
+        try:
+            data = self.owned_container(self.names[phase], cleanup=True)
+            if data is None or data.get("Image") != image_id:
+                raise StreamingError("retained phase container image identity is not confirmed")
+            evidence["container_id"] = data["Id"]
+            evidence["state"] = {key: data.get("State", {}).get(key)
+                                 for key in ("Running", "OOMKilled", "ExitCode")}
+            evidence["host_config"] = {key: data.get("HostConfig", {}).get(key)
+                                       for key in ("PidsLimit", "Memory", "MemorySwap", "NanoCpus")}
+        except Exception as error:
+            evidence["errors"].append(type(error).__name__ + ": " + str(error))
+        try:
+            log = self.output / "guard" / phase / "command.log"
+            if log.is_file():
+                # The container's sampler emits at most one record per 30s,
+                # plus initial/final; the overall deadline is at most 1200s.
+                with log.open() as stream:
+                    for line in stream:
+                        if line.startswith(RESOURCE_PREFIX):
+                            if len(line) > 16_384 or len(evidence["resource_samples"]) >= 44:
+                                raise StreamingError("phase resource telemetry exceeded its bound")
+                            evidence["resource_samples"].append(json.loads(line[len(RESOURCE_PREFIX):]))
+                        match = re.fullmatch(r"\s*Effective CPU Count:\s*(\d+)\s*", line)
+                        if match:
+                            counts = evidence.setdefault("jvm_effective_cpu_counts", [])
+                            if len(counts) >= 8:
+                                raise StreamingError("JVM CPU telemetry exceeded its bound")
+                            counts.append(int(match[1]))
+        except Exception as error:
+            evidence["errors"].append(type(error).__name__ + ": " + str(error))
+        finally:
+            write_json(self.output / (phase + "-resources.json"), evidence)
+            self.save()
+        def reject(message):
+            evidence["validation_error"] = message
+            write_json(self.output / (phase + "-resources.json"), evidence)
+            self.save()
+            raise StreamingError(message)
+        if evidence["errors"]:
+            reject(f"{phase} retained resource evidence is incomplete")
+        state, limits = evidence["state"], evidence["host_config"]
+        if (state != {"Running": False, "OOMKilled": False, "ExitCode": 0}
+                or limits != {"PidsLimit": PHASE_PIDS_LIMIT, "Memory": 2000 * 1024**2,
+                              "MemorySwap": 2000 * 1024**2, "NanoCpus": 2_000_000_000}):
+            reject(f"{phase} container exit or bounded resource profile did not pass")
+        if set(evidence.get("jvm_effective_cpu_counts", [])) != {2}:
+            reject(f"{phase} JVM did not confirm the bounded two-CPU profile")
+        final = [value for value in evidence["resource_samples"] if value.get("kind") == "final"]
+        if len(final) != 1 or final[0].get("child_exit") != 0 or final[0].get("read_errors"):
+            reject(f"{phase} final cgroup resource telemetry is missing or failed")
+        values = final[0].get("values", {})
+        cpu = values.get("cpu.max", {})
+        deltas = final[0].get("events_delta", {})
+        if (values.get("pids.max") != PHASE_PIDS_LIMIT or values.get("memory.max") != 2000 * 1024**2
+                or not isinstance(cpu.get("quota"), int) or cpu.get("quota") != 2 * cpu.get("period", 0)
+                or any(not isinstance(delta, int) or delta < 0 for group in deltas.values()
+                       for delta in (group or {"missing": None}).values())
+                or (deltas.get("pids.events") or {}).get("max") != 0
+                or any((deltas.get("memory.events") or {}).get(key) != 0 for key in ("oom", "oom_kill"))
+                or (deltas.get("memory.events") or {}).get("oom_group_kill", 0) != 0):
+            reject(f"{phase} cgroup limits or resource events did not pass")
 
     def owned_container(self, name, *, cleanup=False):
         data = self.inspect("container", name, cleanup=cleanup)

@@ -111,7 +111,10 @@ root = Path('/opt/spark/extra-jars')
 excluded = ('org.apache.hadoop_hadoop-client-api-*.jar',
             'org.apache.hadoop_hadoop-client-runtime-*.jar',
             'org.apache.spark_spark-core_*.jar',
-            'org.apache.spark_spark-network-common_*.jar')
+            'org.apache.spark_spark-network-common_*.jar',
+            'org.apache.curator_curator-client-*.jar',
+            'org.apache.curator_curator-framework-*.jar',
+            'org.apache.curator_curator-recipes-*.jar')
 for source in sorted((Path(os.environ['IVY_HOME']) / 'jars').rglob('*.jar')):
     if not any(fnmatch.fnmatch(source.name, pattern) for pattern in excluded):
         shutil.copyfile(source, root / source.name)
@@ -123,7 +126,8 @@ record = {
     'method': 'Official Spark 4.2.1 Ivy resolver and local[1] Pi completed with exit zero',
     'requested_packages': os.environ['D2C_EXTRA_PACKAGES'].split(','),
     'artifact_sha256': {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in jars},
-    'excluded_replaced_artifacts': ['hadoop-client-api', 'hadoop-client-runtime', 'spark-core_2.13', 'spark-network-common_2.13'],
+    'excluded_replaced_artifacts': ['hadoop-client-api', 'hadoop-client-runtime', 'spark-core_2.13', 'spark-network-common_2.13',
+                                    'curator-client', 'curator-framework', 'curator-recipes'],
     'limits': 'Build-stage resolution/startup only; final runtime regression and scans are separate',
 }
 (root / 'dependency-source-provenance.json').write_text(json.dumps(record, indent=2, sort_keys=True) + '\n')
@@ -179,6 +183,9 @@ RUN apt-get update \
         /opt/spark/jars/derby*.jar \
         /opt/spark/jars/guava-*.jar \
         /opt/spark/jars/failureaccess-*.jar \
+        /opt/spark/jars/curator-client-*.jar \
+        /opt/spark/jars/curator-framework-*.jar \
+        /opt/spark/jars/curator-recipes-*.jar \
         /opt/spark/jars/jackson-annotations-*.jar \
         /opt/spark/jars/jackson-core-*.jar \
         /opt/spark/jars/jackson-databind-*.jar \
@@ -205,6 +212,9 @@ RUN --mount=type=bind,from=selected-artifacts,target=/tmp/d2c-artifacts,ro \
     && cp /tmp/d2c-artifacts/dependencies/*.jar /opt/spark/jars/ \
     && cp /tmp/d2c-artifacts/hadoop/hadoop-client-api-3.5.0-d2c-local1.jar /opt/spark/jars/ \
     && cp /tmp/d2c-artifacts/hadoop/hadoop-client-runtime-3.5.0-d2c-local1.jar /opt/spark/jars/ \
+    && cp /tmp/d2c-artifacts/hadoop/curator-client-5.9.0-d2c-guava33.7.2-jre.jar /opt/spark/jars/ \
+    && cp /tmp/d2c-artifacts/hadoop/curator-framework-5.9.0-d2c-guava33.7.2-jre.jar /opt/spark/jars/ \
+    && cp /tmp/d2c-artifacts/hadoop/curator-recipes-5.9.0-d2c-guava33.7.2-jre.jar /opt/spark/jars/ \
     && cp /tmp/d2c-artifacts/parquet/parquet-jackson-1.17.0-d2c-jackson2.21.7.jar /opt/spark/jars/ \
     && cp /tmp/d2c-artifacts/iceberg/iceberg-spark-runtime-4.2_2.13-1.12.0-d2c-security1.jar /opt/spark/jars/ \
     && cp /tmp/d2c-artifacts/spark/spark-core_2.13-4.2.1-d2c-jetty12.1.14.jar /opt/spark/jars/spark-core_2.13-4.2.1.jar \

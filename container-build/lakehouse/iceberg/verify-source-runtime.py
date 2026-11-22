@@ -388,6 +388,14 @@ def verify(inputs, rebuilt_path, upstream, java="java", guava_inputs=None):
     }
 
 
+def verification_log_record(passed, report_path, rebuilt_path):
+    """Log a fixed result and content digests; keep detailed input evidence in its file."""
+    return {"component": "iceberg-spark-runtime-4.2_2.13", "version": "1.12.0",
+            "status": "PASS" if passed is True else "FAIL",
+            "verification_report_sha256": sha256(report_path.read_bytes()),
+            "rebuilt_sha256": sha256(rebuilt_path.read_bytes())}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--upstream", type=Path, required=True)
@@ -401,7 +409,8 @@ def main():
     guava_inputs = json.loads(args.guava_inputs.read_text())
     report = verify(inputs, args.rebuilt, args.upstream, args.java, guava_inputs)
     args.artifacts.mkdir(parents=True, exist_ok=True)
-    (args.artifacts / "iceberg-rebuild-verification.json").write_text(json.dumps(report, indent=2) + "\n")
+    report_path = args.artifacts / "iceberg-rebuild-verification.json"
+    report_path.write_text(json.dumps(report, indent=2) + "\n")
     provenance = {
         "component": "iceberg-spark-runtime-4.2_2.13", "upstream_version": "1.12.0",
         "custom_version": "1.12.0-d2c-security1", "spark_compile_version": "4.2.1",
@@ -428,7 +437,7 @@ def main():
         "verification_status": report["status"], "rebuilt_sha256": report["rebuilt_sha256"],
     }
     (args.artifacts / "iceberg-source-provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
-    print(json.dumps(report, indent=2))
+    print(json.dumps(verification_log_record(report["status"] == "PASS", report_path, args.rebuilt), sort_keys=True))
     return 0 if report["status"] == "PASS" else 1
 
 

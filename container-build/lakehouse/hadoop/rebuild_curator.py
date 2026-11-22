@@ -12,12 +12,13 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import shutil
 import subprocess
 from zipfile import ZipFile
 
 from curator_compat import verify_curator_shaded_module
 from runtime_profile import (CURATOR_MODULES, CURATOR_REVIEWED_METADATA, CURATOR_VARIANT_GROUP, CURATOR_VARIANT_VERSION,
-                             CURATOR_VERSION, FAILUREACCESS_VERSION, GUAVA_VERSION)
+                             CURATOR_VERSION, FAILUREACCESS_VERSION, GUAVA_VERSION, curator_assembly_profile)
 
 REPOSITORY = Path("/root/.m2/repository")
 NS = "http://maven.apache.org/POM/4.0.0"
@@ -44,15 +45,17 @@ def dependency(group: str, artifact: str, version: str, *, classifier: str = "",
     return "<dependency>" + fields + "</dependency>"
 
 
-def project_pom(module: str, *, multi_release: bool = False) -> str:
+def project_pom(module: str, *, multi_release: bool = False, curator_version: str = CURATOR_VERSION) -> str:
     """Full unshaded upstream module input plus explicitly selected dependencies."""
     if module not in (*CURATOR_MODULES, "curator-guava-reference"):
         raise ValueError("unsupported Curator assembly module")
+    profile = curator_assembly_profile(curator_version)
+    variant = profile["variant"]
     deps, included = [], []
     if module in CURATOR_MODULES:
         # The whole module is retained; wildcard exclusion only prevents its
         # unclassified siblings and old dependency graph from re-entering.
-        deps.append(dependency("org.apache.curator", module, CURATOR_VERSION,
+        deps.append(dependency("org.apache.curator", module, curator_version,
                                classifier="osgi", no_transitives=True))
         included.append(f"org.apache.curator:{module}:jar:osgi")
     if module in ("curator-client", "curator-guava-reference"):
@@ -62,23 +65,23 @@ def project_pom(module: str, *, multi_release: bool = False) -> str:
     if module == "curator-client":
         # Preserve the original external runtime API dependencies. These are
         # the versions already selected by Hadoop 3.5; neither is embedded.
-        deps += [dependency("org.apache.zookeeper", "zookeeper", "3.8.6"),
+        deps += [dependency("org.apache.zookeeper", "zookeeper", profile["zookeeper"]),
                  dependency("org.slf4j", "slf4j-api", "1.7.36")]
     if module == "curator-framework":
-        deps += [dependency(CURATOR_VARIANT_GROUP, "curator-client", CURATOR_VARIANT_VERSION),
+        deps += [dependency(CURATOR_VARIANT_GROUP, "curator-client", variant),
                  dependency("com.fasterxml.jackson.core", "jackson-core", "2.21.7", scope="provided"),
                  dependency("com.fasterxml.jackson.core", "jackson-databind", "2.21.7", scope="provided")]
     if module == "curator-recipes":
-        deps += [dependency(CURATOR_VARIANT_GROUP, "curator-framework", CURATOR_VARIANT_VERSION)]
+        deps += [dependency(CURATOR_VARIANT_GROUP, "curator-framework", variant)]
     includes = "".join(f"<include>{name}</include>" for name in included)
     manifest = ("<configuration><archive><manifestEntries><Multi-Release>true</Multi-Release>"
                 "</manifestEntries></archive></configuration>" if multi_release else "")
     return f'''<project xmlns="{NS}">
   <modelVersion>4.0.0</modelVersion>
   <groupId>{CURATOR_VARIANT_GROUP}</groupId><artifactId>{module}</artifactId>
-  <version>{CURATOR_VARIANT_VERSION}</version><packaging>jar</packaging>
+  <version>{variant}</version><packaging>jar</packaging>
   <name>D2C complete Curator compatible fixed Guava assembly: {module}</name>
-  <description>Official complete 5.2.0 pre-shade module and fixed dependency assembly; no upstream Java or finished JAR is patched.</description>
+  <description>Official complete {curator_version} pre-shade module and fixed dependency assembly; no upstream Java or finished JAR is patched.</description>
   <licenses><license><name>Apache License, Version 2.0</name><url>https://www.apache.org/licenses/LICENSE-2.0.txt</url></license></licenses>
   <properties><project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <maven.compiler.release>17</maven.compiler.release><project.build.outputTimestamp>2026-11-04T00:00:00Z</project.build.outputTimestamp>
@@ -170,11 +173,13 @@ def preserve_module_descriptors(root: Path, sources: dict[str, Path]) -> dict:
     return proof
 
 
-def build(maven: Path, source_root: Path, output: Path) -> dict:
+def build(maven: Path, source_root: Path, output: Path, *, curator_version: str = CURATOR_VERSION) -> dict:
+    profile = curator_assembly_profile(curator_version)
+    variant = profile["variant"]
     work = source_root / "curator-assemblies"
     work.mkdir(parents=True, exist_ok=True)
     commands = []
-    log_path = output / "curator-bundle-build.log"
+    log_path = output / f"{profile['receipt_prefix']}-bundle-build.log"
     if log_path.exists():
         raise ValueError("refuse to overwrite an existing Curator build receipt")
 
@@ -192,10 +197,10 @@ def build(maven: Path, source_root: Path, output: Path) -> dict:
 
     reference_dir = work / "curator-guava-reference"
     reference_dir.mkdir(parents=True, exist_ok=True)
-    (reference_dir / "pom.xml").write_text(project_pom("curator-guava-reference"))
+    (reference_dir / "pom.xml").write_text(project_pom("curator-guava-reference", curator_version=curator_version))
     coordinates = [("com.google.guava", "guava", GUAVA_VERSION, ""),
                    ("com.google.guava", "failureaccess", FAILUREACCESS_VERSION, "")]
-    coordinates += [("org.apache.curator", name, CURATOR_VERSION, classifier)
+    coordinates += [("org.apache.curator", name, curator_version, classifier)
                     for name in CURATOR_MODULES for classifier in ("osgi", "")]
     for group, artifact, version, classifier in coordinates:
         gav = f"{group}:{artifact}:{version}:jar" + (f":{classifier}" if classifier else "")
@@ -204,36 +209,36 @@ def build(maven: Path, source_root: Path, output: Path) -> dict:
     fixed_inputs = {"guava": resolved("com.google.guava", "guava", GUAVA_VERSION),
                     "failureaccess": resolved("com.google.guava", "failureaccess", FAILUREACCESS_VERSION)}
     multi_release = any(has_multi_release_implementation(path) for path in fixed_inputs.values())
-    (reference_dir / "pom.xml").write_text(project_pom("curator-guava-reference", multi_release=multi_release))
+    (reference_dir / "pom.xml").write_text(project_pom("curator-guava-reference", multi_release=multi_release, curator_version=curator_version))
     documents = preserve_license_sources(reference_dir, fixed_inputs)
     manifests = preserve_manifest_sources(reference_dir, fixed_inputs)
     jpms = preserve_module_descriptors(reference_dir, fixed_inputs)
     run(["-Dmaven.test.skip=true", "package"], reference_dir)
-    reference = reference_dir / "target" / f"curator-guava-reference-{CURATOR_VARIANT_VERSION}.jar"
+    reference = reference_dir / "target" / f"curator-guava-reference-{variant}.jar"
     modules = {}
     for module in CURATOR_MODULES:
         directory = work / module
         directory.mkdir(parents=True, exist_ok=True)
-        pom = project_pom(module, multi_release=multi_release and module == "curator-client")
+        pom = project_pom(module, multi_release=multi_release and module == "curator-client", curator_version=curator_version)
         (directory / "pom.xml").write_text(pom)
-        original = resolved("org.apache.curator", module, CURATOR_VERSION, "osgi")
+        original = resolved("org.apache.curator", module, curator_version, "osgi")
         preserve_license_sources(directory, {module: original})
         preserve_manifest_sources(directory, {f"{module}/osgi": original,
-            f"{module}/standard": resolved("org.apache.curator", module, CURATOR_VERSION)})
+            f"{module}/standard": resolved("org.apache.curator", module, curator_version)})
         if module == "curator-client":
             preserve_license_sources(directory, fixed_inputs)
             preserve_manifest_sources(directory, fixed_inputs)
             preserve_module_descriptors(directory, fixed_inputs)
         run(["-Dmaven.test.skip=true", "install"], directory)
-        target = directory / "target" / f"{module}-{CURATOR_VARIANT_VERSION}.jar"
-        installed = resolved(CURATOR_VARIANT_GROUP, module, CURATOR_VARIANT_VERSION)
+        target = directory / "target" / f"{module}-{variant}.jar"
+        installed = resolved(CURATOR_VARIANT_GROUP, module, variant)
         if digest(target) != digest(installed):
             raise ValueError("installed compatible Curator assembly differs from Maven output")
         report = verify_curator_shaded_module(target,
-            resolved("org.apache.curator", module, CURATOR_VERSION, "osgi"),
-            resolved("org.apache.curator", module, CURATOR_VERSION), module,
+            resolved("org.apache.curator", module, curator_version, "osgi"),
+            resolved("org.apache.curator", module, curator_version), module,
             fixed_inputs["guava"], fixed_inputs["failureaccess"], reference,
-            reviewed_metadata=CURATOR_REVIEWED_METADATA)
+            reviewed_metadata=profile["reviewed_metadata"], upstream_version=curator_version)
         resources = directory / "src/main/resources"
         preserved = {str(path.relative_to(resources)): digest(path) for path in resources.rglob("*") if path.is_file()}
         with ZipFile(target) as jar:
@@ -249,10 +254,17 @@ def build(maven: Path, source_root: Path, output: Path) -> dict:
         if installed_pom.read_bytes() != reduced_pom.read_bytes():
             raise ValueError("installed compatible Curator POM differs from Maven dependency-reduced POM")
         report["installed_pom_sha256"] = digest(installed_pom)
+        if curator_version == "5.9.0":
+            exported = output / target.name
+            if exported.exists():
+                raise ValueError("refuse to overwrite an exported outer Curator JAR")
+            shutil.copyfile(target, exported)
+            report["exported_filename"] = exported.name
+            report["exported_sha256"] = digest(exported)
         modules[module] = report
     result = {"method": "official complete pre-Shade osgi modules assembled by Maven with original Curator relocation and fixed dependencies",
-              "original_curator_version": CURATOR_VERSION, "custom_group": CURATOR_VARIANT_GROUP,
-              "custom_version": CURATOR_VARIANT_VERSION, "upstream_java_source_changes": False,
+              "original_curator_version": curator_version, "custom_group": CURATOR_VARIANT_GROUP,
+              "custom_version": variant, "upstream_java_source_changes": False,
               "finished_jar_edits": False, "guava_version": GUAVA_VERSION,
               "failureaccess_version": FAILUREACCESS_VERSION,
               "fixed_input_sha256": {name: digest(path) for name, path in fixed_inputs.items()},
@@ -263,7 +275,7 @@ def build(maven: Path, source_root: Path, output: Path) -> dict:
               "qualified_unchanged_dependency_documents": documents, "modules": modules,
               "commands": commands, "build_log_sha256": digest(log_path), "command_exit": 0,
               "limits": "Only the client contains fixed Guava. Module class sets, public/protected ABI and actual fixed Guava class bytes are checked before Hadoop assembly. Final-image linkage/regression and fresh scans remain required."}
-    (output / "curator-bundle-build.json").write_text(json.dumps(result, indent=2) + "\n")
+    (output / f"{profile['receipt_prefix']}-bundle-build.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
 
 
@@ -272,5 +284,6 @@ if __name__ == "__main__":
     parser.add_argument("--maven", type=Path, required=True)
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--curator-version", choices=("5.2.0", "5.9.0"), default=CURATOR_VERSION)
     args = parser.parse_args()
-    build(args.maven, args.source_root, args.output)
+    build(args.maven, args.source_root, args.output, curator_version=args.curator_version)

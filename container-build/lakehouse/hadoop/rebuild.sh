@@ -31,6 +31,10 @@ run_maven() {
 # Preserve their original shaded public Guava Predicate ABI with fixed code.
 python3 "$helper_dir/rebuild_curator.py" --maven "$maven" \
     --source-root "$source_root" --output "$output_dir"
+# Spark also supplies independent outer Curator 5.9.0 modules. Reassemble that
+# same version separately; the Hadoop 5.2.0 custom graph remains unchanged.
+python3 "$helper_dir/rebuild_curator.py" --maven "$maven" --curator-version 5.9.0 \
+    --source-root "$source_root/outer-curator" --output "$output_dir"
 
 # This small authored plugin extension is compiled before Maven shading, never
 # added to a runtime dependency graph and never used to rewrite a finished JAR.

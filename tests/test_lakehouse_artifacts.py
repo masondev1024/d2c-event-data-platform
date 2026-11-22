@@ -133,6 +133,29 @@ class ArtifactSealTest(ArtifactFixture):
         with self.assertRaisesRegex(subject.ArtifactError, "leaked"):
             subject.seal(self.artifacts, self.source)
 
+    def test_original_curator_cannot_reenter_through_the_resolver(self) -> None:
+        for module in ("client", "framework", "recipes"):
+            with self.subTest(module=module):
+                path = self.artifacts / f"dependencies/org.apache.curator_curator-{module}-5.9.0.jar"
+                path.write_bytes(jar_fixture())
+                try:
+                    with self.assertRaisesRegex(subject.ArtifactError, "leaked"):
+                        subject.seal(self.artifacts, self.source)
+                finally:
+                    path.unlink()
+
+    def test_each_outer_curator_replacement_is_required_before_sealing(self) -> None:
+        for module in ("client", "framework", "recipes"):
+            with self.subTest(module=module):
+                path = self.artifacts / f"hadoop/curator-{module}-5.9.0-d2c-guava33.7.2-jre.jar"
+                content = path.read_bytes()
+                path.unlink()
+                try:
+                    with self.assertRaisesRegex(subject.ArtifactError, "required hadoop output missing"):
+                        subject.seal(self.artifacts, self.source)
+                finally:
+                    path.write_bytes(content)
+
     def test_old_direct_guava_or_snappy_cannot_accompany_the_patched_dependency(self) -> None:
         for filename in ("com.google.guava_guava-33.7.1-jre.jar",
                          "com.google.guava_failureaccess-1.0.2.jar",

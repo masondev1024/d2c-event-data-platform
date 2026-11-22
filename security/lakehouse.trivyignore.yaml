@@ -1,2 +1,2 @@
-# No vulnerabilities are suppressed. Remaining Jetty findings must fail the image gate.
+# No vulnerabilities are suppressed. HIGH/CRITICAL findings must fail the image gate.
 vulnerabilities: []

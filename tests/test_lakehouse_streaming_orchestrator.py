@@ -2,12 +2,14 @@
 import argparse
 import base64
 import importlib.util
+import io
 import json
 from pathlib import Path
 import signal
 import subprocess
 from tempfile import TemporaryDirectory
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import Mock, patch
 
 
@@ -17,6 +19,14 @@ SPEC.loader.exec_module(module)
 FINAL = "sha256:" + "a" * 64
 BROKER = "sha256:" + "b" * 64
 FOREIGN = "e" * 64
+
+
+def resource_sample():
+    return {"kind": "final", "child_exit": 0, "read_errors": {},
+            "values": {"pids.max": 512, "memory.max": 2000 * 1024**2,
+                       "cpu.max": {"quota": 200000, "period": 100000}},
+            "events_delta": {"pids.events": {"max": 0},
+                             "memory.events": {"max": 0, "oom": 0, "oom_kill": 0}}}
 
 
 class Engine:
@@ -84,6 +94,8 @@ class Engine:
             for network in self.networks.values():
                 network["Containers"].pop(identity, None)
             return done(identity)
+        if args[:2] == ["container", "rm"]:
+            self.containers.pop(args[2]); return done(args[2])
         if args[:2] == ["volume", "rm"]:
             self.volumes.pop(args[2]); return done(args[2])
         if args[:2] == ["network", "rm"]:
@@ -108,6 +120,15 @@ class Harness(module.StreamingTest):
             return "D2C_STREAM_INIT=" + json.dumps({"source_sha256": payload["sha256"]})
         if label == "broker-identity":
             return "D2C_BROKER_IDENTITY=1000:1000\n"
+        identity = str(module.PHASES.index(label) + 3) * 64
+        self.engine.containers[identity] = {"Id": identity, "Name": "/" + name,
+            "Image": FINAL, "Config": {"Labels": {module.OWNER_LABEL: self.token}},
+            "State": {"Running": False, "OOMKilled": False, "ExitCode": 0},
+            "HostConfig": {"PidsLimit": 512, "Memory": 2000 * 1024**2,
+                           "MemorySwap": 2000 * 1024**2, "NanoCpus": 2_000_000_000}}
+        folder = self.output / "guard" / label
+        folder.mkdir(parents=True)
+        (folder / "command.log").write_text("    Effective CPU Count: 2\n" + module.RESOURCE_PREFIX + json.dumps(resource_sample()) + "\n")
         return module.PROOF_PREFIX + json.dumps({"phase": label, "status": "PASS", "image_id": FINAL, "owner": self.token})
 
 
@@ -160,6 +181,11 @@ class OrchestratorTest(unittest.TestCase):
             self.assertEqual(command[command.index("--user") + 1], "185:0")
             self.assertEqual(command[command.index("--memory") + 1], "2000m")
             self.assertEqual(command[command.index("--cpus") + 1], "2")
+            self.assertEqual(command[command.index("--pids-limit") + 1], "512")
+            self.assertNotIn("--rm", command)
+            self.assertEqual(command[command.index("--entrypoint") + 1], "python3")
+            self.assertIn(module.PHASE_MONITOR_SOURCE, command)
+            self.assertIn("spark.driver.extraJavaOptions=-XshowSettings:system", command)
             self.assertEqual(command[command.index("--master") + 1], "local[1]")
             self.assertIn("type=volume,src=" + instance.names["volume"] + ",dst=/state", command)
             self.assertNotIn("type=bind", " ".join(command))
@@ -310,9 +336,101 @@ class OrchestratorTest(unittest.TestCase):
     def test_duplicate_or_wrong_phase_proof_fails(self):
         instance = self.instance()
         proof = module.PROOF_PREFIX + json.dumps({"phase": "initial", "status": "PASS", "image_id": FINAL, "owner": instance.token})
-        with patch.object(instance, "guarded", return_value=proof + "\n" + proof):
+        with patch.object(instance, "guarded", return_value=proof + "\n" + proof), patch.object(instance, "capture_phase_evidence"):
             with self.assertRaisesRegex(module.StreamingError, "ambiguous"):
                 instance.phase("initial", FINAL)
+
+    def phase_inventory(self, instance):
+        name = instance.names["initial"]
+        instance.attempt_container(name)
+        folder = instance.output / "guard" / "initial"; folder.mkdir(parents=True)
+        (folder / "command.log").write_text("    Effective CPU Count: 2\n" + module.RESOURCE_PREFIX + json.dumps(resource_sample()) + "\n")
+        return {"Id": "3" * 64, "Name": "/" + name, "Image": FINAL,
+                "Config": {"Labels": {module.OWNER_LABEL: instance.token}, "Env": ["SECRET=not-evidence"]},
+                "State": {"Running": False, "OOMKilled": False, "ExitCode": 0},
+                "HostConfig": {"PidsLimit": 512, "Memory": 2000 * 1024**2,
+                               "MemorySwap": 2000 * 1024**2, "NanoCpus": 2_000_000_000}}
+
+    def test_failed_phase_collects_inspection_before_any_owned_cleanup(self):
+        instance = self.instance(); data = self.phase_inventory(instance)
+        data["State"].update(ExitCode=1, OOMKilled=True)
+        with patch.object(instance, "guarded", side_effect=module.StreamingError("child failed")), \
+             patch.object(instance, "inspect", return_value=data), patch.object(instance, "docker") as docker:
+            with self.assertRaisesRegex(module.StreamingError, "child failed"):
+                instance.phase("initial", FINAL)
+        docker.assert_not_called()
+        evidence = json.loads((instance.output / "initial-resources.json").read_text())
+        self.assertEqual(evidence["state"], {"Running": False, "OOMKilled": True, "ExitCode": 1})
+        self.assertEqual(len(evidence["resource_samples"]), 1)
+        self.assertIn("exit or bounded", evidence["validation_error"])
+        self.assertNotIn("SECRET", json.dumps(evidence))
+
+    def test_wrong_image_missing_samples_limits_or_events_cannot_establish_phase_success(self):
+        for mutation in ["image", "limit", "pids", "memory", "missing", "negative", "unknown", "quota", "jvm"]:
+            with self.subTest(mutation=mutation):
+                options = self.options(); options.output_dir = self.root / mutation
+                instance = module.StreamingTest(options); data = self.phase_inventory(instance)
+                sample = resource_sample()
+                if mutation == "image": data["Image"] = BROKER
+                elif mutation == "limit": data["HostConfig"]["PidsLimit"] = -1
+                elif mutation == "pids": sample["events_delta"]["pids.events"]["max"] = 1
+                elif mutation == "memory": sample["events_delta"]["memory.events"]["oom_kill"] = 1
+                elif mutation == "negative": sample["events_delta"]["pids.events"]["max"] = -1
+                elif mutation == "unknown": sample["events_delta"]["pids.events"] = None
+                elif mutation == "quota": sample["values"]["cpu.max"]["quota"] = "max"
+                log = instance.output / "guard/initial/command.log"
+                diagnostic = "    Effective CPU Count: " + ("8" if mutation == "jvm" else "2") + "\n"
+                log.write_text("" if mutation == "missing" else diagnostic + module.RESOURCE_PREFIX + json.dumps(sample) + "\n")
+                with patch.object(instance, "inspect", return_value=data), self.assertRaises(module.StreamingError):
+                    instance.capture_phase_evidence("initial", FINAL)
+                self.assertEqual(len(instance.summary["phase_resources"]["initial"]["resource_samples"]), 0 if mutation == "missing" else 1)
+
+    def test_memory_boundary_reclaim_is_reported_separately_from_oom(self):
+        instance = self.instance(); data = self.phase_inventory(instance)
+        sample = resource_sample(); sample["events_delta"]["memory.events"]["max"] = 3
+        log = instance.output / "guard/initial/command.log"
+        log.write_text("    Effective CPU Count: 2\n" + module.RESOURCE_PREFIX + json.dumps(sample) + "\n")
+        with patch.object(instance, "inspect", return_value=data):
+            instance.capture_phase_evidence("initial", FINAL)
+        self.assertEqual(instance.summary["phase_resources"]["initial"]["resource_samples"][0]["events_delta"]["memory.events"]["max"], 3)
+
+    def test_cgroup_parser_is_numeric_bounded_and_does_not_invent_missing_events(self):
+        namespace = {"__name__": "offline_monitor_fixture"}
+        exec(compile(module.PHASE_MONITOR_SOURCE, "phase_monitor", "exec"), namespace)
+        metrics = self.root / "cgroup"; metrics.mkdir()
+        values = {"pids.current": "191", "pids.max": "512", "pids.events": "max 3\n",
+                  "memory.current": "500000000", "memory.max": str(2000 * 1024**2),
+                  "memory.events": "low 0\nhigh 0\nmax 1\noom 0\noom_kill 0\n",
+                  "cpu.max": "200000 100000", "pids.peak": "192", "memory.peak": "600000000"}
+        for name, value in values.items(): (metrics / name).write_text(value)
+        actual, errors = namespace["read_metrics"](metrics)
+        self.assertFalse(errors); self.assertEqual(actual["pids.peak"], 192)
+        self.assertEqual(actual["cpu.max"], {"quota": 200000, "period": 100000})
+        (metrics / "pids.events").unlink(); (metrics / "cpu.max").write_text("x" * 4097)
+        actual, errors = namespace["read_metrics"](metrics)
+        self.assertEqual(set(errors), {"pids.events", "cpu.max"})
+        self.assertIsNone(namespace["event_deltas"]({}, actual)["pids.events"])
+
+    def test_monitor_preserves_failed_and_signalled_child_exit_with_final_high_water(self):
+        for result, expected in [(7, 7), (-9, 137)]:
+            with self.subTest(result=result):
+                namespace = {"__name__": "offline_monitor_fixture"}
+                exec(compile(module.PHASE_MONITOR_SOURCE, "phase_monitor", "exec"), namespace)
+                child = Mock(); child.poll.side_effect = [None, 0]; child.wait.return_value = result
+                snapshots = [({"pids.current": value, "memory.current": value * 1000,
+                               "pids.events": {"max": event}, "memory.events": {"oom": 0}}, {})
+                             for value, event in [(1, 0), (1, 0), (350, 1), (2, 1)]]
+                output = io.StringIO()
+                with patch.object(namespace["subprocess"], "Popen", return_value=child), \
+                     patch.object(namespace["signal"], "signal"), patch.object(namespace["time"], "sleep"), \
+                     patch.dict(namespace, read_metrics=Mock(side_effect=snapshots)), redirect_stdout(output):
+                    self.assertEqual(namespace["monitor"](["same", "spark", "argv"]), expected)
+                rows = [json.loads(line[len(module.RESOURCE_PREFIX):]) for line in output.getvalue().splitlines()]
+                self.assertEqual([row["kind"] for row in rows], ["initial", "final"])
+                self.assertEqual(rows[-1]["child_exit"], result)
+                self.assertEqual(rows[-1]["observed_high_water"]["pids.current"], 350)
+                self.assertEqual(rows[-1]["events_delta"]["pids.events"]["max"], 1)
+                child.wait.assert_called_once()
 
     def test_insufficient_query_budget_never_dispatches_a_phase(self):
         instance = self.instance()

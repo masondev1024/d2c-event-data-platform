@@ -407,6 +407,10 @@ Guava는 외부 JAR과 Hadoop·Iceberg·Spark network-common의 개별 shaded �
 자체 클래스·공개/보호 ABI·라이선스·Maven metadata를 비교합니다. 새 namespace의 Guava
 전체 구현을 실제 수정 버전 입력과 대조하며, 단순 namespace 허용이나 완성된 취약 JAR의
 클래스 삭제로 검사를 통과시키지 않습니다. 실제 최종 JVM 호환성 시험도 별도로 필요합니다.
+Spark 배포의 별도 Curator **5.9.0** 3개 모듈에도 같은 조립·ABI 검증을 적용합니다.
+공식 client가 내장 Guava의 Maven metadata를 제외하므로 패키지 스캔 0건만으로는 이 사본의
+수정 여부를 판단할 수 없습니다. 기존 shaded namespace를 유지한 **33.7.2-jre** 전체 구현을
+검증하고, 원래 5.9.0 모듈 전체를 교체하며 Ivy 경로로 이전 모듈이 다시 들어오면 거부합니다.
 Snappy **1.1.10.9**는 최종 이미지의 실제 클래스 출처와 source manifest의 JAR SHA를
 대조하고, 작은 합성 데이터의 JNI 압축·복원과 실제 로드된 플랫폼별 `.so`의 SHA를 검사합니다.
 Spark source 빌드는 공식 배포본과 같은 Java 17 컴파일러(Temurin **17.0.21+9**)로 고정합니다.
@@ -455,8 +459,17 @@ self-hosted runner에서는 거부합니다. 수동 실행의 정리는 기본 �
 `scripts/test_lakehouse_streaming.py`는 새 broker/network/state volume에서 실제 LZ4 Kafka 입력,
 별도 Spark 프로세스의 checkpoint 재시작, sink commit 뒤 checkpoint commit 전 장애와 replay,
 Iceberg/Parquet 재독출을 검증합니다. 기존 서비스나 데이터 volume은 재사용하지 않습니다.
+Spark의 block-manager 내부 thread pool은 `local[1]`과 별개이므로 회귀 phase에는 유한한
+PID 512·memory 2000MiB·CPU 2·driver heap 512MiB를 할당합니다. cgroup의 PID·memory
+한도와 events, 관측 최대 사용량 및 컨테이너 종료 상태를 함께 남겨 자원 제한 실패와
+애플리케이션 실패를 구분합니다. 이 값은 작은 합성 데이터의 회귀 프로파일이며 운영 용량
+산정 결과가 아닙니다.
 release는 검사한 attested OCI graph를 다시 빌드하지 않고 동일 digest 그대로 게시하도록
 `scripts/oci_release.py`에서 연결하며, 실제 게시와 로컬 검증은 구분합니다.
+현재 release 검증 대상은 별도로 빌드한 **amd64 OCI graph 4개**입니다. 각각 로컬 exporter의
+image name을 지정하여 provenance/SBOM statement를 runtime manifest digest에 결합합니다.
+native amd64/arm64 회귀 이미지의 Docker ID와 이 OCI graph의 digest는 서로 다른 증거이며,
+release arm64 또는 export한 graph 자체의 실행 시험을 의미하지 않습니다.
 CI에서는 AWS `apply`나 `destroy`를 실행하지 않아 credential과 비용을 분리합니다.
 
 DLQ 경로를 강제로 확인하려면 별도 터미널에서 다음처럼 invalid event 비율을 높여 실행합니다.

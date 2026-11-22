@@ -42,7 +42,8 @@ def write_blob(root: Path, value, media_type: str, **extra) -> dict:
 def layout_fixture(root: Path, *, role: str = "fixture", wrong_subject: bool = False,
                    omit_provenance: bool = False, extra_runtime: bool = False,
                    attestation_first: bool = False, config_arch: str = "amd64",
-                   gzip_layer: bool = False, wrong_diff_id: bool = False) -> dict:
+                   gzip_layer: bool = False, wrong_diff_id: bool = False,
+                   statement_subjects: list | None = None) -> dict:
     (root / "blobs/sha256").mkdir(parents=True)
     (root / "oci-layout").write_text('{"imageLayoutVersion":"1.0.0"}')
     content = b"metadata-only-layer-fixture"
@@ -54,9 +55,10 @@ def layout_fixture(root: Path, *, role: str = "fixture", wrong_subject: bool = F
         "config": config, "layers": [layer]}, MANIFEST,
         platform={"os": "linux", "architecture": "amd64"})
     subject = "sha256:" + "a" * 64 if wrong_subject else image["digest"]
+    subjects = statement_subjects if statement_subjects is not None else [
+        {"name": "pkg:docker/d2c-fixture@ci", "digest": {"sha256": subject[7:]}}]
     predicates = [SPDX] + ([] if omit_provenance else ["https://slsa.dev/provenance/v0.2"])
-    statements = [write_blob(root, {"_type": "https://in-toto.io/Statement/v0.1", "subject": [
-        {"name": "fixture", "digest": {"sha256": subject[7:]}}], "predicateType": predicate,
+    statements = [write_blob(root, {"_type": "https://in-toto.io/Statement/v0.1", "subject": subjects, "predicateType": predicate,
         "predicate": {"fixture": True}}, STATEMENT,
         annotations={"in-toto.io/predicate-type": predicate}) for predicate in predicates]
     dummy = write_blob(root, {}, CONFIG)
@@ -69,7 +71,8 @@ def layout_fixture(root: Path, *, role: str = "fixture", wrong_subject: bool = F
         children.append(image)
     top = write_blob(root, {"schemaVersion": 2, "mediaType": INDEX, "manifests": children}, INDEX)
     (root / "index.json").write_text(json.dumps({"schemaVersion": 2, "mediaType": INDEX, "manifests": [top]}))
-    return {"config": config, "image": image, "attestation": attestation, "top": top, "layer": layer}
+    return {"config": config, "image": image, "attestation": attestation, "top": top, "layer": layer,
+            "statements": statements}
 
 
 def release_fixture(root: Path) -> tuple[Path, dict[str, Path]]:
@@ -102,6 +105,51 @@ def release_fixture(root: Path) -> tuple[Path, dict[str, Path]]:
 
 
 class OCIGraphTest(unittest.TestCase):
+    def test_named_subject_bound_to_runtime_leaf_is_accepted(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            item = layout_fixture(root)
+            identity = validate_layout(root, "linux/amd64")
+            self.assertEqual(identity["runtime_leaf_digest"], item["image"]["digest"])
+            self.assertEqual(len(identity["attestations"]), 1)
+
+    def test_unnamed_and_wrong_subjects_fail_with_observed_and_expected_digests(self):
+        for options, count, observed in (({"statement_subjects": []}, 0, []),
+                                         ({"wrong_subject": True}, 1, [{"sha256": "a" * 64, "extra_digest_fields": False}])):
+            with self.subTest(options=options), TemporaryDirectory() as temp:
+                root = Path(temp)
+                item = layout_fixture(root, **options)
+                with self.assertRaisesRegex(OCIError, "attestation statement subject mismatch: ") as raised:
+                    validate_layout(root, "linux/amd64")
+                diagnostic = json.loads(str(raised.exception).split(": ", 1)[1])
+                self.assertEqual(diagnostic, {
+                    "predicate_type": "SPDX", "subject_count": count, "subject_digests": observed,
+                    "subject_digests_truncated": False,
+                    "statement_blob_digest": item["statements"][0]["digest"],
+                    "expected_runtime_leaf_digest": item["image"]["digest"],
+                })
+
+    def test_subject_mismatch_diagnostics_bound_and_omit_untrusted_payloads(self):
+        subjects = [{"name": "https://private.invalid/SECRET", "digest": {
+            "sha256": "f" * 10000, "https://private.invalid/SECRET": "SECRET"}},
+            None, "https://private.invalid/SECRET", *[{"digest": {"sha256": "a" * 64}}] * 9]
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            layout_fixture(root, statement_subjects=subjects)
+            with self.assertRaisesRegex(OCIError, "attestation statement subject mismatch: ") as raised:
+                validate_layout(root, "linux/amd64")
+            message = str(raised.exception)
+            diagnostic = json.loads(message.split(": ", 1)[1])
+            self.assertEqual(diagnostic["subject_count"], 12)
+            self.assertEqual(len(diagnostic["subject_digests"]), 8)
+            self.assertTrue(diagnostic["subject_digests_truncated"])
+            self.assertEqual(diagnostic["subject_digests"][0], {"sha256": None, "extra_digest_fields": True})
+            self.assertEqual(diagnostic["subject_digests"][1:3], [None, None])
+            self.assertLess(len(message), 2000)
+            self.assertNotIn("SECRET", message)
+            self.assertNotIn("private.invalid", message)
+            self.assertNotIn("f" * 100, message)
+
     def test_config_leaf_and_attested_root_are_distinct_and_view_selects_runtime(self):
         with TemporaryDirectory() as temp:
             root = Path(temp)
@@ -346,6 +394,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
             self.assertEqual(build["continue-on-error"], "true")
             for required in ("--provenance=mode=min", "--sbom=true", "type=oci,", "tar=false", "compression=gzip", "--build-state-dir"):
                 self.assertIn(required, build["run"])
+            self.assertIn(f"name=d2c-{role}:$GITHUB_SHA", build["run"])
             self.assertNotIn("--push", build["run"])
             self.assertNotIn("--load", build["run"])
             self.assertIn(f'--oci-layout "{role}=$RELEASE_PRIVATE/{role}"', by_id["scan"]["run"])

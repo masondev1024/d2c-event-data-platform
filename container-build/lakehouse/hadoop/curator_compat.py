@@ -36,7 +36,8 @@ def require(condition: bool, message: str) -> None:
 
 
 def validate_final_curator_guava_namespace(name: str, content: bytes, *,
-                                         reviewed_metadata: dict[str, str] | None = None) -> bool:
+                                         reviewed_metadata: dict[str, str] | None = None,
+                                         upstream_version: str = VERSION) -> bool:
     """Reject retained old Guava references; report exact reviewed source POMs.
 
     The optional map is an exact JAR-entry-path -> official source SHA-256 map.
@@ -61,7 +62,7 @@ def validate_final_curator_guava_namespace(name: str, content: bytes, *,
         group = xml.findtext("m:groupId", namespaces=ns) or xml.findtext("m:parent/m:groupId", namespaces=ns)
         version = xml.findtext("m:version", namespaces=ns) or xml.findtext("m:parent/m:version", namespaces=ns)
         require((group, xml.findtext("m:artifactId", namespaces=ns), version)
-                == (match.group(1), match.group(2), VERSION),
+                == (match.group(1), match.group(2), upstream_version),
                 f"reviewed Curator source POM context mismatch: {name}")
         return True
     raise ValueError(f"old Curator shaded Guava namespace retained: {name}")
@@ -290,20 +291,20 @@ def _unique_entries(jar: ZipFile) -> set[str]:
     return set(names)
 
 
-def _metadata(jar: ZipFile, names: set[str], module: str) -> dict:
+def _metadata(jar: ZipFile, names: set[str], module: str, version: str = VERSION) -> dict:
     root = f"META-INF/maven/org.apache.curator/{module}/"
     paths = (root + "pom.properties", root + "pom.xml")
     require(all(path in names for path in paths), f"Curator Maven identity metadata missing: {module}")
-    expected = {"groupId": "org.apache.curator", "artifactId": module, "version": VERSION}
+    expected = {"groupId": "org.apache.curator", "artifactId": module, "version": version}
     actual = _properties(jar.read(paths[0]))
     require(all(actual.get(key) == value for key, value in expected.items()),
             f"incorrect Curator Maven identity: {module}")
     xml = ET.fromstring(jar.read(paths[1]))
     ns = {"m": "http://maven.apache.org/POM/4.0.0"}
     group = xml.findtext("m:groupId", namespaces=ns) or xml.findtext("m:parent/m:groupId", namespaces=ns)
-    version = xml.findtext("m:version", namespaces=ns) or xml.findtext("m:parent/m:version", namespaces=ns)
-    require((group, xml.findtext("m:artifactId", namespaces=ns), version)
-            == ("org.apache.curator", module, VERSION), f"incorrect Curator embedded POM GAV: {module}")
+    actual_version = xml.findtext("m:version", namespaces=ns) or xml.findtext("m:parent/m:version", namespaces=ns)
+    require((group, xml.findtext("m:artifactId", namespaces=ns), actual_version)
+            == ("org.apache.curator", module, version), f"incorrect Curator embedded POM GAV: {module}")
     return {path: hashlib.sha256(jar.read(path)).hexdigest() for path in paths}
 
 
@@ -642,7 +643,8 @@ def _validate_fixed_guava_references(name: str, content: bytes, available: set[s
 
 def verify_curator_shaded_module(rebuilt_path: Path, osgi_path: Path, baseline_path: Path, module: str,
                                  fixed_guava_path: Path, failureaccess_path: Path, reference_path: Path, *,
-                                 reviewed_metadata: dict[str, str] | None = None) -> dict:
+                                 reviewed_metadata: dict[str, str] | None = None,
+                                 upstream_version: str = VERSION) -> dict:
     """Verify a normal source-time reassembly that preserves Curator's public ABI.
 
     The reference is another normal Maven Shade assembly of only the two fixed
@@ -652,6 +654,8 @@ def verify_curator_shaded_module(rebuilt_path: Path, osgi_path: Path, baseline_p
     the caller; no compiled artifact is rewritten by this verifier.
     """
     require(module in MODULES, f"unsupported Curator module: {module}")
+    require(upstream_version in ("5.2.0", "5.9.0"), "unreviewed Curator assembly version")
+    rebuilt_version = f"{upstream_version}-d2c-guava{FIXED_GUAVA_VERSION}"
     rebuilt_path, osgi_path, baseline_path = Path(rebuilt_path), Path(osgi_path), Path(baseline_path)
     fixed_guava_path, failureaccess_path, reference_path = Path(fixed_guava_path), Path(failureaccess_path), Path(reference_path)
     inputs = [_fixed_library_inputs(fixed_guava_path, "guava", FIXED_GUAVA_VERSION),
@@ -694,15 +698,16 @@ def verify_curator_shaded_module(rebuilt_path: Path, osgi_path: Path, baseline_p
                 backup = f"META-INF/d2c-upstream/{library['artifact']}/{entry}.original"
                 require(backup in ref_names and hashlib.sha256(reference.read(backup)).hexdigest() == digest,
                         f"original fixed Guava JPMS descriptor not preserved: {backup}")
-        identity = _metadata(rebuilt, names, module)
-        require(identity == _metadata(osgi, osgi_names, module) == _metadata(baseline, baseline_names, module),
+        identity = _metadata(rebuilt, names, module, upstream_version)
+        require(identity == _metadata(osgi, osgi_names, module, upstream_version) == _metadata(baseline, baseline_names, module, upstream_version),
                 f"original Curator project Maven metadata changed: {module}")
-        custom_identity = _gav_metadata(rebuilt, names, REBUILT_GROUP, module, REBUILT_VERSION)
+        custom_identity = _gav_metadata(rebuilt, names, REBUILT_GROUP, module, rebuilt_version)
         require(_own_classes(osgi_names) == _own_classes(baseline_names), "OSGi input Curator own class inventory differs")
         osgi_metadata_mentions = {}
         for entry in sorted(osgi_names):
             content = b"" if entry.endswith("/") else osgi.read(entry)
-            if validate_final_curator_guava_namespace(entry, content, reviewed_metadata=reviewed_metadata):
+            if validate_final_curator_guava_namespace(entry, content, reviewed_metadata=reviewed_metadata,
+                                                     upstream_version=upstream_version):
                 osgi_metadata_mentions[entry] = hashlib.sha256(content).hexdigest()
             require(not (entry.endswith(".class") and "com/google/" in entry),
                     f"Guava implementation unexpectedly embedded in OSGi input: {entry}")
@@ -786,8 +791,8 @@ def verify_curator_shaded_module(rebuilt_path: Path, osgi_path: Path, baseline_p
                        "reference_count": sum(len(values) for values in refs.values()),
                        "distinct_target_class_count": len({value for values in refs.values() for value in values}),
                        "canonical_json_sha256": _canonical_json_sha256(refs)}
-        return {"module": module, "original_version": VERSION,
-                "coordinate": f"{REBUILT_GROUP}:{module}:{REBUILT_VERSION}",
+        return {"module": module, "original_version": upstream_version,
+                "coordinate": f"{REBUILT_GROUP}:{module}:{rebuilt_version}",
                 "method": "full official OSGi module assembled by Maven Shade with the original Curator com.google relocation and fixed complete Guava inputs",
                 "rebuilt_sha256": hashlib.sha256(rebuilt_path.read_bytes()).hexdigest(),
                 "osgi_input_sha256": hashlib.sha256(osgi_path.read_bytes()).hexdigest(),

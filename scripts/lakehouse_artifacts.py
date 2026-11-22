@@ -41,6 +41,8 @@ REQUIRED = {
         "hadoop-client-api-3.5.0-d2c-local1.jar", "hadoop-client-runtime-3.5.0-d2c-local1.jar",
         "provenance.json", "hadoop-client-api-dependency-tree.json",
         "hadoop-client-runtime-dependency-tree.json", "maven-version.txt",
+        "outer-curator-bundle-build.json",
+        *(f"curator-{module}-5.9.0-d2c-guava33.7.2-jre.jar" for module in ("client", "framework", "recipes")),
     ),
     "parquet": (
         "parquet-jackson-1.17.0-d2c-jackson2.21.7.jar",
@@ -187,7 +189,7 @@ def validate_component(root: Path, role: str, source: dict[str, str] | None = No
     require(bool(jars), f"component contains no JARs: {role}")
     if role == "dependencies":
         for relative in jars:
-            require(not re.search(r"(?:^|[._-])(?:hadoop-client-(?:api|runtime)|spark-(?:core|network-common)_2\.13)-", relative),
+            require(not re.search(r"(?:^|[._-])(?:hadoop-client-(?:api|runtime)|spark-(?:core|network-common)_2\.13|curator-(?:client|framework|recipes))-", relative),
                     f"upstream Hadoop/Spark implementation leaked into dependency bundle: {relative}")
             for prefix, expected in (("com.google.guava_guava-", "com.google.guava_guava-33.7.2-jre.jar"),
                                      ("com.google.guava_failureaccess-", "com.google.guava_failureaccess-1.0.3.jar"),
