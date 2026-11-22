@@ -100,6 +100,18 @@ mkdir --parents /opt/spark/extra-jars "$IVY_HOME"
         --conf "spark.ui.enabled=false" \
         --packages "$D2C_EXTRA_PACKAGES" \
         /opt/spark/examples/src/main/python/pi.py 1
+# The outer Curator client links to ZooKeeper and its generated wire types even
+# when the client remains unstarted. Fetch the matched pair without a server setup.
+cd /opt/spark/extra-jars
+for artifact in zookeeper zookeeper-jute; do
+    curl --fail --silent --show-error --location --retry 3 \
+        "https://repo.maven.apache.org/maven2/org/apache/zookeeper/$artifact/3.9.7/$artifact-3.9.7.jar" \
+        --output "$artifact-3.9.7.jar"
+done
+sha256sum --check <<'DIGESTS'
+83c722c769bf63bd3890c547f1bccb054bb8669e2c6feb6e407a73c3d9fcba55  zookeeper-3.9.7.jar
+1f659b0a84518c28b3cc94a143d6139e5e49ec711ae5d942442e7b1e7fd47177  zookeeper-jute-3.9.7.jar
+DIGESTS
 python3 - <<'PY'
 import fnmatch
 import hashlib
@@ -114,6 +126,7 @@ excluded = ('org.apache.hadoop_hadoop-client-api-*.jar',
             'org.apache.spark_spark-network-common_*.jar',
             'org.apache.curator_curator-client-*.jar',
             'org.apache.curator_curator-framework-*.jar',
+            'org.apache.zookeeper_zookeeper-*.jar',
             'org.apache.curator_curator-recipes-*.jar')
 for source in sorted((Path(os.environ['IVY_HOME']) / 'jars').rglob('*.jar')):
     if not any(fnmatch.fnmatch(source.name, pattern) for pattern in excluded):
@@ -125,6 +138,7 @@ record = {
     'spark_version': '4.2.1',
     'method': 'Official Spark 4.2.1 Ivy resolver and local[1] Pi completed with exit zero',
     'requested_packages': os.environ['D2C_EXTRA_PACKAGES'].split(','),
+    'pinned_maven_artifacts': ['org.apache.zookeeper:zookeeper:3.9.7', 'org.apache.zookeeper:zookeeper-jute:3.9.7'],
     'artifact_sha256': {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in jars},
     'excluded_replaced_artifacts': ['hadoop-client-api', 'hadoop-client-runtime', 'spark-core_2.13', 'spark-network-common_2.13',
                                     'curator-client', 'curator-framework', 'curator-recipes'],
@@ -170,7 +184,10 @@ COPY scripts/lakehouse_artifacts.py scripts/container_security_guard.py /recipe-
 # ZooKeeper role. Remove those unused distribution components and the older
 # direct Netty/LZ4 libraries before adding patched runtime dependencies.
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends --only-upgrade libssl3 openssl \
+    && apt-get install --yes --no-install-recommends --only-upgrade apt libapt-pkg6.0 libssl3 openssl \
+    && for package in apt libapt-pkg6.0; do \
+        dpkg --compare-versions "$(dpkg-query -W -f='${Version}' "$package")" ge 2.4.15ubuntu0.1 || exit 1; \
+    done \
     # Native compilation belongs in build stages. Keep runtime libraries, Python,
     # and the JVM; do not auto-remove libraries that Spark/JNI may load.
     && apt-get purge --yes \

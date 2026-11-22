@@ -238,6 +238,8 @@ public class VerifyHadoopLocalProfile {
     Class<?> transaction = Class.forName(curator + "framework.api.transaction.CuratorTransactionResult");
     Class<?> operation = Class.forName(curator + "framework.api.transaction.OperationType");
     Class<?> stat = Class.forName("org.apache.zookeeper.data.Stat");
+    requireOrigin(Class.forName("org.apache.zookeeper.ZooKeeper"), "zookeeper-3.9.7.jar");
+    requireOrigin(stat, "zookeeper-jute-3.9.7.jar");
     requireOrigin(transaction, "curator-framework-5.9.0-d2c-guava33.7.2-jre.jar");
     requireOrigin(operation, "curator-framework-5.9.0-d2c-guava33.7.2-jre.jar");
     Method ofTypeAndPath = transaction.getMethod("ofTypeAndPath", operation, String.class);
