@@ -50,6 +50,7 @@ RUN apt-get update \
 
 COPY --from=dependency-resolver /opt/spark/extra-jars/ /opt/spark/jars/
 COPY --chown=spark:root d2c_contract.py /opt/d2c-lakehouse/d2c_contract.py
+COPY --chown=spark:root raffle_contract.py /opt/d2c-lakehouse/raffle_contract.py
 COPY --chown=spark:root lakehouse /opt/d2c-lakehouse/lakehouse
 
 RUN mkdir --parents /warehouse /checkpoints \
