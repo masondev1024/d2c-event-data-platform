@@ -87,6 +87,38 @@ jobs:
       - name: Enforce local-only docs policy
         run: test -z "$(git ls-files -- docs)"
 
+      - name: Reproduce the 10k raffle recovery against the built Spark image
+        timeout-minutes: 25
+        env:
+          RAFFLE_SPARK_IMAGE: d2c-iceberg-stream:${{ github.sha }}
+        run: |
+          set -euo pipefail
+          work=$(mktemp -d "$RUNNER_TEMP/raffle-check.XXXXXX")
+          if [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            git clone --quiet --depth 1 --branch main "https://github.com/$GITHUB_REPOSITORY.git" "$work/data"
+            git -C "$work/data" fetch --quiet --depth 1 origin "$GITHUB_SHA"
+            git -C "$work/data" switch --quiet --detach "$GITHUB_SHA"
+            cd "$work/data"
+          fi
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git clone --quiet https://github.com/masondev1024/aws-data-platform-gitops.git "$work/raffle-writer"
+          git -C "$work/raffle-writer" switch --quiet --detach da4cd00539bcf5c5fc49f81724e788007567ace6
+          python3 scripts/verify_raffle_recovery.py --writer "$work/raffle-writer" --evidence "$work/result.json"
+          python3 - "$work/result.json" <<'PYTHON'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as evidence:
+              result = json.load(evidence)
+          for stage in ("before", "after_first", "after_retry"):
+              row = result["iceberg"][stage]
+              print(stage, "entries", row["fact_count"], "missing", row["missing_entry_ids"],
+                    "mismatched_windows", row["mismatched_windows"])
+          print("same_snapshot_on_retry",
+                result["iceberg"]["after_first"]["snapshot_id"] == result["iceberg"]["after_retry"]["snapshot_id"])
+          print("teardown_verified", result["teardown_verified"])
+          PYTHON
+
       - name: Render Kubernetes manifests
         run: |
           kubectl kustomize k8s/d2c/base >/tmp/d2c-base.yaml
