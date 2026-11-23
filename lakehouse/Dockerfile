@@ -245,6 +245,7 @@ RUN --mount=type=bind,from=selected-artifacts,target=/tmp/d2c-artifacts,ro \
     && cd /tmp/d2c-artifacts \
     && find . -type f ! -name '*.jar' -exec cp --parents '{}' /usr/share/d2c-security/artifacts/ ';'
 COPY --chown=spark:root d2c_contract.py /opt/d2c-lakehouse/d2c_contract.py
+COPY --chown=spark:root raffle_contract.py /opt/d2c-lakehouse/raffle_contract.py
 COPY --chown=spark:root lakehouse /opt/d2c-lakehouse/lakehouse
 
 RUN mkdir --parents /warehouse /checkpoints \

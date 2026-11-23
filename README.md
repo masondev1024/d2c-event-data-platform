@@ -1,13 +1,65 @@
 # D2C Event Data Platform
 
-센서 로그 수집 실습에서 출발해, D2C 응모 승인 도메인의 데이터 정합성과 배포 안전성을
-검증하는 Kafka 기반 Data Platform PoC입니다. 핵심 증거는 Kafka를 붙였다는 사실이 아니라
-`승인 → 같은 DB 트랜잭션의 outbox → Kafka → 운영·분석 sink` 경계와 이를 실제 release gate로
-사용하는 운영 신호입니다. 분석 경계는 Spark Structured Streaming과 Apache Iceberg로 구현하되,
-전달 의미를 exactly-once라고 과장하지 않고 at-least-once source + sink idempotency로 명시합니다.
+행사 담당자가 보는 상품별 응모 수를 어디까지 믿을 수 있을까? BI 업무에서 보고서 숫자가 어긋나면 SQL로 원천부터 대조했습니다. 이 프로젝트에서는 그 확인을 응모 데이터의 복구 절차에 넣었습니다. 응모 API가 접수한 내역을 기준으로 삼아, Kafka에서 같은 이벤트가 다시 들어오거나 일부 구간의 적재가 빠져도 어떤 상품의 숫자가 얼마나 달라졌는지 검사합니다.
 
-이 README가 프로젝트의 실행·설계·운영 문서의 canonical source입니다. 상세 설계 메모와
-일회성 검증 원본은 `docs/`에 로컬로 보관하지만 Git에는 포함하지 않습니다.
+## 응모 1만 건 중 빠진 1,500건 복구하기
+
+팀 프로젝트에서 출발한 응모 API를 원천으로 사용하고, 개인 후속 작업으로 Kafka 재발행과 Iceberg 구간 복구를 구현했습니다. **2026년 11월 22일 새 체크아웃에서 빠진 응모 1,500건을 복구했고, 같은 구간을 다시 읽어도 1만 건이 유지됐습니다.**
+
+| MySQL 원천과 대조한 항목 | 복구 전 | 구간 복구 후 | 같은 구간 재실행 후 |
+| --- | ---: | ---: | ---: |
+| Iceberg에 저장된 고유 응모 | 8,500건 | 10,000건 | 10,000건 |
+| 누락된 응모 ID | 1,500건 | 0건 | 0건 |
+| 원천과 건수가 다른 상품별 5분 집계 | 100개 | 0개 | 0개 |
+| 대상 구간 밖의 행 추가 / 삭제 | 기준 8,500건 | 0 / 0 | 0 / 0 |
+| Iceberg 사실 테이블 스냅샷 | 복구 전 기준 | 새 스냅샷 | 직전 ID 유지 |
+
+100개의 테스트 계정으로 100개 상품에 실제 응모 API를 호출했습니다. MySQL에 응모와 outbox 이벤트가 각각 1만 건 기록된 것을 확인한 뒤, Kafka가 이벤트 수신을 확인해 준 직후 MySQL에 발행 완료를 쓰기 전에 발행 프로세스를 강제 종료했습니다. 재시작하자 **한 응모가 서로 다른 두 Kafka 위치에서** 읽혔습니다. 여기에 지연과 재전송을 섞고, 적재할 때 중간 구간을 의도적으로 건너뛰어 복구 전 상태를 만들었습니다.
+
+**왜 구간을 정해서 다시 읽었나.** Kafka 위치는 다시 읽을 범위를 정하는 데 유용하지만 응모 한 건을 식별해 주지는 않습니다. 그래서 파티션별 시작·끝 위치를 고정하고, 그 안의 물리 레코드 2,501건을 원천 응모 ID와 이벤트 ID로 대조했습니다. Spark는 같은 이벤트를 한 번만 쓰고, 같은 ID의 내용이 다르면 처리를 중단합니다. 이 방식은 Kafka에 대상 구간이 남아 있고 그 경계를 알고 있을 때 쓸 수 있습니다. [구간 검증](lakehouse/raffle_recovery.py) · [Iceberg 기록 조건](lakehouse/raffle_iceberg.py)
+
+**운영에서의 쓰임새.** 행사 리포트를 다시 배포할 때는 전체 응모 수만 맞아도 상품끼리 오차가 상쇄될 수 있습니다. 그래서 상품별·UTC 5분별 건수가 MySQL과 같고, 복구 범위 밖의 정상 행까지 보존됐을 때 복구를 마치도록 했습니다. 다음 담당자도 같은 구간을 재실행하고 같은 기준으로 결과를 판단할 수 있습니다.
+
+검증 환경은 로컬 Kafka 브로커 1대(파티션 3개), MySQL 1대, Iceberg에 쓰는 Spark 작업 1개입니다. 이번에는 원천 1만 건을 전수 대조했습니다. 실서비스에 적용할 때는 Kafka 보존 기간 안에 복구할 수 있는지, 전체 원천을 읽는 대사가 운영 DB에 어느 정도 부하를 주는지도 확인해야 합니다.
+
+<details>
+<summary>새 체크아웃에서 재현하기</summary>
+
+이 README와 [검증기](scripts/verify_raffle_recovery.py)가 들어 있는 데이터 저장소의 루트에서 시작합니다. Git, Python 3.10 이상, Make, 추가 빌드 컨텍스트를 지원하는 Docker Compose가 필요합니다. 처음 실행하면 이미지와 Spark 의존성을 다운로드합니다.
+
+위 표는 응모 API 커밋 `da4cd00`, 데이터 저장소 기준 커밋 `6352782`에 검증 소스를 적용한 새 작업 디렉터리에서 얻었습니다. ARM64 Spark 의존성 이미지를 재사용했고, 실행한 Python 코드는 새 체크아웃에서 마운트했습니다. 이번에는 응모 시각이 한 5분 창에 들어가 상품별 집계가 100개였습니다. 실행 시각에 따라 비교할 창의 수가 달라져도 복구 뒤 불일치는 0개여야 합니다.
+
+```bash
+# 새 체크아웃 옆에 응모 API를 준비합니다.
+git clone https://github.com/masondev1024/aws-data-platform-gitops.git ../raffle-writer
+git -C ../raffle-writer switch --detach da4cd00539bcf5c5fc49f81724e788007567ace6
+
+# Apple Silicon에서는 먼저 export DOCKER_DEFAULT_PLATFORM=linux/arm64 를 실행합니다.
+# 같은 Dockerfile로 만든 이미지가 있으면 RAFFLE_SPARK_IMAGE에 그 태그를 지정할 수 있습니다.
+if [ -z "${RAFFLE_SPARK_IMAGE:-}" ]; then make lakehouse-image; fi
+mkdir -p docs/experiments
+run_dir=$(mktemp -d docs/experiments/raffle-10k.XXXXXX)
+python3 scripts/verify_raffle_recovery.py --writer ../raffle-writer --evidence "$run_dir/result.json"
+```
+
+검증기는 매번 새 MySQL·Kafka와 빈 Iceberg 테이블로 시작합니다. 원천과의 대조, 재실행 후 스냅샷 비교, 실험 전용 컨테이너·네트워크·볼륨 정리가 끝나야 결과 파일을 씁니다. 아래 명령으로 이번 실행의 결과표를 확인할 수 있습니다. 원본은 Git에서 제외한 로컬 경로에 저장됩니다.
+
+```bash
+python3 - "$run_dir/result.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as evidence:
+    stages = json.load(evidence)["iceberg"]
+print("단계         응모 수  누락 응모  불일치 집계")
+for stage in ("before", "after_first", "after_retry"):
+    row = stages[stage]
+    print(stage, row["fact_count"], row["missing_entry_ids"], row["mismatched_windows"])
+print("재시도 후 같은 스냅샷:", stages["after_first"]["snapshot_id"] == stages["after_retry"]["snapshot_id"])
+PY
+```
+
+</details>
 
 ## 구현 내용과 검증 기록
 
