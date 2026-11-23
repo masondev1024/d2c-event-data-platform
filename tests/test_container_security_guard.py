@@ -28,9 +28,59 @@ class GuardTests(unittest.TestCase):
         values = dict(kind="test", evidence_dir=str(self.root / "evidence"), storage_path=[str(self.root)],
                       reserve_free_gib=6, minimum_free_gib=8, timeout_seconds=20,
                       command=[sys.executable, "-c", "print('isolated guard test')"],
-                      container_name=None, owner_token=None, build_state_dir=str(self.root / "builder"))
+                      container_name=None, owner_token=None, scala_source=None, build_state_dir=str(self.root / "builder"))
         values.update(overrides)
         return argparse.Namespace(**values)
+
+    def test_iceberg_memory_probe_reads_container_ancestor_and_private_namespace_root(self):
+        mount = self.root / "cgroup"
+        cid = "f" * 64
+        scope = mount / "system.slice" / ("docker-" + cid + ".scope")
+        scope.mkdir(parents=True)
+        membership = self.root / "membership"
+        for directory, relative, mode in ((scope, "/system.slice/docker-" + cid + ".scope/init", "host"),
+                                           (mount, "/init", "private")):
+            for name, value in {"memory.max": "4096", "memory.current": "1800", "memory.peak": "2100",
+                                "memory.swap.current": "0", "memory.stat": "anon 1200\nfile 400\n",
+                                "memory.events": "oom 2\noom_kill 1\n"}.items():
+                (directory / name).write_text(value)
+            membership.write_text("0::" + relative + "\n")
+            cmd = ["sh", str(guard.MEMORY_PROBE), str(mount), str(membership), cid, "4096", mode]
+            actual = subprocess.check_output(cmd, text=True)
+            self.assertEqual(dict(row.split() for row in actual.splitlines()), {
+                "current_bytes": "1800", "anon_bytes": "1200", "file_bytes": "400",
+                "peak_bytes": "2100", "swap_bytes": "0", "oom": "2", "oom_kill": "1"})
+        # A matching numeric limit alone cannot identify a foreign host cgroup.
+        for limit, mode in [("4096", "host"), ("9999", "private")]:
+            self.assertNotEqual(subprocess.run(cmd[:-2] + [limit, mode], capture_output=True).returncode, 0)
+
+    def test_ci_rejects_missing_builder_memory_evidence(self):
+        instance = guard.Guard(self.args())
+        instance.env["GITHUB_ACTIONS"] = "true"
+        instance.state["builder"] = {}
+        instance.memory_probe = ["exec", "owned-cid"]
+        with patch.object(guard, "available", return_value=50 * guard.GIB), \
+                patch.object(instance, "docker", return_value=subprocess.CompletedProcess([], 0, "oom 0", "")):
+            with self.assertRaisesRegex(guard.GuardError, "requires builder memory"):
+                instance.sample()
+        self.assertIn("incomplete", instance.state["builder"]["memory_probe_error"])
+
+    def test_builder_profiles_enforce_the_configured_limit(self):
+        for role, mib in ((None, 2500), ("iceberg", 4096), ("spark", 8192)):
+            with self.subTest(role=role):
+                folder = self.root / str(mib)
+                instance = guard.Guard(self.args(kind="build", scala_source=role,
+                    evidence_dir=str(folder / "evidence"), build_state_dir=str(folder / "builder"),
+                    command=["docker", "build", "."]))
+                data = {"Id": "a" * 64, "HostConfig": {"Memory": mib * 2**20, "CgroupnsMode": "private"}, "State": {"Pid": 1, "Running": False}}
+                with patch.object(instance, "sample"), patch.object(instance, "run", return_value=0) as run, \
+                        patch.object(instance, "inspect_owned", return_value=data):
+                    instance.prepare_build()
+                    self.assertIn(f"memory={mib}m", run.call_args_list[0].args[1])
+                    self.assertEqual(instance.state["builder"]["memory_limit_bytes"], mib * 2**20)
+                    data["HostConfig"]["Memory"] = 0
+                    with self.assertRaisesRegex(guard.GuardError, "memory limit"):
+                        instance.prepare_build()
 
     def test_admission_never_starts_child(self):
         instance = guard.Guard(self.args())

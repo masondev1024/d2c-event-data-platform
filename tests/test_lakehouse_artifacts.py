@@ -403,6 +403,11 @@ class PhasedBuildPlanTest(ArtifactFixture):
             expected_target = "dependency-artifacts" if role == "dependencies" else role + "-artifacts"
             self.assertEqual(command[command.index("--target") + 1], expected_target)
             self.assertEqual("--build-context" in command, role == "iceberg")
+            guard_flags = command[:command.index("--")]
+            if role in ("iceberg", "spark"):
+                self.assertEqual(guard_flags[guard_flags.index("--scala-source") + 1], role)
+            else:
+                self.assertNotIn("--scala-source", guard_flags)
             self.assertNotIn("--push", command)
 
     def test_remote_docker_context_cannot_be_hidden_by_local_docker_host(self) -> None:

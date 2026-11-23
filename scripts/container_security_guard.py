@@ -81,6 +81,10 @@ def build_arguments(command: list[str], builder: str) -> tuple[list[str], list[P
     return ["docker", "buildx", "build", "--builder", builder, *([] if explicit_output or "--load" in args else ["--load"]), *args], outputs
 
 
+SCALA_SOURCE_MEMORY_MIB = {"iceberg": 4096, "spark": 8192}
+MEMORY_PROBE = Path(__file__).resolve().parents[1] / "container-build/lakehouse/sample-builder-memory.sh"
+
+
 class Guard:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -101,6 +105,7 @@ class Guard:
         self.status_file: Path | None = None
         self.builder_container: str | None = None
         self.builder_token: str | None = None
+        self.memory_probe: list[str] | None = None
         self.container_dispatched = False
         self.process_groups: list[int] = []
         self.cleaning = False
@@ -113,7 +118,23 @@ class Guard:
         values = {str(p): available(nearest_existing(p)) for p in self.paths}
         lowest = min(values.values())
         self.state["min_free_bytes"] = min(self.state["min_free_bytes"] or lowest, lowest)
-        self.state["samples"].append({"elapsed": round(time.monotonic() - self.started, 3), "free_bytes": values})
+        sample = {"elapsed": round(time.monotonic() - self.started, 3), "free_bytes": values}
+        self.state["samples"].append(sample)
+        if self.memory_probe is not None:
+            try:
+                result = self.docker(*self.memory_probe, timeout=5)
+                if result.returncode:
+                    raise ValueError(result.stderr.strip()[:300] or "cgroup probe failed")
+                metrics = {key: int(value) for key, value in
+                           (line.split() for line in result.stdout.splitlines())}
+                if not {"current_bytes", "anon_bytes", "file_bytes", "oom", "oom_kill"} <= metrics.keys():
+                    raise ValueError("incomplete builder memory counters")
+                sample["builder_memory"] = {**metrics, "unix_ms": time.time_ns() // 1_000_000}
+            except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+                self.state["builder"]["memory_probe_error"] = str(exc)
+                self.memory_probe = None
+                if self.env.get("GITHUB_ACTIONS") == "true":
+                    raise GuardError("Scala source CI requires builder memory evidence") from exc
         minimum = self.state["minimum_bytes"] if admission else self.state["reserve_bytes"]
         if lowest < minimum:
             raise GuardError("storage admission failed" if admission else "storage reserve reached", 75 if admission else 70)
@@ -234,6 +255,8 @@ class Guard:
             self.state["cleanup_errors"].append("owned container: " + str(exc))
 
     def prepare_build(self) -> list[str]:
+        # Gradle/Maven and their forked Scala compilers share the component cgroup.
+        memory_mib = SCALA_SOURCE_MEMORY_MIB.get(self.args.scala_source, 2500)
         folder = Path(self.args.build_state_dir).resolve()
         folder.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.env["BUILDX_CONFIG"] = str(folder / "buildx")
@@ -264,7 +287,7 @@ class Guard:
             if self.run("builder-create", ["docker", "buildx", "create", "--name", name,
                     "--driver", "docker-container", "--buildkitd-config", str(config),
                     "--driver-opt", "env.D2C_SECURITY_OWNER=" + token,
-                    "--driver-opt", "memory=2500m", "--driver-opt", "cpu-period=100000",
+                    "--driver-opt", f"memory={memory_mib}m", "--driver-opt", "cpu-period=100000",
                     "--driver-opt", "cpu-quota=200000", "--driver-opt", "restart-policy=no"]) != 0:
                 raise GuardError("private builder creation failed")
         command, outputs = build_arguments(self.args.command, name)
@@ -275,6 +298,14 @@ class Guard:
         data = self.inspect_owned(self.builder_container, token, allow_absent=False)
         self.state["builder"] = {"name": name, "container_id": data["Id"], "max_parallelism": 1,
                                  "cache": "retained; no prune or volume deletion"}
+        limit = data["HostConfig"]["Memory"]
+        if limit != memory_mib * 2**20:
+            raise GuardError("private builder memory limit differs from the requested build profile")
+        self.state["builder"]["memory_limit_bytes"] = limit
+        if self.args.scala_source:
+            self.memory_probe = ["exec", data["Id"], "sh", "-ec", MEMORY_PROBE.read_text(),
+                                 "builder-memory", "/sys/fs/cgroup", "/proc/self/cgroup", data["Id"],
+                                 str(limit), data["HostConfig"]["CgroupnsMode"]]
         return command
 
     def execute(self) -> int:
@@ -329,6 +360,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout-seconds", type=float)
     parser.add_argument("--storage-path", action="append", default=[])
     parser.add_argument("--evidence-dir", required=True)
+    parser.add_argument("--scala-source", choices=tuple(SCALA_SOURCE_MEMORY_MIB),
+                        help="apply the component compiler budget and collect builder memory counters")
     parser.add_argument("--build-state-dir", default=str(Path(tempfile.gettempdir()) / f"d2c-security-build-{os.getuid()}"))
     parser.add_argument("--container-name")
     parser.add_argument("--owner-token")
@@ -339,6 +372,8 @@ def main(argv: list[str] | None = None) -> int:
     args.timeout_seconds = DEFAULTS[args.kind][1] if args.timeout_seconds is None else args.timeout_seconds
     if not args.command or bool(args.container_name) != bool(args.owner_token):
         parser.error("command required; container-name and owner-token must be supplied together")
+    if args.scala_source and args.kind != "build":
+        parser.error("--scala-source requires --kind build")
     numbers = (args.minimum_free_gib, args.reserve_free_gib, args.timeout_seconds)
     if not all(math.isfinite(v) and v > 0 for v in numbers) or args.minimum_free_gib <= args.reserve_free_gib:
         parser.error("positive finite limits and minimum > reserve are required")
