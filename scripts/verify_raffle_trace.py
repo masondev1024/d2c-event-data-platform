@@ -54,7 +54,10 @@ class TraceStack:
         run = subprocess.run(command, env=self.env, cwd=ROOT, input=stdin, text=True,
                              capture_output=True, timeout=timeout)
         if run.returncode:
-            logs = (run.stdout + "\n" + run.stderr)[-6000:]
+            output = run.stdout + "\n" + run.stderr
+            causes = [line for line in output.splitlines() if re.search(
+                r"Caused by:|Exception:|Error:|AccessDenied|ClassNotFound|NoClassDefFound", line)]
+            logs = "\n".join(dict.fromkeys(causes))[:5000] + "\n" + output[-6000:]
             for name in ("ROOT_PASSWORD", "DB_PASSWORD", "RELAY_PASSWORD", "SESSION_SECRET"):
                 logs = logs.replace(self.env["RAFFLE_" + name], "[redacted]")
             raise RuntimeError(f"compose {args[0]} failed ({run.returncode})\n{logs}")
