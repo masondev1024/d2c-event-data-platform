@@ -81,7 +81,8 @@ def build_arguments(command: list[str], builder: str) -> tuple[list[str], list[P
     return ["docker", "buildx", "build", "--builder", builder, *([] if explicit_output or "--load" in args else ["--load"]), *args], outputs
 
 
-MEMORY_PROBE = Path(__file__).resolve().parents[1] / "container-build/lakehouse/iceberg/sample-builder-memory.sh"
+SCALA_SOURCE_MEMORY_MIB = {"iceberg": 4096, "spark": 8192}
+MEMORY_PROBE = Path(__file__).resolve().parents[1] / "container-build/lakehouse/sample-builder-memory.sh"
 
 
 class Guard:
@@ -133,7 +134,7 @@ class Guard:
                 self.state["builder"]["memory_probe_error"] = str(exc)
                 self.memory_probe = None
                 if self.env.get("GITHUB_ACTIONS") == "true":
-                    raise GuardError("Iceberg CI requires builder memory evidence") from exc
+                    raise GuardError("Scala source CI requires builder memory evidence") from exc
         minimum = self.state["minimum_bytes"] if admission else self.state["reserve_bytes"]
         if lowest < minimum:
             raise GuardError("storage admission failed" if admission else "storage reserve reached", 75 if admission else 70)
@@ -254,8 +255,8 @@ class Guard:
             self.state["cleanup_errors"].append("owned container: " + str(exc))
 
     def prepare_build(self) -> list[str]:
-        # The Gradle daemon and forked Scala compiler share a single BuildKit cgroup.
-        memory_mib = 4096 if self.args.iceberg_source_build else 2500
+        # Gradle/Maven and their forked Scala compilers share the component cgroup.
+        memory_mib = SCALA_SOURCE_MEMORY_MIB.get(self.args.scala_source, 2500)
         folder = Path(self.args.build_state_dir).resolve()
         folder.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.env["BUILDX_CONFIG"] = str(folder / "buildx")
@@ -301,7 +302,7 @@ class Guard:
         if limit != memory_mib * 2**20:
             raise GuardError("private builder memory limit differs from the requested build profile")
         self.state["builder"]["memory_limit_bytes"] = limit
-        if self.args.iceberg_source_build:
+        if self.args.scala_source:
             self.memory_probe = ["exec", data["Id"], "sh", "-ec", MEMORY_PROBE.read_text(),
                                  "builder-memory", "/sys/fs/cgroup", "/proc/self/cgroup", data["Id"],
                                  str(limit), data["HostConfig"]["CgroupnsMode"]]
@@ -359,8 +360,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout-seconds", type=float)
     parser.add_argument("--storage-path", action="append", default=[])
     parser.add_argument("--evidence-dir", required=True)
-    parser.add_argument("--iceberg-source-build", action="store_true",
-                        help="use the 4 GiB Iceberg source builder and record its Linux memory counters")
+    parser.add_argument("--scala-source", choices=tuple(SCALA_SOURCE_MEMORY_MIB),
+                        help="apply the component compiler budget and collect builder memory counters")
     parser.add_argument("--build-state-dir", default=str(Path(tempfile.gettempdir()) / f"d2c-security-build-{os.getuid()}"))
     parser.add_argument("--container-name")
     parser.add_argument("--owner-token")
@@ -371,8 +372,8 @@ def main(argv: list[str] | None = None) -> int:
     args.timeout_seconds = DEFAULTS[args.kind][1] if args.timeout_seconds is None else args.timeout_seconds
     if not args.command or bool(args.container_name) != bool(args.owner_token):
         parser.error("command required; container-name and owner-token must be supplied together")
-    if args.iceberg_source_build and args.kind != "build":
-        parser.error("--iceberg-source-build requires --kind build")
+    if args.scala_source and args.kind != "build":
+        parser.error("--scala-source requires --kind build")
     numbers = (args.minimum_free_gib, args.reserve_free_gib, args.timeout_seconds)
     if not all(math.isfinite(v) and v > 0 for v in numbers) or args.minimum_free_gib <= args.reserve_free_gib:
         parser.error("positive finite limits and minimum > reserve are required")

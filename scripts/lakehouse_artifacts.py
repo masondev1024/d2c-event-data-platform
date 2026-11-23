@@ -462,8 +462,8 @@ def guard_command(source_root: Path, role: str, output: Path, evidence: Path, st
                "--kind", "build", "--minimum-free-gib", "16", "--reserve-free-gib", "6",
                "--timeout-seconds", "3600", "--storage-path", str(storage),
                "--evidence-dir", str(evidence), "--build-state-dir", str(state)]
-    if role == "iceberg":
-        command.append("--iceberg-source-build")
+    if role in ("iceberg", "spark"):
+        command.extend(["--scala-source", role])
     command += ["--", "docker", "build", "--platform", native, "--file", "lakehouse/Dockerfile",
                 "--target", TARGETS[role], "--output", "type=local,dest=" + str(output)]
     if role == "iceberg":

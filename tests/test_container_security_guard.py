@@ -28,7 +28,7 @@ class GuardTests(unittest.TestCase):
         values = dict(kind="test", evidence_dir=str(self.root / "evidence"), storage_path=[str(self.root)],
                       reserve_free_gib=6, minimum_free_gib=8, timeout_seconds=20,
                       command=[sys.executable, "-c", "print('isolated guard test')"],
-                      container_name=None, owner_token=None, iceberg_source_build=False, build_state_dir=str(self.root / "builder"))
+                      container_name=None, owner_token=None, scala_source=None, build_state_dir=str(self.root / "builder"))
         values.update(overrides)
         return argparse.Namespace(**values)
 
@@ -66,10 +66,10 @@ class GuardTests(unittest.TestCase):
         self.assertIn("incomplete", instance.state["builder"]["memory_probe_error"])
 
     def test_builder_profiles_enforce_the_configured_limit(self):
-        for iceberg, mib in ((False, 2500), (True, 4096)):
-            with self.subTest(iceberg=iceberg):
+        for role, mib in ((None, 2500), ("iceberg", 4096), ("spark", 8192)):
+            with self.subTest(role=role):
                 folder = self.root / str(mib)
-                instance = guard.Guard(self.args(kind="build", iceberg_source_build=iceberg,
+                instance = guard.Guard(self.args(kind="build", scala_source=role,
                     evidence_dir=str(folder / "evidence"), build_state_dir=str(folder / "builder"),
                     command=["docker", "build", "."]))
                 data = {"Id": "a" * 64, "HostConfig": {"Memory": mib * 2**20, "CgroupnsMode": "private"}, "State": {"Pid": 1, "Running": False}}
