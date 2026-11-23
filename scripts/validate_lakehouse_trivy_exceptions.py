@@ -79,8 +79,8 @@ def validate_policy(
         raise PolicyError("policy may contain only the vulnerabilities section")
 
     entries = document["vulnerabilities"]
-    if not isinstance(entries, Sequence) or isinstance(entries, (str, bytes)) or not entries:
-        raise PolicyError("vulnerabilities must be a non-empty list")
+    if not isinstance(entries, list):
+        raise PolicyError("vulnerabilities must be a list")
 
     seen: set[tuple[str, str]] = set()
     validated: list[Mapping[str, object]] = []
@@ -137,6 +137,13 @@ def main() -> int:
     except PolicyError as error:
         print(f"lakehouse Trivy exception policy rejected: {error}", file=sys.stderr)
         return 1
+
+    if not entries:
+        print(
+            "lakehouse Trivy exception policy valid: "
+            "0 findings, 0 exact paths, no active exceptions"
+        )
+        return 0
 
     earliest_expiry = min(_expiration(entry["expired_at"], "expired_at") for entry in entries)
     print(

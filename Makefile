@@ -37,7 +37,21 @@ lakehouse-security-check:
 		--policy security/lakehouse.trivyignore.yaml
 
 lakehouse-image:
-	docker build --file lakehouse/Dockerfile --tag d2c-iceberg-stream:local .
+	# Set D2C_DOCKER_STORAGE_PATH to monitor Docker's backing filesystem too.
+	$(PYTHON) -c 'import hashlib, os, sys, tempfile, uuid; from pathlib import Path; \
+		root = Path.cwd().resolve(); temporary = Path(tempfile.gettempdir()).resolve(); \
+		private = (temporary / ("d2c-container-security-" + hashlib.sha256(os.fsencode(root)).hexdigest()[:24])).resolve(); \
+		state = (private / "build-state").resolve(); evidence = (private / "evidence" / uuid.uuid4().hex).resolve(); \
+		any(path.is_relative_to(root) for path in (private, state, evidence)) and sys.exit("temporary build state must be outside the build context"); \
+		arguments = [sys.executable, str(root / "scripts/container_security_guard.py"), \
+			"--kind", "build", "--minimum-free-gib", "20", "--reserve-free-gib", "6", \
+			"--timeout-seconds", "1800", "--build-state-dir", str(state), \
+			"--evidence-dir", str(evidence), \
+			"--storage-path", str(root), "--storage-path", str(temporary)]; \
+		extra = os.environ.get("D2C_DOCKER_STORAGE_PATH"); \
+		arguments += ["--storage-path", extra] if extra else []; \
+		os.execv(sys.executable, arguments + ["--", "docker", "build", "--file", \
+			"lakehouse/Dockerfile", "--tag", "d2c-iceberg-stream:local", "."])'
 
 verify: test schema-check evidence-check d2c-contract-check catalog-check lakehouse-security-check
 	$(PYTHON) -m compileall -q app services scripts lakehouse d2c_contract.py log_gen.py
