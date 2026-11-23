@@ -61,6 +61,63 @@ PY
 
 </details>
 
+## 두 개의 5분 창을 MySQL과 Athena에서 대조하기
+
+행사 리포트의 `0`은 마감 후 응모가 없다는 뜻입니다. 집계 중인 상품은 확정 건수를 `NULL`로 표시합니다. 이 차이를 검증하려고 MySQL에 합성 응모 1만 건을 넣고, 첫 창에 속한 20건을 두 창의 마감이 끝난 뒤에 전달했습니다. MySQL은 상품 100개와 UTC 5분 창 2개를 먼저 조합해 정답표를 만들었습니다. Spark는 Kafka의 파티션별 종료 위치와 창별 마감 기준으로 집계한 뒤 S3의 Iceberg v2 테이블에 썼고, 별도 읽기 역할이 Athena에서 스냅샷을 지정해 200행을 대조했습니다. [MySQL 정답표](sql/raffle_athena_mysql/oracle.sql) · [Athena 검증 SQL](sql/raffle_athena_compare.sql)
+
+| Athena 조회 시점 | 첫 창 확정 응모 | 다음 창 확정 응모 | 정답표와 다른 상품·창 |
+| --- | ---: | ---: | ---: |
+| 첫 창 마감 | 4,980 | 집계 중 (`NULL`) | 0 |
+| 두 창 마감 | 4,980 | 5,000 | 0 |
+| 첫 창의 늦은 응모 20건 백필 | 5,000 | 5,000 | 0 |
+| 같은 백필 재실행 | 5,000 | 5,000 | 0 |
+| 백필 후 두 창 마감 당시의 스냅샷 재조회 | 4,980 | 5,000 | 0 |
+
+상품 100은 첫 조회에서 첫 창 `CLOSED / 0`, 다음 창 `OPEN / NULL`이었습니다. 백필로 바뀐 행은 첫 창의 상품 1과 99뿐이었고 각각 10건씩 늘었습니다. 같은 백필을 반복했을 때 바뀐 행과 추가 스냅샷은 모두 0개였습니다. 2026년 11월 23일 서울 리전에서 수행한 단일 writer 실험이며, 당시 로컬 Spark는 4.1.3, Iceberg는 1.11.0이었습니다.
+
+**비용과 정리.** 최종 검증 5회는 총 3,890바이트를 스캔했습니다. 진단 시도까지 합치면 7회·5,354바이트이며, 서울 리전 $5/TB와 쿼리당 최소 10MB를 적용한 **Athena 예상액은 약 $0.00035**입니다. S3·Glue를 포함한 최종 청구액은 별도로 측정하지 않았습니다. 실험 스택 4개는 모두 삭제했고 각 버킷, Glue 데이터베이스, Athena 워크그룹, IAM 역할 2개의 부재를 확인했습니다. [Athena 요금](https://aws.amazon.com/athena/pricing/)
+
+<details>
+<summary>로컬 또는 AWS에서 재현하기</summary>
+
+저장소 루트에서 Python 3.10 이상과 Docker Compose를 사용합니다. 아래는 공개된 linux/amd64 Spark 4.2.1·Iceberg 1.12.0 이미지를 사용하는 예입니다. ARM에서는 네이티브 환경에서 `make lakehouse-image`로 빌드한 후 `export RAFFLE_SPARK_IMAGE=d2c-iceberg-stream:local`로 지정할 수 있습니다.
+
+```bash
+export RAFFLE_SPARK_IMAGE=ghcr.io/masondev1024/d2c-event-data-platform-lakehouse@sha256:f98eb9dcc9fdf472ece91e542a5b6e520cd56afe4c13557e22699a19ab262c41
+docker pull --platform linux/amd64 "$RAFFLE_SPARK_IMAGE"
+mkdir -p docs/experiments
+run_dir=$(mktemp -d docs/experiments/raffle-windows.XXXXXX)
+python3 scripts/verify_raffle_athena.py --evidence-dir "$run_dir/local"
+```
+
+AWS까지 확인할 때는 위 셸에서 아래 명령을 이어서 실행합니다. AWS CLI v2에 등록한 SSO 프로필 이름을 입력합니다. 실험은 서울 리전에 전용 S3 버킷, Glue 데이터베이스, Athena 워크그룹, Spark 쓰기·Athena 읽기 IAM 역할을 생성합니다. 프로필에는 이 스택을 생성·삭제하고 실험 역할을 인수할 권한이 필요합니다. MySQL·Kafka·Spark는 로컬 Docker에서 실행합니다.
+
+```bash
+printf 'AWS SSO profile: '
+IFS= read -r AWS_PROFILE
+export AWS_PROFILE
+aws sso login --profile "$AWS_PROFILE"
+python3 -m venv "$run_dir/venv"
+"$run_dir/venv/bin/python" -m pip install 'boto3==1.42.97'
+iceberg_version=1.12.0
+jar="$run_dir/iceberg-aws-bundle-$iceberg_version.jar"
+curl -fsSL --retry 2 "https://repo.maven.apache.org/maven2/org/apache/iceberg/iceberg-aws-bundle/$iceberg_version/iceberg-aws-bundle-$iceberg_version.jar" -o "$jar"
+"$run_dir/venv/bin/python" scripts/verify_raffle_athena.py \
+  --aws-profile "$AWS_PROFILE" --aws-bundle "$jar" --evidence-dir "$run_dir/aws"
+```
+
+Spark 이미지와 AWS 번들의 Iceberg 버전 및 체크섬을 검증한 뒤 실행합니다. 마지막에는 백필 전 스냅샷까지 조회하고 실험 리소스를 정리합니다. 원본 결과와 정리 상태는 Git에서 제외한 `$run_dir/aws/`에 기록됩니다. 강제 중단으로 AWS 리소스가 남았다면 해당 실행의 Spark 작업을 중지한 뒤 같은 셸에서 아래 명령으로 정리를 재개합니다. [검증기](scripts/verify_raffle_athena.py) · [리소스 정리 코드](scripts/raffle_athena_cloud.py)
+
+```bash
+PYTHONPATH=scripts "$run_dir/venv/bin/python" - "$run_dir/aws/cloud-state.json" <<'PY'
+import sys
+from raffle_athena_cloud import CloudRun
+print(CloudRun.open(sys.argv[1]).cleanup())
+PY
+```
+
+</details>
+
 ## 구현 내용과 검증 기록
 
 승인 기록이 이벤트 전달과 소비자 저장까지 이어지는 경계는 다음 순서로 확인할 수 있습니다.
