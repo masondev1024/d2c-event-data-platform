@@ -1,0 +1,122 @@
+x-db-client: &db-client
+  DB_NAME: raffle_db
+  DB_WRITER_HOST: mysql
+  DB_READER_HOST: mysql
+  DB_APP_USER: raffle_writer
+  DB_APP_PASSWORD: ${RAFFLE_DB_PASSWORD:?set by trace runner}
+
+x-api: &api
+  image: ${COMPOSE_PROJECT_NAME}-runtime:local
+  command: ["python", "-m", "gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "app:app"]
+  ports: ["127.0.0.1::8080"]
+  healthcheck:
+    test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://localhost:8080/readyz', timeout=3)"]
+    interval: 3s
+    timeout: 5s
+    retries: 20
+
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${RAFFLE_ROOT_PASSWORD:?set by trace runner}
+      MYSQL_ROOT_HOST: "%"
+      MYSQL_DATABASE: raffle_db
+    command:
+      - --skip-log-bin
+      - --performance-schema=${RAFFLE_MYSQL_PERFORMANCE_SCHEMA:-OFF}
+      # The lock observer needs threads and data locks, with no long statement history.
+      - --performance-schema-events-statements-history-long-size=0
+      - --performance-schema-digests-size=256
+      - --innodb-buffer-pool-size=64M
+      - --innodb-redo-log-capacity=16M
+    tmpfs: ["/var/lib/mysql:size=384m"]
+    healthcheck:
+      test: ["CMD-SHELL", "MYSQL_PWD=\"$$MYSQL_ROOT_PASSWORD\" mysql --protocol=tcp -h 127.0.0.1 -uroot -Nse 'SELECT 1'"]
+      interval: 3s
+      timeout: 5s
+      retries: 35
+      start_period: 10s
+
+  kafka:
+    image: apache/kafka:3.7.0
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_HEAP_OPTS: -Xms128m -Xmx256m
+      KAFKA_LOG_DIRS: /tmp/raffle-kafka
+    tmpfs: ["/tmp/raffle-kafka:mode=1777,size=128m"]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 8s
+      retries: 20
+
+  migrate:
+    image: ${COMPOSE_PROJECT_NAME}-runtime:local
+    build:
+      context: .
+      dockerfile: scripts/raffle-trace.Dockerfile
+      additional_contexts:
+        gitops_writer: ${RAFFLE_GITOPS_ROOT:?set by trace runner}/app
+    environment:
+      <<: *db-client
+      DB_ADMIN_USER: root
+      DB_ADMIN_PASSWORD: ${RAFFLE_ROOT_PASSWORD:?set by trace runner}
+      DEPLOYMENT_TIER: development
+      SEED_SAMPLE_DATA: "true"
+    command: ["python", "migrate.py"]
+
+  api:
+    <<: *api
+    environment:
+      <<: *db-client
+      SECRET_KEY: ${RAFFLE_SESSION_SECRET:?set by trace runner}
+
+  api-failure:
+    <<: *api
+    environment:
+      <<: *db-client
+      SECRET_KEY: ${RAFFLE_SESSION_SECRET:?set by trace runner}
+      DEPLOYMENT_TIER: validation
+      ALLOW_FAILURE_DRILL: "true"
+      D2C_OUTBOX_FAILURE_INJECTION: before_outbox_insert
+
+  relay:
+    image: ${COMPOSE_PROJECT_NAME}-runtime:local
+    working_dir: /trace
+    volumes:
+      - ./app:/trace/app:ro
+      - ./raffle_contract.py:/trace/raffle_contract.py:ro
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_DATABASE: raffle_db
+      MYSQL_USER: raffle_relay
+      MYSQL_PASSWORD: ${RAFFLE_RELAY_PASSWORD:?set by trace runner}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    command: ["python", "-m", "app.raffle_outbox_relay"]
+
+  iceberg:
+    image: ${RAFFLE_SPARK_IMAGE:-d2c-iceberg-stream:local}
+    pull_policy: never
+    environment:
+      PYTHONPATH: /opt/d2c-lakehouse
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      D2C_LAKEHOUSE_WAREHOUSE: file:///warehouse
+    volumes:
+      - ./lakehouse:/opt/d2c-lakehouse/lakehouse:ro
+      - ./d2c_contract.py:/opt/d2c-lakehouse/d2c_contract.py:ro
+      - ./raffle_contract.py:/opt/d2c-lakehouse/raffle_contract.py:ro
+      - warehouse:/warehouse
+    command: ["/opt/spark/bin/spark-submit", "--master", "local[1]", "--driver-memory", "640m", "--conf", "spark.ui.enabled=false", "/opt/d2c-lakehouse/lakehouse/raffle_iceberg.py"]
+
+volumes:
+  warehouse:

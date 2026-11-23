@@ -16,17 +16,33 @@ REFERENCE_DATE = date(2026, 9, 23)
 
 
 class LakehouseTrivyExceptionPolicyTest(unittest.TestCase):
-    def test_checked_in_policy_is_short_lived_and_path_scoped(self) -> None:
-        entries = validate_policy(POLICY_PATH, today=REFERENCE_DATE)
+    def test_checked_in_policy_has_no_suppressions_even_after_old_expiry(self) -> None:
+        for day in (REFERENCE_DATE, date(2026, 10, 23), date(2026, 10, 24), date(2050, 1, 1)):
+            with self.subTest(today=day):
+                self.assertEqual(validate_policy(POLICY_PATH, today=day), ())
 
-        self.assertEqual(len(entries), 10)
-        self.assertEqual(
-            sum(len(entry["paths"]) for entry in entries),
-            17,
-        )
-        self.assertTrue(
-            all(entry["expired_at"] == date(2026, 10, 23) for entry in entries)
-        )
+    def test_nonempty_policy_still_rejects_on_expiration_day(self) -> None:
+        policy = {"vulnerabilities": [{
+            "id": "CVE-2026-1234",
+            "paths": ["opt/spark/jars/example-1.0.0.jar"],
+            "expired_at": "2026-10-23",
+            "statement": "This sentence is deliberately long enough to describe a risk and a replacement plan.",
+        }]}
+        with TemporaryDirectory() as directory:
+            policy_path = Path(directory) / "policy.yaml"
+            policy_path.write_text(yaml.safe_dump(policy), encoding="utf-8")
+            self.assertEqual(len(validate_policy(policy_path, today=date(2026, 10, 22))), 1)
+            for day in (date(2026, 10, 23), date(2026, 10, 24)):
+                with self.subTest(today=day), self.assertRaisesRegex(PolicyError, "must be after today"):
+                    validate_policy(policy_path, today=day)
+
+    def test_empty_policy_requires_a_real_list(self) -> None:
+        with TemporaryDirectory() as directory:
+            policy_path = Path(directory) / "policy.yaml"
+            for value in (None, "", {}, False, 0):
+                policy_path.write_text(yaml.safe_dump({"vulnerabilities": value}), encoding="utf-8")
+                with self.subTest(value=value), self.assertRaisesRegex(PolicyError, "must be a list"):
+                    validate_policy(policy_path, today=REFERENCE_DATE)
 
     def test_policy_rejects_an_expired_or_unscoped_exception(self) -> None:
         policy = {

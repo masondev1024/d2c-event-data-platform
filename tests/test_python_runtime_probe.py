@@ -1,0 +1,312 @@
+"""Offline checks for probe dispatch, HTTP deadlines and owned-child cleanup.
+
+These mocks establish control flow only. They never claim that an image's
+native libraries, actual HTTP server, database or Kafka connection passed.
+"""
+from contextlib import ExitStack, contextmanager, redirect_stdout
+import importlib.util
+import io
+import json
+from pathlib import Path
+import signal
+import stat
+from types import SimpleNamespace
+import unittest
+from unittest.mock import Mock, call, patch
+
+
+SPEC = importlib.util.spec_from_file_location("python_runtime_probe", Path(__file__).parents[1] / "scripts/check_python_runtime.py")
+probe = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(probe)
+
+
+class Child:
+    """Only this fake Popen child can be terminated by the test."""
+    def __init__(self, *, running=True, ignore_terminate=False):
+        self.running = running
+        self.ignore_terminate = ignore_terminate
+        self.terminated = 0
+        self.killed = 0
+        self.waits = []
+
+    def poll(self):
+        return None if self.running else 0
+
+    def terminate(self):
+        self.terminated += 1
+        if not self.ignore_terminate:
+            self.running = False
+
+    def kill(self):
+        self.killed += 1
+        self.running = False
+
+    def wait(self, *, timeout):
+        self.waits.append(timeout)
+        if self.running:
+            raise probe.subprocess.TimeoutExpired("owned fake child", timeout)
+        return 0
+
+
+def response(payload, *, status=200):
+    result = Mock()
+    result.__enter__ = Mock(return_value=result)
+    result.__exit__ = Mock(return_value=False)
+    result.status = status
+    result.read.return_value = json.dumps(payload).encode()
+    return result
+
+
+@contextmanager
+def mock_http(*, return_value=None, side_effect=None):
+    request = Mock(return_value=return_value, side_effect=side_effect)
+    with patch.object(probe.urllib.request, "build_opener", return_value=SimpleNamespace(open=request)):
+        yield request
+
+
+class RuntimeDispatchTest(unittest.TestCase):
+    def test_gunicorn_worker_directory_is_private_and_removed_after_child_cleanup(self):
+        application = Mock()
+        client = application.app.test_client.return_value.__enter__ = Mock()
+        application.app.test_client.return_value.__exit__ = Mock(return_value=False)
+        client.return_value.get.return_value.status_code = 200
+        client.return_value.get.return_value.get_json.return_value = {"status": "ok"}
+        temporary = []
+        def server(command, *_args, **_kwargs):
+            path = Path(command[command.index("--worker-tmp-dir") + 1])
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
+            temporary.append(path)
+            return {"owned_child_reaped": True}
+        with patch.object(probe, "import_versions", return_value={}), \
+             patch.object(probe, "native_psycopg_probe", return_value={"implementation": "c"}), \
+             patch.object(probe.importlib, "import_module", return_value=application), \
+             patch.object(probe, "local_port", return_value=8765), \
+             patch.object(probe, "server_probe", side_effect=server), patch.dict(probe.os.environ, {}):
+            result = probe.api_probe(100)
+        self.assertTrue(result["normal_gunicorn"]["owned_child_reaped"])
+        self.assertEqual(len(temporary), 1)
+        self.assertFalse(temporary[0].exists())
+
+    def test_libpq_known_fixed_branch_floors_reject_the_observed_binary_version(self):
+        for version, expected in ((170005, False), (170009, False), (170010, True),
+                                  (180003, False), (180004, True), (190000, False)):
+            with self.subTest(version=version):
+                self.assertEqual(probe.fixed_libpq(version), expected)
+
+    def test_native_c_provider_requires_system_libraries_and_libpq_ssl_dependencies(self):
+        native = SimpleNamespace(pq=SimpleNamespace(__impl__="c", version=lambda: 180004))
+        maps = "\n".join("1000-2000 r-xp 00000000 00:00 1 /usr/lib/" + name
+                         for name in ("libpq.so.5.18", "libssl.so.3", "libcrypto.so.3"))
+        library = Mock()
+        library.PQlibVersion.return_value = 180004
+        library.TLS_client_method.return_value = 1
+        library.OpenSSL_version.return_value = b"OpenSSL fixture dependency"
+        with patch.object(probe.importlib, "import_module", return_value=native), \
+             patch.object(probe.metadata, "version", side_effect=probe.metadata.PackageNotFoundError), \
+             patch.object(probe.Path, "read_text", return_value=maps), \
+             patch.object(probe.ctypes, "CDLL", return_value=library) as load:
+            result = probe.native_psycopg_probe()
+        self.assertEqual(result["implementation"], "c")
+        self.assertTrue(result["libpq_dependency_tls_method"])
+        self.assertTrue(result["binary_wheel_distribution_absent"])
+        load.assert_called_once_with("/usr/lib/libpq.so.5.18")
+
+    def test_binary_distribution_or_vendored_library_is_rejected(self):
+        native = SimpleNamespace(pq=SimpleNamespace(__impl__="c", version=lambda: 180004))
+        with patch.object(probe.importlib, "import_module", return_value=native), \
+             patch.object(probe.metadata, "version", return_value="3.2.10"):
+            with self.assertRaisesRegex(probe.ProbeError, "binary wheel"):
+                probe.native_psycopg_probe()
+        maps = "1000-2000 r-xp 00000000 00:00 1 /opt/venv/psycopg_binary.libs/libpq.so.5"
+        with patch.object(probe.importlib, "import_module", return_value=native), \
+             patch.object(probe.metadata, "version", side_effect=probe.metadata.PackageNotFoundError), \
+             patch.object(probe.Path, "read_text", return_value=maps), \
+             patch.object(probe.ctypes, "CDLL") as load:
+            with self.assertRaisesRegex(probe.ProbeError, "vendored"):
+                probe.native_psycopg_probe()
+        load.assert_not_called()
+
+    def test_database_driver_uses_parameters_commits_and_rolls_back_without_logging_values(self):
+        native = Mock()
+        connection = native.connect.return_value
+        connection.info.server_version = 160014
+        connection.cursor.return_value.__enter__ = Mock()
+        connection.cursor.return_value.__exit__ = Mock(return_value=False)
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchall.return_value = [(1, "검증-π-事务", {"message": "재현-λ", "value": 7})]
+        configuration = {"host": "database", "port": 5432, "dbname": "d2c_probe", "user": "d2c_probe", "password": "sensitive-memory-only-credential"}
+        json_types = SimpleNamespace(Jsonb=lambda value: value)
+        with patch.object(probe, "import_versions", return_value={}), \
+             patch.object(probe, "native_psycopg_probe", return_value={"implementation": "c"}), \
+             patch.object(probe.importlib, "import_module", side_effect=lambda name: json_types if name == "psycopg.types.json" else native), \
+             patch.object(probe.time, "monotonic", return_value=10):
+            result = probe.database_probe(configuration, 100)
+        self.assertEqual(result["database_roundtrip"]["server_version_num"], 160014)
+        self.assertTrue(result["database_roundtrip"]["unicode_jsonb_roundtrip"])
+        self.assertEqual(connection.commit.call_count, 2)
+        connection.rollback.assert_called_once()
+        connection.close.assert_called_once()
+        self.assertEqual(len(cursor.execute.call_args_list[1].args), 2)
+        self.assertNotIn(configuration["password"], json.dumps(result))
+
+    def test_each_role_dispatches_only_its_own_checks_and_restores_alarm(self):
+        for role in probe.ROLES:
+            with self.subTest(role=role), ExitStack() as stack:
+                identity = {"role": role, "uid": 10001, "python": "3.12.16", "openssl": "fixture only"}
+                stack.enter_context(patch.object(probe, "runtime_identity", return_value=identity))
+                stack.enter_context(patch.object(probe.time, "monotonic", return_value=100))
+                install = stack.enter_context(patch.object(probe.signal, "signal", return_value="previous-handler"))
+                timer = stack.enter_context(patch.object(probe.signal, "setitimer"))
+                workers = {name: stack.enter_context(patch.object(probe, name, return_value={"mock": name}))
+                           for name in ("worker_probe", "api_probe", "catalog_probe")}
+                result = probe.run(role)
+                selected = role + "_probe"
+                workers[selected].assert_called_once_with(*(() if role == "worker" else (145,)))
+                for name in workers.keys() - {selected}:
+                    workers[name].assert_not_called()
+                self.assertEqual(result["status"], "PASS")
+                self.assertIn("PostgreSQL", result["limits"])
+                self.assertIn("Kafka broker", result["limits"])
+                self.assertEqual(timer.call_args_list, [call(signal.ITIMER_REAL, 45), call(signal.ITIMER_REAL, 0)])
+                self.assertEqual(install.call_args_list[-1], call(signal.SIGALRM, "previous-handler"))
+
+    def test_failed_checks_still_restore_alarm(self):
+        with patch.object(probe, "runtime_identity", return_value={"role": "worker"}), \
+             patch.object(probe, "worker_probe", side_effect=probe.ProbeError("fixed check failed")), \
+             patch.object(probe.signal, "signal", return_value="prior") as handler, \
+             patch.object(probe.signal, "setitimer") as timer:
+            with self.assertRaisesRegex(probe.ProbeError, "fixed check failed"):
+                probe.run("worker")
+        self.assertEqual(timer.call_args_list[-1], call(signal.ITIMER_REAL, 0))
+        self.assertEqual(handler.call_args_list[-1], call(signal.SIGALRM, "prior"))
+
+    def test_identity_requires_actual_uid_cpython_venv_and_wolfi(self):
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(probe.sys, "implementation", SimpleNamespace(name="cpython")))
+            stack.enter_context(patch.object(probe.sys, "version_info", (3, 12, 16)))
+            stack.enter_context(patch.object(probe.sys, "prefix", "/opt/venv"))
+            stack.enter_context(patch.object(probe.os, "getuid", return_value=10001))
+            effective = stack.enter_context(patch.object(probe.os, "geteuid", return_value=10001))
+            stack.enter_context(patch.object(probe.platform, "python_version", return_value="3.12.16"))
+            release = stack.enter_context(patch.object(probe.Path, "read_text", return_value='ID="wolfi"\n'))
+            packages = stack.enter_context(patch.object(probe.subprocess, "run", return_value=SimpleNamespace(stdout="python-3.12-3.12.16-r3\n")))
+            identity = probe.runtime_identity("worker")
+            self.assertEqual(identity["uid"], 10001)
+            self.assertEqual(identity["os_id"], "wolfi")
+            self.assertEqual(identity["apk_versions"], ["python-3.12-3.12.16-r3"])
+            release.return_value = 'ID="chainguard"\nPRETTY_NAME="Chainguard"\n'
+            identity = probe.runtime_identity("worker")
+            self.assertEqual(identity["os_id"], "chainguard")
+            self.assertEqual(identity["os_release"], release.return_value)
+            self.assertEqual(packages.call_args.args[0], ["apk", "info", "-v"])
+            effective.return_value = 0
+            with self.assertRaisesRegex(probe.ProbeError, "UID 10001"):
+                probe.runtime_identity("worker")
+
+    def test_main_prints_one_fixed_prefix_and_redacts_arbitrary_failure_text(self):
+        for failure, expected in ((None, 0), (RuntimeError("DATABASE_URL=private-value"), 1)):
+            with self.subTest(failure=failure), patch.object(probe, "run", return_value={"status": "PASS", "role": "api"}, side_effect=failure):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(probe.main(["api"]), expected)
+                lines = output.getvalue().splitlines()
+                self.assertEqual(len(lines), 1)
+                self.assertTrue(lines[0].startswith(probe.PREFIX))
+                result = json.loads(lines[0][len(probe.PREFIX):])
+                self.assertEqual(result["status"], "PASS" if failure is None else "FAIL")
+                self.assertNotIn("private-value", lines[0])
+
+
+class ServerLifecycleTest(unittest.TestCase):
+    def setUp(self):
+        blocker = patch.object(probe.socket, "socket", side_effect=AssertionError("offline fixtures must never open real sockets"))
+        blocker.start()
+        self.addCleanup(blocker.stop)
+
+    def test_healthy_local_server_is_validated_and_its_only_child_reaped(self):
+        child = Child()
+        with patch.object(probe.subprocess, "Popen", return_value=child) as start, \
+             mock_http(return_value=response({"status": "ok"})) as request, \
+             patch.object(probe.time, "monotonic", return_value=10):
+            result = probe.server_probe(["normal", "server"], {"http://127.0.0.1:8765/healthz": lambda item: item == {"status": "ok"}}, 30,
+                                        environment={"SAFE": "fixture"})
+        self.assertTrue(result["owned_child_reaped"])
+        self.assertEqual(child.terminated, 1)
+        self.assertEqual(child.killed, 0)
+        start.assert_called_once_with(["normal", "server"], env={"SAFE": "fixture"}, stdout=probe.subprocess.DEVNULL, stderr=probe.subprocess.DEVNULL)
+        request.assert_called_once_with("http://127.0.0.1:8765/healthz", timeout=1)
+
+    def test_http_startup_timeout_is_bounded_and_child_cleanup_always_runs(self):
+        child = Child(); clock = [0.0]
+        with patch.object(probe.subprocess, "Popen", return_value=child), \
+             mock_http(side_effect=TimeoutError("mock timeout")), \
+             patch.object(probe.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(probe.time, "sleep", side_effect=lambda interval: clock.__setitem__(0, clock[0] + max(interval, 0.01))):
+            with self.assertRaisesRegex(probe.ProbeError, "startup deadline"):
+                probe.server_probe(["normal", "server"], {"http://127.0.0.1:8765/healthz": lambda _: True}, 6)
+        self.assertLess(clock[0], 2)
+        self.assertEqual(child.terminated, 1)
+        self.assertTrue(child.waits)
+
+    def test_expired_startup_budget_never_starts_a_child(self):
+        with patch.object(probe.time, "monotonic", return_value=26), \
+             patch.object(probe.subprocess, "Popen") as start, mock_http() as request:
+            with self.assertRaisesRegex(probe.ProbeError, "deadline"):
+                probe.server_probe(["normal"], {"http://127.0.0.1:8765/healthz": lambda _: True}, 30)
+        start.assert_not_called()
+        request.assert_not_called()
+
+    def test_failed_payload_cannot_be_reported_as_healthy(self):
+        child = Child()
+        with patch.object(probe.subprocess, "Popen", return_value=child), \
+             mock_http(return_value=response({"status": "wrong"})), \
+             patch.object(probe.time, "monotonic", return_value=10):
+            with self.assertRaisesRegex(probe.ProbeError, "payload failed"):
+                probe.server_probe(["normal"], {"http://127.0.0.1:8765/healthz": lambda item: item == {"status": "ok"}}, 30)
+        self.assertEqual(child.terminated, 1)
+
+    def test_denied_loopback_socket_is_not_retried(self):
+        child = Child()
+        denied = probe.urllib.error.URLError(PermissionError(1, "Operation not permitted"))
+        with patch.object(probe.subprocess, "Popen", return_value=child), \
+             mock_http(side_effect=denied) as request, \
+             patch.object(probe.time, "monotonic", return_value=10), \
+             patch.object(probe.time, "sleep") as sleep:
+            with self.assertRaisesRegex(probe.ProbeError, "access denied; no retry"):
+                probe.server_probe(["normal"], {"http://127.0.0.1:8765/healthz": lambda _: True}, 30)
+        request.assert_called_once()
+        sleep.assert_not_called()
+        self.assertEqual(child.terminated, 1)
+
+    def test_exited_child_never_receives_a_termination_signal(self):
+        child = Child(running=False)
+        with patch.object(probe.subprocess, "Popen", return_value=child), mock_http() as request, \
+             patch.object(probe.time, "monotonic", return_value=10):
+            with self.assertRaisesRegex(probe.ProbeError, "exited before"):
+                probe.server_probe(["normal"], {"http://127.0.0.1:8765/healthz": lambda _: True}, 30)
+        request.assert_not_called()
+        self.assertEqual(child.terminated, 0)
+        self.assertEqual(child.killed, 0)
+
+    def test_termination_timeout_kills_and_waits_only_for_owned_child(self):
+        child = Child(ignore_terminate=True)
+        with patch.object(probe.subprocess, "Popen", return_value=child), \
+             mock_http(return_value=response({"status": "ok"})), \
+             patch.object(probe.time, "monotonic", return_value=10):
+            result = probe.server_probe(["normal"], {"http://127.0.0.1:8765/healthz": lambda _: True}, 30)
+        self.assertTrue(result["owned_child_reaped"])
+        self.assertEqual((child.terminated, child.killed), (1, 1))
+        self.assertEqual(len(child.waits), 2)
+
+    def test_external_http_endpoint_is_never_contacted(self):
+        child = Child()
+        with patch.object(probe.subprocess, "Popen", return_value=child), mock_http() as request, \
+             patch.object(probe.time, "monotonic", return_value=10):
+            with self.assertRaisesRegex(probe.ProbeError, "loopback"):
+                probe.server_probe(["normal"], {"http://external.invalid:8765/healthz": lambda _: True}, 30)
+        request.assert_not_called()
+        self.assertEqual(child.terminated, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
