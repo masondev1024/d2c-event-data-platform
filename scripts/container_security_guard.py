@@ -81,23 +81,7 @@ def build_arguments(command: list[str], builder: str) -> tuple[list[str], list[P
     return ["docker", "buildx", "build", "--builder", builder, *([] if explicit_output or "--load" in args else ["--load"]), *args], outputs
 
 
-def builder_memory_sample(root: Path) -> dict:
-    """Read aggregate cgroup v2 counters, including BuildKit worker descendants."""
-    def counters(name: str) -> dict:
-        return dict(line.split() for line in (root / name).read_text().splitlines())
-
-    events = counters("memory.events")
-    usage = counters("memory.stat")
-    sample = {
-        "unix_ms": time.time_ns() // 1_000_000,
-        "current_bytes": int((root / "memory.current").read_text()),
-        "anon_bytes": int(usage["anon"]), "file_bytes": int(usage["file"]),
-        "oom": int(events["oom"]), "oom_kill": int(events["oom_kill"]),
-    }
-    for name, key in (("memory.peak", "peak_bytes"), ("memory.swap.current", "swap_bytes")):
-        if (root / name).is_file():
-            sample[key] = int((root / name).read_text())
-    return sample
+MEMORY_PROBE = Path(__file__).resolve().parents[1] / "container-build/lakehouse/iceberg/sample-builder-memory.sh"
 
 
 class Guard:
@@ -120,7 +104,7 @@ class Guard:
         self.status_file: Path | None = None
         self.builder_container: str | None = None
         self.builder_token: str | None = None
-        self.memory_root: Path | None = None
+        self.memory_probe: list[str] | None = None
         self.container_dispatched = False
         self.process_groups: list[int] = []
         self.cleaning = False
@@ -135,12 +119,21 @@ class Guard:
         self.state["min_free_bytes"] = min(self.state["min_free_bytes"] or lowest, lowest)
         sample = {"elapsed": round(time.monotonic() - self.started, 3), "free_bytes": values}
         self.state["samples"].append(sample)
-        if self.memory_root is not None:
+        if self.memory_probe is not None:
             try:
-                sample["builder_memory"] = builder_memory_sample(self.memory_root)
-            except (OSError, ValueError, KeyError) as exc:
-                self.state["builder"]["memory_probe_error"] = type(exc).__name__
-                self.memory_root = None
+                result = self.docker(*self.memory_probe, timeout=5)
+                if result.returncode:
+                    raise ValueError(result.stderr.strip()[:300] or "cgroup probe failed")
+                metrics = {key: int(value) for key, value in
+                           (line.split() for line in result.stdout.splitlines())}
+                if not {"current_bytes", "anon_bytes", "file_bytes", "oom", "oom_kill"} <= metrics.keys():
+                    raise ValueError("incomplete builder memory counters")
+                sample["builder_memory"] = {**metrics, "unix_ms": time.time_ns() // 1_000_000}
+            except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+                self.state["builder"]["memory_probe_error"] = str(exc)
+                self.memory_probe = None
+                if self.env.get("GITHUB_ACTIONS") == "true":
+                    raise GuardError("Iceberg CI requires builder memory evidence") from exc
         minimum = self.state["minimum_bytes"] if admission else self.state["reserve_bytes"]
         if lowest < minimum:
             raise GuardError("storage admission failed" if admission else "storage reserve reached", 75 if admission else 70)
@@ -309,19 +302,9 @@ class Guard:
             raise GuardError("private builder memory limit differs from the requested build profile")
         self.state["builder"]["memory_limit_bytes"] = limit
         if self.args.iceberg_source_build:
-            # On Linux CI read the unified cgroup of the inspected container from the
-            # host. Docker Desktop runs the daemon in a VM, outside the host procfs.
-            try:
-                membership = Path(f"/proc/{data['State']['Pid']}/cgroup").read_text().splitlines()
-                relative = next(line[3:] for line in membership if line.startswith("0::/"))
-                root = Path("/sys/fs/cgroup") / relative.lstrip("/")
-                if root.name not in (data["Id"], "docker-" + data["Id"] + ".scope"):
-                    raise ValueError("cgroup does not identify the inspected builder")
-                if int((root / "memory.max").read_text()) != limit:
-                    raise ValueError("cgroup does not have the configured builder limit")
-                self.memory_root = root
-            except (OSError, StopIteration, ValueError) as exc:
-                self.state["builder"]["memory_probe_error"] = type(exc).__name__
+            self.memory_probe = ["exec", data["Id"], "sh", "-ec", MEMORY_PROBE.read_text(),
+                                 "builder-memory", "/sys/fs/cgroup", "/proc/self/cgroup", data["Id"],
+                                 str(limit), data["HostConfig"]["CgroupnsMode"]]
         return command
 
     def execute(self) -> int:

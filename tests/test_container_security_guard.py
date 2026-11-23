@@ -32,21 +32,38 @@ class GuardTests(unittest.TestCase):
         values.update(overrides)
         return argparse.Namespace(**values)
 
-    def test_iceberg_samples_owned_cgroup_memory_breakdown(self):
-        root = self.root / "cgroup"
-        root.mkdir()
-        for name, value in {
-            "memory.current": "1800", "memory.peak": "2100", "memory.swap.current": "0",
-            "memory.stat": "anon 1200\nfile 400\n", "memory.events": "oom 2\noom_kill 1\n",
-        }.items():
-            (root / name).write_text(value)
-        sample = guard.builder_memory_sample(root)
-        self.assertEqual(sample["current_bytes"], 1800)
-        self.assertEqual(sample["peak_bytes"], 2100)
-        self.assertEqual(sample["anon_bytes"], 1200)
-        self.assertEqual(sample["file_bytes"], 400)
-        self.assertEqual(sample["oom_kill"], 1)
-        self.assertEqual(sample["swap_bytes"], 0)
+    def test_iceberg_memory_probe_reads_container_ancestor_and_private_namespace_root(self):
+        mount = self.root / "cgroup"
+        cid = "f" * 64
+        scope = mount / "system.slice" / ("docker-" + cid + ".scope")
+        scope.mkdir(parents=True)
+        membership = self.root / "membership"
+        for directory, relative, mode in ((scope, "/system.slice/docker-" + cid + ".scope/init", "host"),
+                                           (mount, "/init", "private")):
+            for name, value in {"memory.max": "4096", "memory.current": "1800", "memory.peak": "2100",
+                                "memory.swap.current": "0", "memory.stat": "anon 1200\nfile 400\n",
+                                "memory.events": "oom 2\noom_kill 1\n"}.items():
+                (directory / name).write_text(value)
+            membership.write_text("0::" + relative + "\n")
+            cmd = ["sh", str(guard.MEMORY_PROBE), str(mount), str(membership), cid, "4096", mode]
+            actual = subprocess.check_output(cmd, text=True)
+            self.assertEqual(dict(row.split() for row in actual.splitlines()), {
+                "current_bytes": "1800", "anon_bytes": "1200", "file_bytes": "400",
+                "peak_bytes": "2100", "swap_bytes": "0", "oom": "2", "oom_kill": "1"})
+        # A matching numeric limit alone cannot identify a foreign host cgroup.
+        for limit, mode in [("4096", "host"), ("9999", "private")]:
+            self.assertNotEqual(subprocess.run(cmd[:-2] + [limit, mode], capture_output=True).returncode, 0)
+
+    def test_ci_rejects_missing_builder_memory_evidence(self):
+        instance = guard.Guard(self.args())
+        instance.env["GITHUB_ACTIONS"] = "true"
+        instance.state["builder"] = {}
+        instance.memory_probe = ["exec", "owned-cid"]
+        with patch.object(guard, "available", return_value=50 * guard.GIB), \
+                patch.object(instance, "docker", return_value=subprocess.CompletedProcess([], 0, "oom 0", "")):
+            with self.assertRaisesRegex(guard.GuardError, "requires builder memory"):
+                instance.sample()
+        self.assertIn("incomplete", instance.state["builder"]["memory_probe_error"])
 
     def test_builder_profiles_enforce_the_configured_limit(self):
         for iceberg, mib in ((False, 2500), (True, 4096)):
@@ -55,7 +72,7 @@ class GuardTests(unittest.TestCase):
                 instance = guard.Guard(self.args(kind="build", iceberg_source_build=iceberg,
                     evidence_dir=str(folder / "evidence"), build_state_dir=str(folder / "builder"),
                     command=["docker", "build", "."]))
-                data = {"Id": "a" * 64, "HostConfig": {"Memory": mib * 2**20}, "State": {"Pid": 1, "Running": False}}
+                data = {"Id": "a" * 64, "HostConfig": {"Memory": mib * 2**20, "CgroupnsMode": "private"}, "State": {"Pid": 1, "Running": False}}
                 with patch.object(instance, "sample"), patch.object(instance, "run", return_value=0) as run, \
                         patch.object(instance, "inspect_owned", return_value=data):
                     instance.prepare_build()
