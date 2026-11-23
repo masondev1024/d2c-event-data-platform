@@ -15,6 +15,11 @@ gradle.afterProject { component ->
       substitute module('org.apache.parquet:parquet-jackson') using module('org.apache.parquet:parquet-jackson:1.17.1-d2c-jackson2.21.7')
     }
   }
+  // Align the two-second builder cgroup samples with execution on the same CI host.
+  component.tasks.matching { it.name in ['compileScala', 'shadowJar'] }.configureEach {
+    doFirst { task -> logger.lifecycle("D2C_ICEBERG_TASK start ${System.currentTimeMillis()} ${task.path}") }
+    doLast { task -> logger.lifecycle("D2C_ICEBERG_TASK end ${System.currentTimeMillis()} ${task.path}") }
+  }
   component.tasks.withType(org.gradle.api.tasks.scala.ScalaCompile).configureEach {
     scalaCompileOptions.forkOptions.memoryMaximumSize = '768m'
   }

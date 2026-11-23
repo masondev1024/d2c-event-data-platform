@@ -81,6 +81,25 @@ def build_arguments(command: list[str], builder: str) -> tuple[list[str], list[P
     return ["docker", "buildx", "build", "--builder", builder, *([] if explicit_output or "--load" in args else ["--load"]), *args], outputs
 
 
+def builder_memory_sample(root: Path) -> dict:
+    """Read aggregate cgroup v2 counters, including BuildKit worker descendants."""
+    def counters(name: str) -> dict:
+        return dict(line.split() for line in (root / name).read_text().splitlines())
+
+    events = counters("memory.events")
+    usage = counters("memory.stat")
+    sample = {
+        "unix_ms": time.time_ns() // 1_000_000,
+        "current_bytes": int((root / "memory.current").read_text()),
+        "anon_bytes": int(usage["anon"]), "file_bytes": int(usage["file"]),
+        "oom": int(events["oom"]), "oom_kill": int(events["oom_kill"]),
+    }
+    for name, key in (("memory.peak", "peak_bytes"), ("memory.swap.current", "swap_bytes")):
+        if (root / name).is_file():
+            sample[key] = int((root / name).read_text())
+    return sample
+
+
 class Guard:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -101,6 +120,7 @@ class Guard:
         self.status_file: Path | None = None
         self.builder_container: str | None = None
         self.builder_token: str | None = None
+        self.memory_root: Path | None = None
         self.container_dispatched = False
         self.process_groups: list[int] = []
         self.cleaning = False
@@ -113,7 +133,14 @@ class Guard:
         values = {str(p): available(nearest_existing(p)) for p in self.paths}
         lowest = min(values.values())
         self.state["min_free_bytes"] = min(self.state["min_free_bytes"] or lowest, lowest)
-        self.state["samples"].append({"elapsed": round(time.monotonic() - self.started, 3), "free_bytes": values})
+        sample = {"elapsed": round(time.monotonic() - self.started, 3), "free_bytes": values}
+        self.state["samples"].append(sample)
+        if self.memory_root is not None:
+            try:
+                sample["builder_memory"] = builder_memory_sample(self.memory_root)
+            except (OSError, ValueError, KeyError) as exc:
+                self.state["builder"]["memory_probe_error"] = type(exc).__name__
+                self.memory_root = None
         minimum = self.state["minimum_bytes"] if admission else self.state["reserve_bytes"]
         if lowest < minimum:
             raise GuardError("storage admission failed" if admission else "storage reserve reached", 75 if admission else 70)
@@ -234,6 +261,8 @@ class Guard:
             self.state["cleanup_errors"].append("owned container: " + str(exc))
 
     def prepare_build(self) -> list[str]:
+        # The Gradle daemon and forked Scala compiler share a single BuildKit cgroup.
+        memory_mib = 4096 if self.args.iceberg_source_build else 2500
         folder = Path(self.args.build_state_dir).resolve()
         folder.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.env["BUILDX_CONFIG"] = str(folder / "buildx")
@@ -264,7 +293,7 @@ class Guard:
             if self.run("builder-create", ["docker", "buildx", "create", "--name", name,
                     "--driver", "docker-container", "--buildkitd-config", str(config),
                     "--driver-opt", "env.D2C_SECURITY_OWNER=" + token,
-                    "--driver-opt", "memory=2500m", "--driver-opt", "cpu-period=100000",
+                    "--driver-opt", f"memory={memory_mib}m", "--driver-opt", "cpu-period=100000",
                     "--driver-opt", "cpu-quota=200000", "--driver-opt", "restart-policy=no"]) != 0:
                 raise GuardError("private builder creation failed")
         command, outputs = build_arguments(self.args.command, name)
@@ -275,6 +304,24 @@ class Guard:
         data = self.inspect_owned(self.builder_container, token, allow_absent=False)
         self.state["builder"] = {"name": name, "container_id": data["Id"], "max_parallelism": 1,
                                  "cache": "retained; no prune or volume deletion"}
+        limit = data["HostConfig"]["Memory"]
+        if limit != memory_mib * 2**20:
+            raise GuardError("private builder memory limit differs from the requested build profile")
+        self.state["builder"]["memory_limit_bytes"] = limit
+        if self.args.iceberg_source_build:
+            # On Linux CI read the unified cgroup of the inspected container from the
+            # host. Docker Desktop runs the daemon in a VM, outside the host procfs.
+            try:
+                membership = Path(f"/proc/{data['State']['Pid']}/cgroup").read_text().splitlines()
+                relative = next(line[3:] for line in membership if line.startswith("0::/"))
+                root = Path("/sys/fs/cgroup") / relative.lstrip("/")
+                if root.name not in (data["Id"], "docker-" + data["Id"] + ".scope"):
+                    raise ValueError("cgroup does not identify the inspected builder")
+                if int((root / "memory.max").read_text()) != limit:
+                    raise ValueError("cgroup does not have the configured builder limit")
+                self.memory_root = root
+            except (OSError, StopIteration, ValueError) as exc:
+                self.state["builder"]["memory_probe_error"] = type(exc).__name__
         return command
 
     def execute(self) -> int:
@@ -329,6 +376,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout-seconds", type=float)
     parser.add_argument("--storage-path", action="append", default=[])
     parser.add_argument("--evidence-dir", required=True)
+    parser.add_argument("--iceberg-source-build", action="store_true",
+                        help="use the 4 GiB Iceberg source builder and record its Linux memory counters")
     parser.add_argument("--build-state-dir", default=str(Path(tempfile.gettempdir()) / f"d2c-security-build-{os.getuid()}"))
     parser.add_argument("--container-name")
     parser.add_argument("--owner-token")
@@ -339,6 +388,8 @@ def main(argv: list[str] | None = None) -> int:
     args.timeout_seconds = DEFAULTS[args.kind][1] if args.timeout_seconds is None else args.timeout_seconds
     if not args.command or bool(args.container_name) != bool(args.owner_token):
         parser.error("command required; container-name and owner-token must be supplied together")
+    if args.iceberg_source_build and args.kind != "build":
+        parser.error("--iceberg-source-build requires --kind build")
     numbers = (args.minimum_free_gib, args.reserve_free_gib, args.timeout_seconds)
     if not all(math.isfinite(v) and v > 0 for v in numbers) or args.minimum_free_gib <= args.reserve_free_gib:
         parser.error("positive finite limits and minimum > reserve are required")

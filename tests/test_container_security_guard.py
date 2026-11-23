@@ -28,9 +28,42 @@ class GuardTests(unittest.TestCase):
         values = dict(kind="test", evidence_dir=str(self.root / "evidence"), storage_path=[str(self.root)],
                       reserve_free_gib=6, minimum_free_gib=8, timeout_seconds=20,
                       command=[sys.executable, "-c", "print('isolated guard test')"],
-                      container_name=None, owner_token=None, build_state_dir=str(self.root / "builder"))
+                      container_name=None, owner_token=None, iceberg_source_build=False, build_state_dir=str(self.root / "builder"))
         values.update(overrides)
         return argparse.Namespace(**values)
+
+    def test_iceberg_samples_owned_cgroup_memory_breakdown(self):
+        root = self.root / "cgroup"
+        root.mkdir()
+        for name, value in {
+            "memory.current": "1800", "memory.peak": "2100", "memory.swap.current": "0",
+            "memory.stat": "anon 1200\nfile 400\n", "memory.events": "oom 2\noom_kill 1\n",
+        }.items():
+            (root / name).write_text(value)
+        sample = guard.builder_memory_sample(root)
+        self.assertEqual(sample["current_bytes"], 1800)
+        self.assertEqual(sample["peak_bytes"], 2100)
+        self.assertEqual(sample["anon_bytes"], 1200)
+        self.assertEqual(sample["file_bytes"], 400)
+        self.assertEqual(sample["oom_kill"], 1)
+        self.assertEqual(sample["swap_bytes"], 0)
+
+    def test_builder_profiles_enforce_the_configured_limit(self):
+        for iceberg, mib in ((False, 2500), (True, 4096)):
+            with self.subTest(iceberg=iceberg):
+                folder = self.root / str(mib)
+                instance = guard.Guard(self.args(kind="build", iceberg_source_build=iceberg,
+                    evidence_dir=str(folder / "evidence"), build_state_dir=str(folder / "builder"),
+                    command=["docker", "build", "."]))
+                data = {"Id": "a" * 64, "HostConfig": {"Memory": mib * 2**20}, "State": {"Pid": 1, "Running": False}}
+                with patch.object(instance, "sample"), patch.object(instance, "run", return_value=0) as run, \
+                        patch.object(instance, "inspect_owned", return_value=data):
+                    instance.prepare_build()
+                    self.assertIn(f"memory={mib}m", run.call_args_list[0].args[1])
+                    self.assertEqual(instance.state["builder"]["memory_limit_bytes"], mib * 2**20)
+                    data["HostConfig"]["Memory"] = 0
+                    with self.assertRaisesRegex(guard.GuardError, "memory limit"):
+                        instance.prepare_build()
 
     def test_admission_never_starts_child(self):
         instance = guard.Guard(self.args())

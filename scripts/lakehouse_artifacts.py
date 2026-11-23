@@ -461,9 +461,11 @@ def guard_command(source_root: Path, role: str, output: Path, evidence: Path, st
     command = [sys.executable, str(source_root / "scripts/container_security_guard.py"),
                "--kind", "build", "--minimum-free-gib", "16", "--reserve-free-gib", "6",
                "--timeout-seconds", "3600", "--storage-path", str(storage),
-               "--evidence-dir", str(evidence), "--build-state-dir", str(state), "--",
-               "docker", "build", "--platform", native, "--file", "lakehouse/Dockerfile",
-               "--target", TARGETS[role], "--output", "type=local,dest=" + str(output)]
+               "--evidence-dir", str(evidence), "--build-state-dir", str(state)]
+    if role == "iceberg":
+        command.append("--iceberg-source-build")
+    command += ["--", "docker", "build", "--platform", native, "--file", "lakehouse/Dockerfile",
+                "--target", TARGETS[role], "--output", "type=local,dest=" + str(output)]
     if role == "iceberg":
         command += ["--build-context", "d2c_artifacts=" + str(assembled),
                     "--build-arg", "D2C_PARQUET_STAGE=d2c_artifacts"]
